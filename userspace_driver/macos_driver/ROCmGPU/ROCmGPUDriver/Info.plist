@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>ROCmGPUDriver</string>
+    <key>CFBundlePackageType</key>
+    <string>DEXT</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- IOKit Matching Personality (DriverKit / PCIDriverKit)
+         Schema cribbed from tinygrad's TinyGPU DEXT (Apple-approved for
+         com.apple.developer.driverkit.transport.pci, March 2026). Do NOT
+         add CFBundleIdentifierKernel — that flags the bundle as a kext
+         and causes OSSystemExtensionRequest to silently reject it with
+         code 4 (.extensionNotFound). -->
+    <key>OSBundleUsageDescription</key>
+    <string>Provides PCIe access for AMD eGPUs attached over Thunderbolt, used by the ROCm userspace runtime.</string>
+
+    <key>IOKitPersonalities</key>
+    <dict>
+        <key>ROCmGPUDriver</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+            <key>IOClass</key>
+            <string>IOUserService</string>
+            <key>IOUserClass</key>
+            <string>ROCmGPUDriver</string>
+            <!-- IOUserServerName must match the DEXT's bundle ID. -->
+            <key>IOUserServerName</key>
+            <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+            <key>IOProviderClass</key>
+            <string>IOPCIDevice</string>
+            <!-- Required for DriverKit matching. -->
+            <key>IOResourceMatch</key>
+            <string>IOKit</string>
+            <!-- Required for multi-DEXT arbitration; value is the
+                 personality name. -->
+            <key>IOMatchCategory</key>
+            <string>ROCmGPUDriver</string>
+            <!-- REQUIRED for Thunderbolt-attached devices. Without this
+                 key the match never fires for TB3/TB4/TB5 eGPUs. -->
+            <key>IOPCITunnelCompatible</key>
+            <true/>
+            <!--
+              Match PCI class 0x03 (display controller), subclass/progif
+              wildcard via low byte zero. This matches what tinygrad's
+              TinyGPU DEXT does (Apple-approved), and stays within the
+              scope of the dev-variant transport.pci entitlement grant
+              (0xFFFFFFFF&0x00000000 = any external PCI). Using
+              IOPCIPrimaryMatch with a vendor-specific spec outside the
+              entitlement's grant causes SystemExtensions.framework to
+              silently reject registration.
+              Narrower vendor filtering (AMD 0x1002) can be reinstated
+              here once the production transport.pci entitlement is
+              approved.
+            -->
+            <key>IOPCIClassMatch</key>
+            <string>0x03000000</string>
+            <key>IOUserClientClass</key>
+            <string>ROCmGPUUserClient</string>
+
+            <!-- UserClient creation properties (for NewUserClient -> Create) -->
+            <key>UserClientProperties</key>
+            <dict>
+                <key>IOClass</key>
+                <string>IOUserUserClient</string>
+                <key>IOUserClass</key>
+                <string>ROCmGPUUserClient</string>
+            </dict>
+        </dict>
+    </dict>
+</dict>
+</plist>

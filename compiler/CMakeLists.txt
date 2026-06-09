@@ -5,6 +5,10 @@ if(THEROCK_ENABLE_COMPILER)
   if(NOT DEFINED THEROCK_BUILD_COMGR_TESTS)
     set(THEROCK_BUILD_COMGR_TESTS ${THEROCK_BUILD_TESTING})
   endif()
+  set(_therock_shared_library_suffix ".so")
+  if(APPLE)
+    set(_therock_shared_library_suffix ".dylib")
+  endif()
 
   ##############################################################################
   # amd-llvm
@@ -101,18 +105,18 @@ if(THEROCK_ENABLE_COMPILER)
       -DCLANG_TIDY_ENABLE_STATIC_ANALYZER=OFF
 
       -DCLANG_TOOL_CLANG_LINKER_WRAPPER_BUILD=${THEROCK_CONDITION_IS_NON_WINDOWS}
-      -DOPENMP_ENABLE_LIBOMPTARGET=${THEROCK_CONDITION_IS_NON_WINDOWS}
-      -DLIBOMPTARGET_BUILD_DEVICE_FORTRT=${THEROCK_CONDITION_IS_NON_WINDOWS}
-      -DOFFLOAD_EXTERNAL_PROJECT_UNIFIED_ROCR=${THEROCK_CONDITION_IS_NON_WINDOWS}
+      -DOPENMP_ENABLE_LIBOMPTARGET=${THEROCK_CONDITION_IS_LINUX}
+      -DLIBOMPTARGET_BUILD_DEVICE_FORTRT=${THEROCK_CONDITION_IS_LINUX}
+      -DOFFLOAD_EXTERNAL_PROJECT_UNIFIED_ROCR=${THEROCK_CONDITION_IS_LINUX}
       -DLIBOMPTARGET_EXTERNAL_PROJECT_HSA_PATH=${THEROCK_ROCM_SYSTEMS_SOURCE_DIR}/projects/rocr-runtime
       -DFLANG_RUNTIME_F128_MATH_LIB=libquadmath
-      -DRUNTIMES_amdgcn-amd-amdhsa_LLVM_ENABLE_PER_TARGET_RUNTIME_DIR=${THEROCK_CONDITION_IS_NON_WINDOWS}
+      -DRUNTIMES_amdgcn-amd-amdhsa_LLVM_ENABLE_PER_TARGET_RUNTIME_DIR=${THEROCK_CONDITION_IS_LINUX}
       -DRUNTIMES_amdgcn-amd-amdhsa_LLVM_ENABLE_RUNTIMES=openmp
       # ASAN features.
       # Note that building AMDGPU ASAN extensions depends on various runtime headers
       # (since it instruments them). These paths must line up and will be an error
       # in the compiler-rt build if not found.
-      "-DSANITIZER_AMDGPU=${THEROCK_CONDITION_IS_NON_WINDOWS}"
+      "-DSANITIZER_AMDGPU=${THEROCK_CONDITION_IS_LINUX}"
       "-DSANITIZER_HSA_INCLUDE_PATH=${THEROCK_ROCM_SYSTEMS_SOURCE_DIR}/projects/rocr-runtime/runtime/hsa-runtime/inc"
       "-DSANITIZER_COMGR_INCLUDE_PATH=${CMAKE_CURRENT_SOURCE_DIR}/amd-llvm/amd/comgr/include"
 
@@ -155,6 +159,11 @@ if(THEROCK_ENABLE_COMPILER)
   # version script, avoiding symbol interposition issues.
   ##############################################################################
 
+  set(_comgr_enable_symbol_versioning ON)
+  if(APPLE)
+    set(_comgr_enable_symbol_versioning OFF)
+  endif()
+
   therock_cmake_subproject_declare(amd-comgr
     USE_DIST_AMDGPU_TARGETS
     NO_INSTALL_RPATH  # See manual handling in the pre_hook.
@@ -169,7 +178,7 @@ if(THEROCK_ENABLE_COMPILER)
       -DCOMGR_STATIC_LLVM=ON
       -DTHEROCK_BUILD_COMGR_TESTS=${THEROCK_BUILD_COMGR_TESTS}
       "-DLLVM_VERSION_SUFFIX=-rocm${ROCM_MAJOR_VERSION}"
-      -DLLVM_ENABLE_SYMBOL_VERSIONING=ON
+      "-DLLVM_ENABLE_SYMBOL_VERSIONING=${_comgr_enable_symbol_versioning}"
     BUILD_DEPS
       rocm-cmake
     RUNTIME_DEPS
@@ -203,7 +212,7 @@ if(THEROCK_ENABLE_COMPILER)
   therock_test_validate_shared_lib(
     PATH amd-comgr/dist/lib
     LIB_NAMES
-      libamd_comgr.so
+      "libamd_comgr${_therock_shared_library_suffix}"
   )
 
   ##############################################################################

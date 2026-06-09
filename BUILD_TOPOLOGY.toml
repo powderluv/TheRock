@@ -505,7 +505,7 @@ type = "target-neutral"
 artifact_deps = ["base", "sysdeps", "sysdeps-libnl", "sysdeps-libmnl", "amd-llvm"]
 feature_name = "CORE_AMDSMI"
 feature_group = "CORE"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 [artifacts.core-kpack]
 artifact_group = "hip-runtime"
