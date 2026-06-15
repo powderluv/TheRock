@@ -55,6 +55,17 @@ AmdGpuAddDevice(
     KeInitializeSpinLock(&pAdapter->DmaAllocsLock);
     KeInitializeSpinLock(&pAdapter->EventsLock);
 
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_ADDDEVICE);
+    AmdGpuDiag(L"AddDevice", 1);
+    /* Reset per-bind diagnostic accumulators so a fresh device start does
+     * not show stale QueryAdapterInfo masks from a previous driver image. */
+    AmdGpuDiag(L"QAI_QueriedLo", 0);
+    AmdGpuDiag(L"QAI_QueriedHi", 0);
+    AmdGpuDiag(L"QAI_UnhandledLo", 0);
+    AmdGpuDiag(L"QAI_UnhandledHi", 0);
+    AmdGpuDiag(L"QAI_Unhandled", 0);
+    AmdGpuDiag(L"QAI_LastType", 999);
+
     *MiniportDeviceContext = pAdapter;
     return STATUS_SUCCESS;
 }
@@ -250,6 +261,18 @@ DetectVramSize(
     MemSizeMB = READ_REGISTER_ULONG(
         (PULONG)((PUCHAR)pAdapter->Bars[0].KernelAddress + mmRCC_CONFIG_MEMSIZE_BYTE));
 
+    /*
+     * Sanity-clamp: a valid VRAM size is 1 MB .. 64 GB. gfx12 may place
+     * mmRCC_CONFIG_MEMSIZE at a different offset, so a misread can return
+     * garbage (e.g. ~2.6 PB). Reject implausible values so we don't report
+     * an absurd memory segment to VidMm; 0 lets QUERYSEGMENT4 fall back.
+     */
+    if (MemSizeMB == 0 || MemSizeMB > 65536) {
+        pAdapter->VramSize = 0;
+        pAdapter->VisibleVramSize = 0;
+        return;
+    }
+
     pAdapter->VramSize = (ULONGLONG)MemSizeMB * 1024ULL * 1024ULL;
 
     /*
@@ -290,6 +313,9 @@ AmdGpuStartDevice(
 {
     AMDGPU_ADAPTER *pAdapter = (AMDGPU_ADAPTER *)MiniportDeviceContext;
     NTSTATUS Status;
+
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_STARTDEVICE_ENTER);
+    AmdGpuDiag(L"StartDevice_enter", 1);
 
     /* Save DXGK handles for later use (DxgkCbReadDeviceSpace, etc.) */
     pAdapter->DxgkHandle = DxgkInterface->DeviceHandle;
@@ -370,6 +396,13 @@ AmdGpuStartDevice(
 
     pAdapter->Started = TRUE;
 
+    /* Breadcrumbs: did we get real hardware resources before returning? */
+    AmdGpuDiag(L"NumBars", pAdapter->NumBars);
+    AmdGpuDiag(L"Bar0Mapped", pAdapter->Bars[0].Mapped ? 1u : 0u);
+    AmdGpuDiag(L"VramSizeMB", (ULONG)(pAdapter->VramSize >> 20));
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_STARTDEVICE_RET);
+    AmdGpuDiag(L"StartDevice_ret", 0);
+
     return STATUS_SUCCESS;
 }
 
@@ -448,6 +481,9 @@ AmdGpuCreateDevice(
     RtlZeroMemory(pDevCtx, sizeof(*pDevCtx));
     pDevCtx->AdapterContext = (PVOID)hAdapter;
 
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_CREATEDEVICE);
+    AmdGpuDiag(L"CreateDevice", 1);
+
     pCreateDevice->hDevice = pDevCtx;
     return STATUS_SUCCESS;
 }
@@ -485,6 +521,9 @@ AmdGpuCreateContext(
     pCtx->DeviceContext = (PVOID)hDevice;
     pCtx->NodeOrdinal = pCreateContext->NodeOrdinal;
     pCtx->EngineAffinity = pCreateContext->EngineAffinity;
+
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_CREATECONTEXT);
+    AmdGpuDiag(L"CreateContext", 1);
 
     pCreateContext->hContext = pCtx;
     pCreateContext->ContextInfo.DmaBufferSize = 4096;        /* Minimal */
@@ -529,6 +568,9 @@ AmdGpuCreateProcess(
 
     RtlZeroMemory(pProc, sizeof(*pProc));
     pArgs->hKmdProcess = pProc;
+
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_CREATEPROCESS);
+    AmdGpuDiag(L"CreateProcess", 1);
 
     return STATUS_SUCCESS;
 }

@@ -38,6 +38,13 @@ amdgpu_mcdm.sys = 1
 
 [AmdGpu_Install]
 FeatureScore = E1
+CopyFiles = AmdGpu_CopyFiles
+
+; Copy the driver binary into the Driver Store (dir 13, per DestinationDirs) so
+; the service's ServiceBinary = %13%\amdgpu_mcdm.sys resolves. Without this the
+; driver fails to load with Code 39 / STATUS_OBJECT_NAME_NOT_FOUND.
+[AmdGpu_CopyFiles]
+amdgpu_mcdm.sys
 
 [AmdGpu_Install.HW]
 AddReg = AmdGpu_HW_AddReg

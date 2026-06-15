@@ -15,6 +15,19 @@
  * type chain for d3dukmdt.h.
  */
 #ifdef _KERNEL_MODE
+/*
+ * Pin the DDI interface version to WDDM 2.6 (0xB004) BEFORE any WDK header.
+ * The 26100 headers otherwise default DXGKDDI_INTERFACE_VERSION to WDDM3_2,
+ * which makes the DXGK_* QueryAdapterInfo structs (DRIVERCAPS,
+ * PHYSICALADAPTERCAPS, ...) both LARGER and DIFFERENTLY LAID OUT than the
+ * 2.6-versioned buffers dxgkrnl passes a driver that declares
+ * DriverInitData.Version = WDDM2_6. That size/offset mismatch is what made
+ * adapter start fail (BUFFER_TOO_SMALL, then INVALID_PARAMETER). 2.6 is the
+ * lowest version that still supports MCDM ComputeOnly + WDDMDEVICECAPS.
+ */
+#ifndef DXGKDDI_INTERFACE_VERSION
+#define DXGKDDI_INTERFACE_VERSION 0xB004  /* DXGKDDI_INTERFACE_VERSION_WDDM2_6 */
+#endif
 /* ntddk.h includes wdm.h plus BUS_DATA_TYPE etc. needed by video.h */
 #include <ntddk.h>
 /*
@@ -246,11 +259,49 @@ typedef struct _AMDGPU_ADAPTER {
 
     /* Flags */
     BOOLEAN                 Started;
+
+    /* Diagnostics: bitmask (bit N = DXGKQAITYPE N) of every adapter-info
+     * type dxgkrnl queried, and of those we rejected with NOT_SUPPORTED. */
+    volatile LONG64         QaiQueriedMask;
+    volatile LONG64         QaiUnhandledMask;
 } AMDGPU_ADAPTER;
 
 /*
  * DDI function declarations live in driver_entry.c (using DDI typedefs
  * from dispmprt.h) and are implemented across ddi_*.c files.
  */
+
+/* ======================================================================
+ * Diagnostic breadcrumbs
+ *
+ * Writes progress markers to HKLM\SOFTWARE\AmdMcdmDiag so the adapter
+ * bring-up sequence can be inspected from user mode (reg query) after a
+ * silent post-start failure (Code 43) — no kernel debugger required.
+ *
+ *   - "LastDDI"      : ID of the most recent instrumented DDI entered
+ *   - "QAI_LastType" : most recent DXGKQAITYPE queried via QueryAdapterInfo
+ *   - "QAI_Unhandled": last DXGKQAITYPE that fell through to NOT_SUPPORTED
+ *   - StartDevice records NumBars / Bar0Mapped / VramSizeMB
+ * ====================================================================== */
+
+#define AMDGPU_DDI_DRIVERENTRY        1
+#define AMDGPU_DDI_ADDDEVICE          2
+#define AMDGPU_DDI_STARTDEVICE_ENTER  3
+#define AMDGPU_DDI_STARTDEVICE_RET    4
+#define AMDGPU_DDI_QUERYADAPTERINFO   10
+#define AMDGPU_DDI_QUERYCHILDREL      20
+#define AMDGPU_DDI_QUERYCHILDSTATUS   21
+#define AMDGPU_DDI_QUERYDEVICEDESC    22
+#define AMDGPU_DDI_ISSUPPORTEDVIDPN   30
+#define AMDGPU_DDI_ENUMCOFUNC         31
+#define AMDGPU_DDI_RECOMMENDFUNCVIDPN 32
+#define AMDGPU_DDI_COMMITVIDPN        33
+#define AMDGPU_DDI_RECOMMENDVIDPNTOPO 34
+#define AMDGPU_DDI_QUERYVIDPNHWCAP    35
+#define AMDGPU_DDI_CREATEDEVICE       40
+#define AMDGPU_DDI_CREATECONTEXT      41
+#define AMDGPU_DDI_CREATEPROCESS      42
+
+VOID AmdGpuDiag(_In_z_ PCWSTR Name, _In_ ULONG Value);
 
 #endif /* _KERNEL_MODE */

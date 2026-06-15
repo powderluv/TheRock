@@ -14,6 +14,34 @@ DRIVER_INITIALIZE DriverEntry;
 #pragma alloc_text(INIT, DriverEntry)
 #endif
 
+/* ----------------------------------------------------------------------
+ * Diagnostic breadcrumb writer (declared in amdgpu_mcdm.h).
+ *
+ * Writes a REG_DWORD under HKLM\SOFTWARE\AmdMcdmDiag. Runs at
+ * PASSIVE_LEVEL from PnP/adapter DDIs (well after DriverEntry returns),
+ * so it must NOT be in the INIT segment.
+ * -------------------------------------------------------------------- */
+VOID
+AmdGpuDiag(
+    _In_z_ PCWSTR   Name,
+    _In_ ULONG      Value
+    )
+{
+    ULONG val = Value;
+    /* Self-create the key: a device restart re-runs AddDevice/StartDevice
+     * but not necessarily DriverEntry (image stays loaded), so don't rely
+     * on DriverEntry having created it. */
+    (void)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE,
+        L"\\Registry\\Machine\\SOFTWARE\\AmdMcdmDiag");
+    (void)RtlWriteRegistryValue(
+        RTL_REGISTRY_ABSOLUTE,
+        L"\\Registry\\Machine\\SOFTWARE\\AmdMcdmDiag",
+        (PWSTR)Name,
+        REG_DWORD,
+        &val,
+        sizeof(val));
+}
+
 /* ======================================================================
  * Forward declarations for all DDI callbacks
  *
@@ -102,6 +130,10 @@ DXGKDDI_QUERYVIDPNHWCAPABILITY AmdGpuQueryVidPnHWCapability;
 
 /* WDDM 1.2+ (Win8) */
 DXGKDDISETPOWERCOMPONENTFSTATE AmdGpuSetPowerComponentFState;
+DXGKDDI_SETSTABLEPOWERSTATE AmdGpuSetStablePowerState;
+DXGKDDI_SETVIRTUALMACHINEDATA AmdGpuSetVirtualMachineData;
+DXGKDDI_BEGINEXCLUSIVEACCESS AmdGpuBeginExclusiveAccess;
+DXGKDDI_ENDEXCLUSIVEACCESS AmdGpuEndExclusiveAccess;
 DXGKDDI_QUERYDEPENDENTENGINEGROUP AmdGpuQueryDependentEngineGroup;
 DXGKDDI_QUERYENGINESTATUS   AmdGpuQueryEngineStatus;
 DXGKDDI_STOP_DEVICE_AND_RELEASE_POST_DISPLAY_OWNERSHIP AmdGpuStopDeviceAndReleasePostDisplayOwnership;
@@ -140,6 +172,12 @@ DriverEntry(
     DRIVER_INITIALIZATION_DATA  DriverInitData;
 
     RtlZeroMemory(&DriverInitData, sizeof(DriverInitData));
+
+    /* Diagnostic breadcrumbs: create the key and mark DriverEntry reached. */
+    (void)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE,
+        L"\\Registry\\Machine\\SOFTWARE\\AmdMcdmDiag");
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_DRIVERENTRY);
+    AmdGpuDiag(L"DriverEntry", 1);
 
     /*
      * Set version to WDDM 2.6 — the minimum that supports ComputeOnly bit
@@ -262,7 +300,10 @@ DriverEntry(
     DriverInitData.DxgkDdiDestroyProcess                 = AmdGpuDestroyProcess;
     DriverInitData.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2 = NULL;
     DriverInitData.DxgkDdiPowerRuntimeSetDeviceHandle    = NULL;
-    DriverInitData.DxgkDdiSetStablePowerState            = NULL;
+    DriverInitData.DxgkDdiSetStablePowerState            = AmdGpuSetStablePowerState;
+    DriverInitData.DxgkDdiSetVirtualMachineData          = AmdGpuSetVirtualMachineData;
+    DriverInitData.DxgkDdiBeginExclusiveAccess           = AmdGpuBeginExclusiveAccess;
+    DriverInitData.DxgkDdiEndExclusiveAccess             = AmdGpuEndExclusiveAccess;
     DriverInitData.DxgkDdiSetVideoProtectedRegion        = NULL;
 
     /* --- WDDM 2.6+ (needed for ComputeOnly bit) --- */
@@ -270,5 +311,10 @@ DriverEntry(
     DriverInitData.DxgkDdiRestoreMemoryForHotUpdate      = NULL;
     DriverInitData.DxgkDdiCollectDiagnosticInfo          = NULL;
 
-    return DxgkInitialize(DriverObject, RegistryPath, &DriverInitData);
+    {
+        NTSTATUS DxgkStatus =
+            DxgkInitialize(DriverObject, RegistryPath, &DriverInitData);
+        AmdGpuDiag(L"DxgkInitializeRet", (ULONG)DxgkStatus);
+        return DxgkStatus;
+    }
 }

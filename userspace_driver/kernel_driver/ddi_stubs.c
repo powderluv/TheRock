@@ -60,6 +60,8 @@ AmdGpuIsSupportedVidPn(
     )
 {
     UNREFERENCED_PARAMETER(hAdapter);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_ISSUPPORTEDVIDPN);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     /* No VidPn configurations are supported — compute-only device */
     if (pIsSupportedVidPn != NULL)
         pIsSupportedVidPn->IsVidPnSupported = FALSE;
@@ -75,6 +77,8 @@ AmdGpuRecommendFunctionalVidPn(
 {
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pRecommendFunctionalVidPn);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_RECOMMENDFUNCVIDPN);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -87,6 +91,8 @@ AmdGpuEnumVidPnCofuncModality(
 {
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pEnumCofuncModality);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_ENUMCOFUNC);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -123,6 +129,8 @@ AmdGpuCommitVidPn(
 {
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pCommitVidPn);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_COMMITVIDPN);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -159,6 +167,8 @@ AmdGpuRecommendVidPnTopology(
 {
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pRecommendVidPnTopology);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_RECOMMENDVIDPNTOPO);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -267,6 +277,8 @@ AmdGpuQueryVidPnHWCapability(
 {
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pQueryVidPnHWCapability);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_QUERYVIDPNHWCAP);
+    AmdGpuDiag(L"VidPnPathTaken", 1);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -285,6 +297,8 @@ AmdGpuQueryChildRelations(
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     UNREFERENCED_PARAMETER(ChildRelations);
     UNREFERENCED_PARAMETER(ChildRelationsSize);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_QUERYCHILDREL);
+    AmdGpuDiag(L"QueryChildRelations", 1);
     /* No child devices (no monitor outputs) */
     return STATUS_SUCCESS;
 }
@@ -300,6 +314,7 @@ AmdGpuQueryChildStatus(
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     UNREFERENCED_PARAMETER(ChildStatus);
     UNREFERENCED_PARAMETER(NonDestructiveOnly);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_QUERYCHILDSTATUS);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -314,6 +329,7 @@ AmdGpuQueryDeviceDescriptor(
     UNREFERENCED_PARAMETER(MiniportDeviceContext);
     UNREFERENCED_PARAMETER(ChildUid);
     UNREFERENCED_PARAMETER(pDeviceDescriptor);
+    AmdGpuDiag(L"LastDDI", AMDGPU_DDI_QUERYDEVICEDESC);
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -402,6 +418,70 @@ AmdGpuPowerRuntimeControlRequest(
     UNREFERENCED_PARAMETER(OutBufferSize);
     UNREFERENCED_PARAMETER(BytesReturned);
     return STATUS_NOT_SUPPORTED;
+}
+
+/*
+ * SetStablePowerState — required by dxgkrnl for a WDDMv2 driver (its
+ * absence/NULL caused STATUS_REVISION_MISMATCH at adapter start: trace
+ * "DxgkDdiSetStablePowerState is required"). We don't gate clocks; no-op.
+ * NOTE: this DDI returns VOID, not NTSTATUS.
+ */
+VOID
+APIENTRY
+AmdGpuSetStablePowerState(
+    IN_CONST_HANDLE                        hAdapter,
+    IN_CONST_PDXGKARG_SETSTABLEPOWERSTATE  pArgs
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+}
+
+/*
+ * SetVirtualMachineData — required by dxgkrnl for a WDDMv2 driver (trace
+ * "DxgkDdiSetVirtualMachineData is required"). We are not a virtualization
+ * host; accept the call and succeed.
+ */
+NTSTATUS
+APIENTRY
+AmdGpuSetVirtualMachineData(
+    IN_CONST_HANDLE                         hAdapter,
+    IN_CONST_PDXGKARG_SETVIRTUALMACHINEDATA Args
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(Args);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Begin/EndExclusiveAccess — required by dxgkrnl to create the render
+ * adapter for a WDDMv2 driver (their absence caused "Failed to create
+ * ADAPTER_RENDER" + STATUS_REVISION_MISMATCH). We have no exclusive-mode
+ * hardware state to gate; accept and succeed.
+ */
+NTSTATUS
+APIENTRY
+AmdGpuBeginExclusiveAccess(
+    IN_CONST_HANDLE                  hAdapter,
+    IN_PDXGKARG_BEGINEXCLUSIVEACCESS pBeginExclusiveAccess
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pBeginExclusiveAccess);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+APIENTRY
+AmdGpuEndExclusiveAccess(
+    IN_CONST_HANDLE                hAdapter,
+    IN_PDXGKARG_ENDEXCLUSIVEACCESS pEndExclusiveAccess
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pEndExclusiveAccess);
+    return STATUS_SUCCESS;
 }
 
 /* ======================================================================

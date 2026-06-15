@@ -81,6 +81,13 @@
         ntoskrnl.lib, hal.lib, wmilib.lib: Auto-linked by WDK WDM props.
       -->
       <AdditionalDependencies>$(DDK_LIB_PATH)displib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Keep all symbols: /OPT:REF was dead-stripping DriverEntry + the DDI
+           dispatch table + DxgkInitialize, producing a ~16KB stub that fails to
+           load (0xC000026C). NOREF/NOICF keep the full miniport. (No map file —
+           inf2cat rejects unreferenced files in the driver output dir.) -->
+      <OptimizeReferences>false</OptimizeReferences>
+      <EnableCOMDATFolding>false</EnableCOMDATFolding>
+      <AdditionalOptions>/OPT:NOREF /OPT:NOICF %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <!--
       StampInf: set driver version date and version string.
