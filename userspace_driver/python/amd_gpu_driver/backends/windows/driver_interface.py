@@ -1,10 +1,10 @@
-"""Low-level ctypes bindings for D3DKMT APIs and escape commands.
+"""Low-level ctypes bindings for D3DKMT APIs and MCDM escape commands.
 
 Provides the Python ↔ kernel communication channel:
-  Python → gdi32.D3DKMTEscape → dxgkrnl.sys → DxgkDdiEscape → amdgpu_wddm.sys
+  Python → gdi32.D3DKMTEscape → dxgkrnl.sys → DxgkDdiEscape → amdgpu_mcdm.sys
 
 The escape buffer carries an AMDGPU_ESCAPE_HEADER followed by command-specific
-data, matching the structures defined in wddm_driver/amdgpu_wddm.h.
+data, matching the structures defined in kernel_driver/amdgpu_mcdm.h.
 """
 
 from __future__ import annotations
@@ -20,15 +20,9 @@ if sys.platform != "win32":
 
 # ============================================================================
 # D3DKMT API bindings (gdi32.dll)
-#
-# CRITICAL: D3DKMT_HANDLE is UINT (4 bytes), NOT HANDLE (8 bytes on x64).
-# Using wintypes.HANDLE causes struct misalignment and silent failures.
 # ============================================================================
 
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-
-# D3DKMT_HANDLE is typedef UINT, always 4 bytes
-D3DKMT_HANDLE = ctypes.c_uint32
 
 
 class LUID(ctypes.Structure):
@@ -39,21 +33,38 @@ class LUID(ctypes.Structure):
     ]
 
 
-# --- D3DKMTEnumAdapters2 ---
+# D3DKMT_HANDLE is a 32-bit UINT on ALL platforms (it is NOT a pointer-sized
+# HANDLE). Defining handle fields as wintypes.HANDLE (8 bytes on x64) mis-lays-out
+# every D3DKMT struct — wrong array stride for D3DKMT_ADAPTERINFO and misaligned
+# fields in D3DKMT_ESCAPE — which corrupts handles and makes escapes fail with
+# STATUS_INVALID_PARAMETER (0xC000000D). Use a 32-bit handle type for D3DKMT_HANDLE
+# fields specifically (real NT HANDLEs, e.g. event handles, stay wintypes.HANDLE).
+D3DKMT_HANDLE = ctypes.c_uint32
 
-class D3DKMT_ADAPTERINFO(ctypes.Structure):
+
+# --- D3DKMTEnumAdapters3 ---
+
+class D3DKMT_ENUMADAPTERS3(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", D3DKMT_HANDLE),
-        ("AdapterLuid", LUID),
-        ("NumOfSources", ctypes.c_uint32),
-        ("bPrecisePresentRegionsPreferred", wintypes.BOOL),
+        ("Filter", ctypes.c_uint64),  # D3DKMT_ENUMADAPTERS_FILTER
+        ("NumAdapters", ctypes.c_uint),
+        ("pAdapters", ctypes.c_void_p),  # D3DKMT_ADAPTERINFO*
     ]
 
 
 class D3DKMT_ENUMADAPTERS2(ctypes.Structure):
     _fields_ = [
-        ("NumAdapters", ctypes.c_uint32),
-        ("pAdapters", ctypes.POINTER(D3DKMT_ADAPTERINFO)),
+        ("NumAdapters", ctypes.c_uint),
+        ("pAdapters", ctypes.c_void_p),  # D3DKMT_ADAPTERINFO*
+    ]
+
+
+class D3DKMT_ADAPTERINFO(ctypes.Structure):
+    _fields_ = [
+        ("hAdapter", D3DKMT_HANDLE),
+        ("AdapterLuid", LUID),
+        ("NumOfSources", ctypes.c_uint),
+        ("bPrecisePresentRegionsPreferred", wintypes.BOOL),
     ]
 
 
@@ -82,10 +93,10 @@ class D3DKMT_ESCAPE(ctypes.Structure):
     _fields_ = [
         ("hAdapter", D3DKMT_HANDLE),
         ("hDevice", D3DKMT_HANDLE),
-        ("Type", ctypes.c_uint32),
-        ("Flags", ctypes.c_uint32),
+        ("Type", ctypes.c_uint),
+        ("Flags", ctypes.c_uint),
         ("pPrivateDriverData", ctypes.c_void_p),
-        ("PrivateDriverDataSize", ctypes.c_uint32),
+        ("PrivateDriverDataSize", ctypes.c_uint),
         ("hContext", D3DKMT_HANDLE),
     ]
 
@@ -96,11 +107,11 @@ class D3DKMT_CREATEDEVICE(ctypes.Structure):
     _fields_ = [
         ("hAdapter", D3DKMT_HANDLE),
         ("pCommandBuffer", ctypes.c_void_p),
-        ("CommandBufferSize", ctypes.c_uint32),
+        ("CommandBufferSize", ctypes.c_uint),
         ("pAllocationList", ctypes.c_void_p),
-        ("AllocationListSize", ctypes.c_uint32),
+        ("AllocationListSize", ctypes.c_uint),
         ("pPatchLocationList", ctypes.c_void_p),
-        ("PatchLocationListSize", ctypes.c_uint32),
+        ("PatchLocationListSize", ctypes.c_uint),
         ("hDevice", D3DKMT_HANDLE),
     ]
 
@@ -117,10 +128,10 @@ KMTQAITYPE_DRIVER_DESCRIPTION = 76  # Gets driver description string
 
 class D3DKMT_QUERYADAPTERINFO(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", D3DKMT_HANDLE),
-        ("Type", ctypes.c_uint32),
+        ("hAdapter", wintypes.HANDLE),
+        ("Type", ctypes.c_uint),
         ("pPrivateDriverData", ctypes.c_void_p),
-        ("PrivateDriverDataSize", ctypes.c_uint32),
+        ("PrivateDriverDataSize", ctypes.c_uint),
     ]
 
 
@@ -128,7 +139,9 @@ class D3DKMT_QUERYADAPTERINFO(ctypes.Structure):
 # Set up D3DKMT function prototypes
 # ============================================================================
 
-_D3DKMTEnumAdapters2 = gdi32.D3DKMTEnumAdapters2
+# D3DKMTEnumAdapters3 may not exist on older Windows — check at call time
+_D3DKMTEnumAdapters3 = getattr(gdi32, "D3DKMTEnumAdapters3", None)
+_D3DKMTEnumAdapters2 = getattr(gdi32, "D3DKMTEnumAdapters2", None)
 _D3DKMTOpenAdapterFromLuid = gdi32.D3DKMTOpenAdapterFromLuid
 _D3DKMTCloseAdapter = gdi32.D3DKMTCloseAdapter
 _D3DKMTEscape = gdi32.D3DKMTEscape
@@ -198,6 +211,10 @@ class EscapeGetInfoData(ctypes.Structure):
         ("Bars", BarInfo * 6),
         ("VramSizeBytes", ctypes.c_uint64),
         ("VisibleVramSizeBytes", ctypes.c_uint64),
+        # These trailing fields must be present so the buffer size matches the
+        # kernel's AMDGPU_ESCAPE_GET_INFO_DATA; the KMD's GET_INFO handler
+        # rejects an undersized buffer with STATUS_INVALID_PARAMETER (0xC000000D),
+        # which otherwise makes discovery report "no AMD GPU devices found".
         ("MmioBarIndex", ctypes.c_uint32),
         ("VramBarIndex", ctypes.c_uint32),
         ("Headless", ctypes.c_uint8),
@@ -295,9 +312,6 @@ class DeviceInfo:
     bars: list[dict[str, int | bool]]
     vram_size: int
     visible_vram_size: int
-    mmio_bar_index: int
-    vram_bar_index: int
-    headless: bool
 
 
 # ============================================================================
@@ -312,46 +326,55 @@ class DriverInterface:
     """
 
     def __init__(self) -> None:
-        self._adapter_handle: int | None = None
-        self._device_handle: int | None = None
+        self._adapter_handle: wintypes.HANDLE | None = None
+        self._device_handle: wintypes.HANDLE | None = None
         self._adapter_luid: LUID | None = None
 
     def enumerate_adapters(self) -> list[D3DKMT_ADAPTERINFO]:
-        """Enumerate all WDDM display adapters.
+        """Enumerate all WDDM adapters via D3DKMTEnumAdapters2.
 
-        Returns list of adapter info structs. Our MCDM device will
-        appear as a ComputeAccelerator with NumOfSources=0.
+        EnumAdapters2 returns D3DKMT_ADAPTERINFO entries whose hAdapter is
+        already open and directly usable for D3DKMTEscape — no
+        OpenAdapterFromLuid needed. EnumAdapters3 proved flaky on the gfx1201
+        VFIO VM (returned only 1-2 adapters with LUIDs that
+        D3DKMTOpenAdapterFromLuid rejected with STATUS_INVALID_PARAMETER);
+        EnumAdapters2 reliably returns every adapter (matches the validated
+        C escape probe). Our amdgpu_wddm device is identified later by
+        ESCAPE_GET_INFO returning AMD's vendor ID.
         """
-        # First call: get count
+        if _D3DKMTEnumAdapters2 is None:
+            raise RuntimeError(
+                "D3DKMTEnumAdapters2 not available — requires Windows 8+"
+            )
+
+        # First call: pAdapters=NULL -> NumAdapters returns the count.
         args = D3DKMT_ENUMADAPTERS2()
         args.NumAdapters = 0
         args.pAdapters = None
-
         status = _D3DKMTEnumAdapters2(ctypes.byref(args))
         _check_ntstatus(status, "D3DKMTEnumAdapters2 (count)")
 
         if args.NumAdapters == 0:
             return []
 
-        # Second call: get adapter info
+        # Second call: fill the array (EnumAdapters2 opens each hAdapter).
         adapter_array = (D3DKMT_ADAPTERINFO * args.NumAdapters)()
-        args.pAdapters = adapter_array
-
+        args.pAdapters = ctypes.cast(adapter_array, ctypes.c_void_p)
         status = _D3DKMTEnumAdapters2(ctypes.byref(args))
         _check_ntstatus(status, "D3DKMTEnumAdapters2 (list)")
 
         return list(adapter_array[:args.NumAdapters])
 
-    def open_adapter(self, luid: LUID) -> None:
-        """Open an adapter by its LUID."""
-        args = D3DKMT_OPENADAPTERFROMLUID()
-        args.AdapterLuid = luid
+    def open_adapter(self, adapter: D3DKMT_ADAPTERINFO) -> None:
+        """Bind to an adapter enumerated by enumerate_adapters().
 
-        status = _D3DKMTOpenAdapterFromLuid(ctypes.byref(args))
-        _check_ntstatus(status, "D3DKMTOpenAdapterFromLuid")
-
-        self._adapter_handle = args.hAdapter
-        self._adapter_luid = luid
+        EnumAdapters2 already opened ``adapter.hAdapter``; use it directly for
+        escapes (the validated path). This replaces OpenAdapterFromLuid, which
+        failed (STATUS_INVALID_PARAMETER) on this VM. close() releases it via
+        D3DKMTCloseAdapter.
+        """
+        self._adapter_handle = adapter.hAdapter
+        self._adapter_luid = adapter.AdapterLuid
 
     def create_device(self) -> None:
         """Create a D3DKMT device on the opened adapter.
@@ -399,7 +422,11 @@ class DriverInterface:
 
         args = D3DKMT_ESCAPE()
         args.hAdapter = self._adapter_handle
-        args.hDevice = self._device_handle if self._device_handle is not None else 0
+        # hDevice/hContext are 32-bit D3DKMT_HANDLE fields now (not pointers),
+        # so they must be 0 rather than None when unset. Adapter-level escapes
+        # (GET_INFO/READ_REG32/...) work with hDevice=0 — no device needed,
+        # matching the validated C escape probe.
+        args.hDevice = self._device_handle or 0
         args.Type = D3DKMT_ESCAPE_DRIVERPRIVATE
         args.Flags = 0
         args.pPrivateDriverData = ctypes.addressof(command_buffer)
@@ -440,9 +467,6 @@ class DriverInterface:
             bars=bars,
             vram_size=cmd.VramSizeBytes,
             visible_vram_size=cmd.VisibleVramSizeBytes,
-            mmio_bar_index=cmd.MmioBarIndex,
-            vram_bar_index=cmd.VramBarIndex,
-            headless=bool(cmd.Headless),
         )
 
     def read_reg32(self, offset: int, bar_index: int = 0) -> int:

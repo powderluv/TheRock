@@ -1,6 +1,6 @@
 """Adapter discovery — find our MCDM device among WDDM adapters.
 
-Uses D3DKMTEnumAdapters2 to enumerate adapters, then ESCAPE_GET_INFO
+Uses D3DKMTEnumAdapters3 to enumerate adapters, then ESCAPE_GET_INFO
 to identify which one is our AMD GPU MCDM compute device.
 """
 
@@ -46,8 +46,7 @@ def discover_devices() -> list[DiscoveredDevice]:
     for i, adapter in enumerate(adapters):
         probe = DriverInterface()
         try:
-            probe.open_adapter(adapter.AdapterLuid)
-            probe.create_device()
+            probe.open_adapter(adapter)
             info = probe.get_info()
         except RuntimeError:
             # Not our driver, or escape failed — skip
@@ -86,7 +85,6 @@ def open_device(device_index: int = 0) -> tuple[DriverInterface, DiscoveredDevic
     # Re-open the adapter for long-term use
     iface = DriverInterface()
     adapters = iface.enumerate_adapters()
-    iface.open_adapter(adapters[dev.adapter_index].AdapterLuid)
-    iface.create_device()
+    iface.open_adapter(adapters[dev.adapter_index])
 
     return iface, dev

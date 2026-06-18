@@ -6,6 +6,8 @@ communicating via D3DKMTEscape.
 
 from __future__ import annotations
 
+import ctypes
+
 from amd_gpu_driver.backends.base import (
     DeviceBackend,
     MemoryHandle,
@@ -35,12 +37,21 @@ class WindowsDevice(DeviceBackend):
     and will be implemented as the kernel driver gains capabilities.
     """
 
+    # VRAM MC base for gfx1201 (GMC framebuffer location = MC address of VRAM
+    # offset 0). The PSP bootloader and ring buffers need a GPU MC address, not
+    # a system-physical one (C2PMSG_36 = mc_addr >> 20).
+    _VRAM_MC_BASE = 0x8000000000
+
     def __init__(self) -> None:
         self._iface: DriverInterface | None = None
         self._device_info: DeviceInfo | None = None
         self._discovered: DiscoveredDevice | None = None
         self._device_index: int = 0
         self._opened = False
+        # VRAM bump allocator (over the VRAM BAR via MAP_VRAM). Reserve the
+        # low 32MB for scratch/probes, matching the macOS MacOSMemoryManager.
+        self._vram_cursor: int = 32 * 1024 * 1024
+        self._vram_maps: dict[int, tuple[int, int]] = {}
 
     def open(self, device_index: int = 0) -> None:
         """Open the AMD GPU MCDM device at the given index."""
@@ -111,19 +122,51 @@ class WindowsDevice(DeviceBackend):
     ) -> MemoryHandle:
         """Allocate GPU-accessible memory.
 
-        GTT: Uses ESCAPE_ALLOC_DMA for contiguous system memory.
-        VRAM: Uses ESCAPE_MAP_VRAM for BAR2-mapped VRAM.
-
-        Not yet implemented — requires kernel driver v0.3+.
+        VRAM: bump-allocate a region of the VRAM BAR, map it to a CPU VA via
+        the MAP_VRAM escape, and return a MemoryHandle whose gpu_addr is the
+        VRAM MC address (_VRAM_MC_BASE + offset) — what the PSP bootloader and
+        ring buffers require. GTT system memory is not allocated here; callers
+        use dev.driver.alloc_dma() directly for that.
+        Mirrors backends/macos/memory.py MacOSMemoryManager._alloc_vram.
         """
-        raise NotImplementedError(
-            "Memory allocation not yet implemented — "
-            "requires kernel driver v0.3+ (ALLOC_DMA / MAP_VRAM)"
+        if location != MemoryLocation.VRAM:
+            raise NotImplementedError(
+                f"alloc_memory(location={location}) not implemented on Windows; "
+                "use dev.driver.alloc_dma() for system memory"
+            )
+        page = 4096
+        size = (size + page - 1) & ~(page - 1)
+        if self._vram_cursor + size > self.vram_size:
+            raise MemoryError(
+                f"VRAM exhausted: requested {size}, "
+                f"available {self.vram_size - self._vram_cursor}"
+            )
+        offset = self._vram_cursor
+        self._vram_cursor += size
+        cpu_addr, mapping_handle = self.driver.map_vram(offset, size)
+        ctypes.memset(cpu_addr, 0, size)
+        handle = MemoryHandle(
+            gpu_addr=self._VRAM_MC_BASE + offset,
+            cpu_addr=cpu_addr,
+            size=size,
+            location=MemoryLocation.VRAM,
         )
+        self._vram_maps[id(handle)] = (mapping_handle, offset)
+        return handle
+
+    def read_vram(self, offset: int, length: int) -> bytes:
+        """Read `length` bytes of VRAM at byte `offset` (maps via MAP_VRAM).
+
+        Presence of this method also signals _alloc_psp_buffer to use the VRAM
+        path (it checks hasattr(dev, 'read_vram')).
+        """
+        cpu_addr, _handle = self.driver.map_vram(offset, length)
+        return ctypes.string_at(cpu_addr, length)
 
     def free_memory(self, handle: MemoryHandle) -> None:
-        """Free a previously allocated memory region."""
-        raise NotImplementedError("Memory free not yet implemented")
+        """Drop bookkeeping for a VRAM allocation. Mapping teardown is a no-op
+        for now (unmap is unreliable; the bring-up is short-lived)."""
+        self._vram_maps.pop(id(handle), None)
 
     def map_memory(self, handle: MemoryHandle) -> None:
         """Map memory into GPU page tables.

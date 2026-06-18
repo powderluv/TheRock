@@ -694,8 +694,12 @@ def _doorbell_cpu_addr(
     if mapped:
         return mapped + doorbell_index * 4
 
-    if getattr(nbio_config, "doorbell_phys_addr", 0) == 0:
-        return 0
+    # BAR2 is the doorbell aperture. On Windows the amdgpu_wddm KMD does not
+    # populate nbio_config.doorbell_phys_addr (GET_INFO leaves it 0), but
+    # MAP_BAR(2) maps the doorbell BAR directly (validated: BAR2 mappable;
+    # the 64-bit doorbell DWORD lives at byte index*4, e.g. idx 6 -> 0x18,
+    # matching the Linux/Tinygrad MEC ring0 doorbell). So do NOT gate on
+    # doorbell_phys_addr -- always try the BAR2 map.
     driver = getattr(dev, "driver", None)
     if driver is None or not hasattr(driver, "map_bar"):
         return 0

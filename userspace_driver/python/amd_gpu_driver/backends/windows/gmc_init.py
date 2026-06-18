@@ -13,6 +13,7 @@ Reference: Linux amdgpu gmc_v12_0.c, mmhub_v4_1_0.c, gfxhub_v12_0.c
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 
 # ============================================================================
 # MMHUB v4.1.0 register offsets (base_index 0 in MMHUB IP space)
-# These are DWORD offsets — multiply by 4 for byte offset from MMHUB base.
+# These are DWORD offsets - multiply by 4 for byte offset from MMHUB base.
 # ============================================================================
 
 # FB location
@@ -835,3 +836,74 @@ def init_gmc(
 
     print("  GMC: MMHUB GART enabled")
     return config
+
+
+def build_compute_gpuvm(
+    dev: WindowsDevice,
+    config: GMCConfig,
+    nbio_config,
+    target_gpu_addr: int,
+    va: int = 0x200000000000,
+) -> int:
+    """Build a 4-level GFXHUB GPUVM page table mapping virtual address ``va`` to
+    ``target_gpu_addr`` (a VRAM MC address) for VMID-0 compute waves, and enable
+    GCVM_CONTEXT0 at depth 3. Returns ``va`` for use as COMPUTE_PGM.
+
+    gfx12 specifics (verified against a live amdgpu compute dispatch on gfx1201):
+    - 4 levels PDB2(root)->PDB1->PDB0->PTB(leaf), each a 4KB VRAM page.
+    - Page-table addresses are 0-BASED VRAM OFFSETS (gpu_addr - vram_start), NOT
+      MC addresses - amdgpu's CTX page-table base reads 0x7F3.. (no 0x80 prefix).
+      Using MC addresses points the walker past VRAM -> WALKER_ERROR.
+    - PDE = VALID | next_offset; leaf PTE = VALID|EXEC|READ|WRITE|IS_PTE | offset.
+    - CONTEXT0_CNTL = ENABLE | PAGE_TABLE_DEPTH=3 | fault-enable bits (0x03FFFC07,
+      matching amdgpu). Must be programmed AFTER AUTOLOAD_RLC (which resets it).
+    Caller keeps the ring/MQD/fence on the FB-aperture physical fast-path (VMID 0);
+    only the shader needs this translation.
+    """
+    from amd_gpu_driver.backends.base import MemoryLocation
+    from amd_gpu_driver.backends.windows.nbio_init import hdp_flush
+
+    # AUTOLOAD_RLC reset the GFXHUB; re-enable the hub here (not in the general
+    # bring-up) so the control tests keep running on the physical FB-aperture
+    # path. We then re-point CONTEXT0 at the depth-3 page table below.
+    gfxhub_gart_enable(dev, config)
+
+    vram = config.vram_start
+    addr_mask = 0x0000FFFFFFFFF000
+
+    pdb2 = dev.alloc_memory(4096, MemoryLocation.VRAM)
+    pdb1 = dev.alloc_memory(4096, MemoryLocation.VRAM)
+    pdb0 = dev.alloc_memory(4096, MemoryLocation.VRAM)
+    ptb = dev.alloc_memory(4096, MemoryLocation.VRAM)
+    for h in (pdb2, pdb1, pdb0, ptb):
+        ctypes.memset(h.cpu_addr, 0, 4096)
+
+    def off(h):
+        return (h.gpu_addr - vram) & addr_mask
+
+    i2 = (va >> 39) & 0x1FF
+    i1 = (va >> 30) & 0x1FF
+    i0 = (va >> 21) & 0x1FF
+    ip_ = (va >> 12) & 0x1FF
+    leaf_flags = (AMDGPU_PTE_VALID | AMDGPU_PTE_EXECUTABLE | AMDGPU_PTE_READABLE
+                  | AMDGPU_PTE_WRITEABLE | AMDGPU_PTE_IS_PTE)
+    ctypes.c_uint64.from_address(pdb2.cpu_addr + i2 * 8).value = AMDGPU_PTE_VALID | off(pdb1)
+    ctypes.c_uint64.from_address(pdb1.cpu_addr + i1 * 8).value = AMDGPU_PTE_VALID | off(pdb0)
+    ctypes.c_uint64.from_address(pdb0.cpu_addr + i0 * 8).value = AMDGPU_PTE_VALID | off(ptb)
+    ctypes.c_uint64.from_address(ptb.cpu_addr + ip_ * 8).value = (
+        leaf_flags | ((target_gpu_addr - vram) & addr_mask))
+    hdp_flush(dev, nbio_config)
+
+    root = ((pdb2.gpu_addr - vram) & addr_mask) | AMDGPU_PTE_VALID
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, root & 0xFFFFFFFF)
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, (root >> 32) & 0xFFFFFFFF)
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32, 0)
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32, 0)
+    end = 0x7FFFFFFFFFFF
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32, (end >> 12) & 0xFFFFFFFF)
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32, (end >> 44) & 0xFFFFFFFF)
+    # ENABLE_CONTEXT(b0) | PAGE_TABLE_DEPTH=3(b1:2) | all PROTECTION_FAULT_ENABLE bits.
+    _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_CNTL, 0x03FFFC07)
+    hdp_flush(dev, nbio_config)
+    flush_gpu_tlb(dev, config, vmid=0, hub="gfxhub")
+    return va

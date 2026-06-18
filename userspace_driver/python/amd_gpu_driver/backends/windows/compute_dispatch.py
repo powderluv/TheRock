@@ -5,13 +5,13 @@ state to running compute workloads:
 
 Init sequence:
 1. Open device via D3DKMTEscape
-2. IP discovery — enumerate IP blocks and base addresses
-3. NBIO init — doorbell aperture, framebuffer access
-4. GMC init — memory controller, system aperture, GART
-5. PSP init — firmware loading (SOS, RLC, MEC, SDMA)
-6. IH init — interrupt handler ring
-7. Compute ring init — MQD, HQD registers, doorbell
-8. Self-test — NOP + RELEASE_MEM fence verification
+2. IP discovery - enumerate IP blocks and base addresses
+3. NBIO init - doorbell aperture, framebuffer access
+4. GMC init - memory controller, system aperture, GART
+5. PSP init - firmware loading (SOS, RLC, MEC, SDMA)
+6. IH init - interrupt handler ring
+7. Compute ring init - MQD, HQD registers, doorbell
+8. Self-test - NOP + RELEASE_MEM fence verification
 
 After bring-up, provides:
 - PM4 WRITE_DATA memory test (no shader needed)
@@ -36,8 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from amd_gpu_driver.backends.windows.device import WindowsDevice
+from amd_gpu_driver.backends.windows.device import WindowsDevice
 from amd_gpu_driver.backends.windows.ip_discovery import (
     IPDiscoveryResult,
     parse_ip_discovery,
@@ -91,7 +90,7 @@ WRITE_DATA_ENGINE_SEL_ME = 0
 
 
 # ============================================================================
-# GPUContext — holds all initialized subsystem configs
+# GPUContext - holds all initialized subsystem configs
 # ============================================================================
 
 @dataclass
@@ -159,17 +158,17 @@ def _build_dispatch_packets(
     """Build a complete PM4 command stream for compute dispatch.
 
     Sequence:
-    1. ACQUIRE_MEM — invalidate caches
-    2. SET_SH_REG — program address (COMPUTE_PGM_LO/HI)
-    3. SET_SH_REG — program resources (RSRC1, RSRC2)
-    4. SET_SH_REG — RSRC3
-    5. SET_SH_REG — scratch (TMPRING_SIZE = 0)
-    6. SET_SH_REG — restart coordinates
-    7. SET_SH_REG — kernarg pointer (USER_DATA_0/1)
-    8. SET_SH_REG — resource limits
-    9. SET_SH_REG — start coordinates + workgroup dimensions
+    1. ACQUIRE_MEM - invalidate caches
+    2. SET_SH_REG - program address (COMPUTE_PGM_LO/HI)
+    3. SET_SH_REG - program resources (RSRC1, RSRC2)
+    4. SET_SH_REG - RSRC3
+    5. SET_SH_REG - scratch (TMPRING_SIZE = 0)
+    6. SET_SH_REG - restart coordinates
+    7. SET_SH_REG - kernarg pointer (USER_DATA_0/1)
+    8. SET_SH_REG - resource limits
+    9. SET_SH_REG - start coordinates + workgroup dimensions
     10. DISPATCH_DIRECT
-    11. RELEASE_MEM — write fence value
+    11. RELEASE_MEM - write fence value
 
     Args:
         code_gpu_addr: GPU address of the kernel code entry point.
@@ -241,8 +240,9 @@ def _build_dispatch_packets(
         0, 0,                               # trailing zeros
     )
 
-    # 10. Dispatch
-    pm4.dispatch_direct(grid[0], grid[1], grid[2])
+    # 10. Dispatch (gfx12 wave32: COMPUTE_SHADER_EN|FORCE_START_000|ORDER_MODE|
+    #     CS_W32_EN = 0x8045; the default 0x5 launches wave64 and never retires)
+    pm4.dispatch_direct(grid[0], grid[1], grid[2], initiator=0x8045)
 
     # 11. CS_PARTIAL_FLUSH (ensures shader completion before fence)
     pm4.event_write(CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH)
@@ -258,13 +258,13 @@ def _build_dispatch_packets(
 
 
 # ============================================================================
-# Noop shader — minimal compute kernel for pipeline validation
+# Noop shader - minimal compute kernel for pipeline validation
 # ============================================================================
 
 # GFX12 s_endpgm = 0xBF810000 (SOPP format: opcode=1)
 # This shader does nothing and returns immediately. Used to verify
-# the dispatch pipeline works end-to-end (SET_SH_REG → DISPATCH_DIRECT
-# → CP fetches/executes shader → RELEASE_MEM writes fence).
+# the dispatch pipeline works end-to-end (SET_SH_REG -> DISPATCH_DIRECT
+# -> CP fetches/executes shader -> RELEASE_MEM writes fence).
 _NOOP_SHADER_CODE = struct.pack("<I", 0xBF810000)  # s_endpgm
 
 # Kernel descriptor for the noop shader (64 bytes)
@@ -272,7 +272,9 @@ _NOOP_SHADER_CODE = struct.pack("<I", 0xBF810000)  # s_endpgm
 #   kernel_code_entry_byte_offset = 64 (code starts after descriptor)
 #   compute_pgm_rsrc1: float_mode=0xC0, dx10_clamp=1, ieee_mode=1
 #   compute_pgm_rsrc2: enable_workgroup_id_x=1
-_NOOP_RSRC1 = (0xC0 << 12) | (1 << 21) | (1 << 23)  # 0x00AC0000
+# gfx12 RSRC1: VGPRS=3 (32 wave32), float_mode=0xC0, WGP_MODE|MEM_ORDERED|
+# FWD_PROGRESS (bits 29/30/31). The gfx9-style 0x00AC0000 mis-launches on gfx12.
+_NOOP_RSRC1 = 0xE00C0003
 _NOOP_RSRC2 = (1 << 7)  # enable_sgpr_workgroup_id_x
 
 
@@ -310,6 +312,31 @@ def _build_noop_kernel_image() -> tuple[bytes, int, int, int]:
 # GPU bring-up sequence
 # ============================================================================
 
+def _read_discovery_via_vram_bar(
+    dev: WindowsDevice, vram_size: int, read_size: int = 65536
+) -> bytes:
+    """Read the IP discovery table from the top of VRAM via the VRAM BAR.
+
+    The table lives at (vram_size - 64KB) in VRAM. read_discovery_table_via_mmio
+    feeds that VRAM byte-offset to SMN index/data, which cannot address VRAM
+    data (returns 0). When the full VRAM BAR is exposed (ReBAR on; e.g. the
+    32GB BAR0 on shark-a), map the region directly and read it. BAR0 = VRAM
+    (VramBarIndex=0 per GET_INFO).
+    """
+    base = vram_size - read_size
+    mapped_va, handle = dev.driver.map_bar(0, base, read_size)
+    data = ctypes.string_at(mapped_va, read_size)
+    try:
+        dev.driver.unmap_bar(handle)
+    except RuntimeError:
+        # unmap_bar currently fails STATUS_INVALID_PARAMETER (the KMD's
+        # UNMAP_BAR needs both MappingHandle and MappedAddress, but the Python
+        # helper only passes the handle). The read already succeeded; leak the
+        # 64KB mapping rather than abort discovery. TODO: fix unmap_bar.
+        pass
+    return data
+
+
 def full_gpu_bringup(
     device_index: int = 0,
     fw_dir: str | Path = ".",
@@ -335,7 +362,6 @@ def full_gpu_bringup(
 
     # --- 1. Open device ---
     print("\n[1/8] Opening device...")
-    from amd_gpu_driver.backends.windows.device import WindowsDevice
     dev = WindowsDevice()
     dev.open(device_index)
     print(f"  Device: {dev.name}")
@@ -343,12 +369,12 @@ def full_gpu_bringup(
 
     # --- 2. IP discovery ---
     print("\n[2/8] Running IP discovery...")
-    raw_table = read_discovery_table_via_mmio(
-        dev.read_reg_indirect, dev.vram_size)
+    raw_table = _read_discovery_via_vram_bar(dev, dev.vram_size)
     ip_result = parse_ip_discovery(raw_table)
     print(f"  Found {len(ip_result.ip_blocks)} IP blocks")
     for block in ip_result.ip_blocks:
-        print(f"    {block.hw_id.name}: "
+        hw = getattr(block.hw_id, "name", None) or f"hw_id={int(block.hw_id)}"
+        print(f"    {hw}: "
               f"v{block.major}.{block.minor}.{block.revision}")
 
     # --- 3. NBIO init ---
@@ -379,15 +405,109 @@ def full_gpu_bringup(
     try:
         load_all_firmware(dev, psp_config)
     except FileNotFoundError as e:
-        print(f"  WARNING: Firmware loading skipped — {e}")
+        print(f"  WARNING: Firmware loading skipped - {e}")
         print("  Continuing with VBIOS-initialized firmware state")
     except RuntimeError as e:
-        print(f"  WARNING: Firmware loading failed — {e}")
+        print(f"  WARNING: Firmware loading failed - {e}")
         print("  Continuing with VBIOS-initialized firmware state")
+
+    # --- 5b. SMU mailbox: SetDriverDramAddr + EnableAllSmuFeatures(0) ---
+    # Mirrors Linux _recipe_bringup [recipe 2/5]: after PSP AUTOLOAD_RLC the SMU
+    # must publish the driver DRAM addr and enable all features (param=0) so the
+    # IMU/RLC backdoor autoload can power up the GFX blocks and finish. WITHOUT
+    # this, RLC_RLCS_BOOTLOAD_STATUS bit31 never sets, the MEC stays down, and
+    # every compute dispatch fence-times-out. EnableAllSmuFeatures(0)=ALL (not
+    # 3=SOC); do NOT DisallowGfxOff (matches macOS recipe).
+    import os
+    os.environ.setdefault("AMDGPU_LITE_ENABLE_SMU_FEATURES", "1")
+    # On Windows the doorbell BAR is NOT effective under VFIO/WDDM passthrough,
+    # so the dispatch relies on the MMIO CP_HQD_PQ_WPTR write (LITE_NO_MMIO_WPTR=0)
+    # which does NOT wake GFXOFF -> DisallowGfxOff to keep the CP clocked.
+    os.environ.setdefault("AMDGPU_LITE_DISALLOW_GFXOFF", "1")
+    os.environ.setdefault("LITE_NO_MMIO_WPTR", "0")
+    print("\n[5b] SMU mailbox (SetDriverDramAddr + EnableAllSmuFeatures)...")
+    smu_config = None
+    try:
+        from amd_gpu_driver.backends.windows.smu_init import init_smu
+        smu_config = init_smu(
+            dev, ip_result,
+            disable_gfxoff=True,
+            vram_mc_base=gmc_config.vram_start,
+        )
+        print(f"  SMU: MP1[0]=0x{smu_config.mp1_base[0]:x} "
+              f"{smu_config.messages.name}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  SMU step failed (non-fatal): {e}")
+
+    # --- 5c. Poll RLC_RLCS_BOOTLOAD_STATUS bit31 (autoload completion) ---
+    # GC BASE_IDX=1 DWORD base = 0xA000 on gfx1201 (validated). bit31 =
+    # BOOTLOAD_COMPLETE. RESET_CTRL==0x7F when all 7 GFX blocks released;
+    # CORE_CTRL==0x8 when IMU running; RLC_CNTL==0x1 when RLC enabled.
+    _GC_B1_DW = 0xA000
+    _bl = 0
+    _deadline = time.monotonic() + 5.0
+    while time.monotonic() < _deadline:
+        _bl = dev.read_reg32((_GC_B1_DW + 0x4e7c) * 4)
+        if _bl & 0x80000000:
+            break
+        time.sleep(0.01)
+    _reset = dev.read_reg32((_GC_B1_DW + 0x40bc) * 4)
+    _core = dev.read_reg32((_GC_B1_DW + 0x40b6) * 4)
+    _rlc = dev.read_reg32((_GC_B1_DW + 0x4c00) * 4)
+    print(f"  BOOTLOAD_STATUS=0x{_bl:08x} RESET_CTRL=0x{_reset:08x} "
+          f"CORE_CTRL=0x{_core:x} RLC_CNTL=0x{_rlc:x}  [want bit31 set]")
+    if _bl & 0x80000000:
+        print("  PASS: BOOTLOAD_COMPLETE - RLC/IMU autoload succeeded")
+    else:
+        print("  FAIL: BOOTLOAD_COMPLETE not set within timeout")
 
     # --- 6. IH init ---
     print("\n[6/8] Initializing IH (interrupts)...")
     ih_config = init_ih(dev, ip_result, nbio_config)
+
+    # --- 6b. GFX/MEC enable for direct compute ---
+    # Mirrors Linux _recipe_bringup [recipe 4/5] (_recipe_mes_start +
+    # init_gfx_for_compute): set the MEC program counter from the gfx fw headers,
+    # program CP_MEC_DOORBELL_RANGE, enable the MEC pipes (clear HALT), enable
+    # MES. Without this the MEC never services the queue (RPTR stays 0 -> fence
+    # timeout). The LITE_MES_RECIPE PSP path doesn't populate ucode_start, so
+    # fill it from the fw headers (PFP/ME/MEC ucode_start @+52; MES uni_mes @+56).
+    print("\n[6b] GFX/MEC enable (init_gfx_for_compute)...")
+    try:
+        import struct as _struct
+        from pathlib import Path as _Path
+        from amd_gpu_driver.backends.windows.psp_init import (
+            _read_firmware as _rf,
+        )
+        from amd_gpu_driver.backends.windows.ring_init import (
+            init_gfx_for_compute,
+        )
+        _gc = psp_config.ip_versions.get("gc", "12_0_1")
+
+        def _rs64_entry(_name: str) -> int:
+            _b = _rf(_Path(fw_dir) / f"gc_{_gc}_{_name}.bin")
+            _lo, _hi = _struct.unpack_from("<II", _b, 52)
+            return (_hi << 32) | _lo
+
+        _mb = _rf(_Path(fw_dir) / f"gc_{_gc}_uni_mes.bin")
+        _mlo, _mhi = _struct.unpack_from("<II", _mb, 56)
+        _mes = (_mhi << 32) | _mlo
+        if not getattr(psp_config, "ucode_start", None):
+            psp_config.ucode_start = {}
+        psp_config.ucode_start.update({
+            "PFP": _rs64_entry("pfp"), "ME": _rs64_entry("me"),
+            "MEC": _rs64_entry("mec"), "MES": _mes, "MES1": _mes,
+        })
+        psp_config.mes_psp_loaded = True
+        init_gfx_for_compute(dev, ip_result, psp_config, smu_config)
+    except Exception as e:  # noqa: BLE001
+        print(f"  GFX/MEC enable failed (non-fatal): {e}")
+
+    # NOTE: GFXHUB GPUVM (gfxhub_gart_enable + CONTEXT0) is intentionally NOT
+    # enabled in the general bring-up. Enabling CONTEXT0 with fault-enable makes
+    # VMID-0 memory accesses (e.g. the WRITE_DATA self-test target) get GPUVM-
+    # translated and fault. Only the shader dispatch needs translation, so
+    # build_compute_gpuvm() sets the hub + page table up just before dispatch.
 
     # --- 7. Compute ring ---
     print("\n[7/8] Creating compute queue...")
@@ -398,7 +518,7 @@ def full_gpu_bringup(
     if test_compute_nop_fence(compute_queue):
         print("  PASS: NOP + RELEASE_MEM fence completed")
     else:
-        print("  FAIL: Fence timeout — GPU may not be processing commands")
+        print("  FAIL: Fence timeout - GPU may not be processing commands")
 
     print("\n" + "=" * 60)
     print("GPU bring-up complete!")
@@ -418,7 +538,7 @@ def full_gpu_bringup(
 
 
 # ============================================================================
-# Memory write test (PM4 WRITE_DATA — no shader needed)
+# Memory write test (PM4 WRITE_DATA - no shader needed)
 # ============================================================================
 
 def test_write_data(ctx: GPUContext, num_dwords: int = 16) -> bool:
@@ -516,43 +636,38 @@ def test_noop_dispatch(ctx: GPUContext) -> bool:
     print("\n--- Noop shader dispatch test ---")
     cq = ctx.compute_queue
 
-    # Build the noop kernel image
-    image, rsrc1, rsrc2, rsrc3 = _build_noop_kernel_image()
+    # Stage s_endpgm in VRAM at the 256-aligned base (no descriptor - a raw HW
+    # dispatch programs RSRC1/2 directly). The code MUST be in VRAM (alloc_dma is
+    # not GPU-fetchable on this KMD) and reachable via a GPUVM virtual address the
+    # compute wave's VMID-0 page table translates.
+    from amd_gpu_driver.backends.base import MemoryLocation
+    from amd_gpu_driver.backends.windows.gmc_init import build_compute_gpuvm
 
-    # Allocate DMA memory for the kernel code (256-byte aligned)
-    code_size = max(len(image), 4096)
-    code_cpu, code_bus, code_handle = ctx.dev.driver.alloc_dma(code_size)
-    ctypes.memset(code_cpu, 0, code_size)
-    ctypes.memmove(code_cpu, image, len(image))
+    code = ctx.dev.alloc_memory(4096, MemoryLocation.VRAM)
+    buf = (ctypes.c_uint32 * 16).from_address(code.cpu_addr)
+    for i in range(16):
+        buf[i] = 0xBF810000  # s_endpgm
+    shader_va = build_compute_gpuvm(
+        ctx.dev, ctx.gmc_config, ctx.nbio_config, code.gpu_addr)
 
-    # Code entry point is at offset 64 (after descriptor)
-    code_entry_addr = code_bus + 64
-
-    # Build dispatch packets (1x1x1 grid, 1x1x1 block — single thread)
     fence_seq = ctx.next_fence_seq()
     ctypes.c_uint64.from_address(cq.fence_cpu_addr).value = 0
-
     packets = _build_dispatch_packets(
-        code_gpu_addr=code_entry_addr,
-        kernarg_gpu_addr=0,  # No kernargs for noop
-        pgm_rsrc1=rsrc1,
-        pgm_rsrc2=rsrc2,
-        pgm_rsrc3=rsrc3,
+        code_gpu_addr=shader_va,          # GPUVM virtual address (not physical)
+        kernarg_gpu_addr=0,
+        pgm_rsrc1=_NOOP_RSRC1,
+        pgm_rsrc2=_NOOP_RSRC2,
+        pgm_rsrc3=0,
         grid=(1, 1, 1),
         block=(1, 1, 1),
         fence_addr=cq.fence_bus_addr,
         fence_value=fence_seq,
     )
-
     submit_compute_packets(cq, packets)
-
     if not wait_fence(cq, fence_seq, timeout_ms=5000):
         print("  FAIL: Fence timeout after noop dispatch")
-        ctx.dev.driver.free_dma(code_handle)
         return False
-
     print("  PASS: Noop shader dispatched and completed")
-    ctx.dev.driver.free_dma(code_handle)
     return True
 
 
@@ -796,7 +911,7 @@ def alloc_gpu_buffer(ctx: GPUContext, size: int) -> tuple[int, int, int]:
     """Allocate a DMA buffer accessible by both CPU and GPU.
 
     Returns:
-        (cpu_addr, bus_addr, handle) — cpu_addr for CPU access,
+        (cpu_addr, bus_addr, handle) - cpu_addr for CPU access,
         bus_addr for GPU access (as kernarg or output pointer).
     """
     cpu_addr, bus_addr, handle = ctx.dev.driver.alloc_dma(
