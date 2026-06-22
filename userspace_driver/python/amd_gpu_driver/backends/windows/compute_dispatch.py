@@ -154,8 +154,13 @@ def _build_dispatch_packets(
     block: tuple[int, int, int],
     fence_addr: int,
     fence_value: int,
+    kernarg_sgpr_index: int = 0,
 ) -> bytes:
     """Build a complete PM4 command stream for compute dispatch.
+
+    ``kernarg_sgpr_index`` is the USER_DATA SGPR slot that receives the kernarg
+    segment pointer (0 when kernarg is the first enabled preload SGPR, as for a
+    minimal kernel).
 
     Sequence:
     1. ACQUIRE_MEM - invalidate caches
@@ -222,9 +227,9 @@ def _build_dispatch_packets(
     # 6. Restart coordinates (zero)
     pm4.set_sh_reg(sh_reg_offset(COMPUTE_RESTART_X), 0, 0, 0)
 
-    # 7. Kernarg pointer
+    # 7. Kernarg pointer (in the USER_DATA slot the kernel descriptor expects)
     pm4.set_sh_reg(
-        sh_reg_offset(COMPUTE_USER_DATA_0),
+        sh_reg_offset(COMPUTE_USER_DATA_0 + kernarg_sgpr_index),
         kernarg_gpu_addr & 0xFFFFFFFF,
         (kernarg_gpu_addr >> 32) & 0xFFFFFFFF,
     )
@@ -680,22 +685,25 @@ def dispatch_elf_kernel(
     co_path: str | Path,
     grid: tuple[int, int, int],
     block: tuple[int, int, int],
-    args: list[int],
+    args: list,
     *,
     kernel_name: str | None = None,
     timeout_ms: int = 5000,
 ) -> bool:
     """Dispatch a compute kernel from a compiled ELF code object (.co file).
 
-    Loads the ELF, uploads code to DMA memory, builds kernarg buffer,
-    and dispatches via PM4. Waits for completion fence.
+    Loads the code into VRAM honoring section vaddrs, GPUVM-maps the code +
+    kernargs + pointer-arg buffers (VMID 0), packs the kernargs, dispatches via
+    PM4 and waits for the completion fence.
 
     Args:
         ctx: Initialized GPU context.
         co_path: Path to .co / .hsaco file compiled for the target GPU.
         grid: Dispatch dimensions (workgroups in x, y, z).
         block: Workgroup dimensions (threads in x, y, z).
-        args: Kernel arguments as 64-bit integers (GPU addresses or scalars).
+        args: Kernel arguments. Each is either a VRAM ``MemoryHandle`` (a pointer
+            argument -- its GPUVM-mapped VA is packed) or an int (a scalar,
+            packed verbatim).
         kernel_name: Specific kernel name (None = first kernel found).
         timeout_ms: Fence timeout in milliseconds.
 
@@ -704,105 +712,103 @@ def dispatch_elf_kernel(
     """
     from amd_gpu_driver.kernel.elf_parser import parse_elf_file
     from amd_gpu_driver.kernel.descriptor import KernelDescriptor
+    from amd_gpu_driver.backends.base import MemoryLocation, MemoryHandle
+    from amd_gpu_driver.backends.windows.gmc_init import map_compute_buffers
+    from amd_gpu_driver.backends.windows.nbio_init import hdp_flush
 
     co_path = Path(co_path)
     print(f"\n--- ELF kernel dispatch: {co_path.name} ---")
 
-    # Parse the ELF
     co = parse_elf_file(str(co_path))
-
-    # Find kernel symbol
     kernels = co.kernel_symbols()
     if not kernels:
         raise RuntimeError(f"No kernel symbols in {co_path}")
-
     if kernel_name is not None:
         matches = [k for k in kernels if k.name == kernel_name]
         if not matches:
-            available = [k.name for k in kernels]
             raise RuntimeError(
-                f"Kernel '{kernel_name}' not found. Available: {available}")
+                f"Kernel '{kernel_name}' not found. "
+                f"Available: {[k.name for k in kernels]}")
         kernel_sym = matches[0]
     else:
         kernel_sym = kernels[0]
-
     print(f"  Kernel: {kernel_sym.name}")
 
-    # Find the kernel descriptor
-    kd_name = kernel_sym.name + ".kd"
-    kd_syms = [s for s in co.symbols if s.name == kd_name]
+    # The kernel descriptor is the "<name>.kd" object symbol; read its 64 bytes
+    # from whichever allocated section its vaddr falls in.
+    kd_syms = [s for s in co.symbols if s.name == kernel_sym.name + ".kd"]
+    if not kd_syms:
+        raise RuntimeError(f"No kernel descriptor {kernel_sym.name}.kd in ELF")
+    kd_sym = kd_syms[0]
+    kd_sec = next((x for x in co.sections
+                   if x.sh_size and x.sh_addr <= kd_sym.st_value
+                   < x.sh_addr + x.sh_size), None)
+    if kd_sec is None:
+        raise RuntimeError("Kernel descriptor section not found")
+    kd = KernelDescriptor.from_bytes(
+        co.get_section_data(kd_sec)[kd_sym.st_value - kd_sec.sh_addr:][:64])
+    print(f"  RSRC1=0x{kd.compute_pgm_rsrc1:08X} RSRC2=0x{kd.compute_pgm_rsrc2:08X} "
+          f"RSRC3=0x{kd.compute_pgm_rsrc3:08X} kernarg={kd.kernarg_size} "
+          f"LDS={kd.group_segment_fixed_size}")
+    if kd.private_segment_fixed_size:
+        raise RuntimeError(
+            f"kernel needs {kd.private_segment_fixed_size} bytes of scratch "
+            "per work-item (scratch programming not yet implemented)")
 
-    if kd_syms and co.rodata_section is not None:
-        kd_sym = kd_syms[0]
-        rodata_data = co.get_section_data(co.rodata_section)
-        kd_offset = kd_sym.st_value - co.rodata_section.sh_addr
-        kd = KernelDescriptor.from_bytes(rodata_data, kd_offset)
-        descriptor_va = kd_sym.st_value
-    elif co.text_section is not None:
-        text_data = co.code
-        desc_offset = kernel_sym.st_value - co.text_section.sh_addr
-        kd = KernelDescriptor.from_bytes(text_data, desc_offset)
-        descriptor_va = kernel_sym.st_value
-    else:
-        raise RuntimeError("Cannot find kernel descriptor in ELF")
+    # Assemble the loadable image by SECTION VADDR -- on AMDGPU code objects the
+    # section vaddrs differ from their file offsets (e.g. .text loads above the
+    # descriptor). Upload it to a VRAM allocation; GPU VA(x) = code_va + x.
+    SHF_ALLOC, SHT_NOBITS = 0x2, 8
+    alloc_secs = [s for s in co.sections if (s.sh_flags & SHF_ALLOC) and s.sh_addr]
+    if not alloc_secs:
+        raise RuntimeError("No allocatable sections in ELF")
+    img_bytes = (max(s.sh_addr + s.sh_size for s in alloc_secs) + 0xFFF) & ~0xFFF
+    image = bytearray(img_bytes)
+    for s in alloc_secs:
+        if s.sh_type != SHT_NOBITS:
+            image[s.sh_addr:s.sh_addr + s.sh_size] = co.get_section_data(s)
+    code = ctx.dev.alloc_memory(img_bytes, MemoryLocation.VRAM)
+    ctypes.memmove(code.cpu_addr, bytes(image), img_bytes)
 
-    print(f"  RSRC1=0x{kd.compute_pgm_rsrc1:08X} "
-          f"RSRC2=0x{kd.compute_pgm_rsrc2:08X}")
-    print(f"  Kernarg size={kd.kernarg_size} bytes, "
-          f"LDS={kd.group_segment_fixed_size} bytes")
+    # Kernarg buffer in VRAM. Pointer args are VRAM MemoryHandles (their mapped
+    # VA is packed); scalar args are ints (packed verbatim).
+    kernarg = ctx.dev.alloc_memory(max(kd.kernarg_size, 4096), MemoryLocation.VRAM)
+    ctypes.memset(kernarg.cpu_addr, 0, kernarg.size)
+    ptr_handles = [a for a in args if isinstance(a, MemoryHandle)]
 
-    # Get code data
-    code_data = co.code
-    if not code_data:
-        raise RuntimeError("No .text section in ELF")
+    # GPUVM-map code + kernarg + pointer-arg buffers (one PTB, VMID 0).
+    vas = map_compute_buffers(ctx.dev, ctx.gmc_config, ctx.nbio_config,
+                              [code, kernarg] + ptr_handles)
+    code_va, kernarg_va = vas[0], vas[1]
+    handle_va = {id(h): v for h, v in zip(ptr_handles, vas[2:])}
 
-    text_va = (co.text_section.sh_addr
-               if co.text_section else 0)
-    code_entry_va = descriptor_va + kd.kernel_code_entry_byte_offset
-
-    # Upload code to DMA memory (256-byte aligned)
-    code_alloc_size = max(len(code_data), 4096)
-    code_alloc_size = (code_alloc_size + 255) & ~255  # 256-byte align
-    code_cpu, code_bus, code_handle = ctx.dev.driver.alloc_dma(code_alloc_size)
-    ctypes.memset(code_cpu, 0, code_alloc_size)
-    ctypes.memmove(code_cpu, code_data, len(code_data))
-
-    # Compute the code entry GPU address
-    # .text was loaded at code_bus, and code_entry_va is relative to text_va
-    code_entry_addr = code_bus + (code_entry_va - text_va)
-    print(f"  Code uploaded at bus 0x{code_bus:012X}")
-    print(f"  Code entry at bus 0x{code_entry_addr:012X}")
-
-    # Build kernarg buffer
-    kernarg_data = bytearray(max(kd.kernarg_size, 64))
+    kbuf = (ctypes.c_char * kernarg.size).from_address(kernarg.cpu_addr)
     offset = 0
     for arg in args:
-        struct.pack_into("<Q", kernarg_data, offset, arg & 0xFFFFFFFFFFFFFFFF)
+        value = (handle_va[id(arg)] if isinstance(arg, MemoryHandle)
+                 else arg & 0xFFFFFFFFFFFFFFFF)
+        struct.pack_into("<Q", kbuf, offset, value)
         offset += 8
 
-    # Write implicit dispatch packet (if kernarg_size accommodates it)
-    implicit_offset = (offset + 15) & ~15
-    if implicit_offset + 18 <= len(kernarg_data):
-        struct.pack_into(
-            "<III HHH", kernarg_data, implicit_offset,
-            grid[0], grid[1], grid[2],
-            block[0], block[1], block[2],
-        )
+    code_entry_va = code_va + (kd_sym.st_value + kd.kernel_code_entry_byte_offset)
 
-    # Upload kernarg to DMA memory
-    ka_size = max(len(kernarg_data), 4096)
-    ka_cpu, ka_bus, ka_handle = ctx.dev.driver.alloc_dma(ka_size)
-    ctypes.memset(ka_cpu, 0, ka_size)
-    ctypes.memmove(ka_cpu, bytes(kernarg_data), len(kernarg_data))
+    # The kernarg segment pointer lands in the USER_DATA slot following any
+    # earlier-enabled preload SGPRs (canonical order: private-seg-buffer=4,
+    # dispatch-ptr=2, queue-ptr=2, then kernarg-ptr).
+    slot = 0
+    if kd.enable_sgpr_private_segment_buffer:
+        slot += 4
+    if kd.enable_sgpr_dispatch_ptr:
+        slot += 2
+    if kd.enable_sgpr_queue_ptr:
+        slot += 2
 
-    # Build and submit dispatch
     cq = ctx.compute_queue
     fence_seq = ctx.next_fence_seq()
     ctypes.c_uint64.from_address(cq.fence_cpu_addr).value = 0
-
     packets = _build_dispatch_packets(
-        code_gpu_addr=code_entry_addr,
-        kernarg_gpu_addr=ka_bus,
+        code_gpu_addr=code_entry_va,
+        kernarg_gpu_addr=kernarg_va,
         pgm_rsrc1=kd.compute_pgm_rsrc1,
         pgm_rsrc2=kd.compute_pgm_rsrc2,
         pgm_rsrc3=kd.compute_pgm_rsrc3,
@@ -810,21 +816,16 @@ def dispatch_elf_kernel(
         block=block,
         fence_addr=cq.fence_bus_addr,
         fence_value=fence_seq,
+        kernarg_sgpr_index=slot,
     )
-
-    print(f"  Dispatching grid={grid} block={block}...")
+    print(f"  code_entry=0x{code_entry_va:X} kernarg=0x{kernarg_va:X} "
+          f"sgpr_slot={slot} grid={grid} block={block}")
     submit_compute_packets(cq, packets)
-
-    # Wait for completion
     if not wait_fence(cq, fence_seq, timeout_ms=timeout_ms):
         print(f"  FAIL: Fence timeout after {timeout_ms}ms")
-        ctx.dev.driver.free_dma(code_handle)
-        ctx.dev.driver.free_dma(ka_handle)
         return False
-
+    hdp_flush(ctx.dev, ctx.nbio_config)  # make GPU's VRAM writes CPU-visible
     print("  PASS: Dispatch completed")
-    ctx.dev.driver.free_dma(code_handle)
-    ctx.dev.driver.free_dma(ka_handle)
     return True
 
 
@@ -836,67 +837,56 @@ def test_fill_dispatch(
     ctx: GPUContext,
     co_path: str | Path,
     *,
-    num_elements: int = 256,
+    num_elements: int = 64,
     fill_value: int = 0xDEADBEEF,
     kernel_name: str = "fill_kernel",
 ) -> bool:
-    """Dispatch a fill kernel and verify the output buffer.
+    """Dispatch a real compiled fill kernel and verify the output buffer.
 
-    Requires a compiled fill_kernel for the target GPU:
-      __global__ void fill_kernel(uint32_t* out, uint32_t val) {
-          out[threadIdx.x + blockIdx.x * blockDim.x] = val;
-      }
+    The kernel reads its output pointer from the kernarg segment and writes
+    ``fill_value`` to ``out[tid]``. Output lives in VRAM and is GPUVM-mapped;
+    the kernarg's pointer arg is the output's mapped VA.
+
+    Uses a single workgroup (grid=1) so ``tid == local_id`` and the per-kernel
+    hidden args (get_local_size, multiplied by group_id=0) don't matter -- this
+    is the validated path. Filling >64 elements needs the COV5 implicit-args
+    layout for multi-workgroup grids (follow-on), so num_elements is clamped.
 
     Args:
         ctx: Initialized GPU context.
         co_path: Path to compiled fill kernel .co file.
-        num_elements: Number of uint32 elements to fill.
+        num_elements: Number of uint32 elements to fill (clamped to one block).
         fill_value: Value to fill with.
         kernel_name: Name of the kernel in the .co file.
 
     Returns:
         True if all elements match the fill value.
     """
+    from amd_gpu_driver.backends.base import MemoryLocation
+
+    if num_elements > 64:
+        print(f"  NOTE: clamping {num_elements} -> 64 (single workgroup; "
+              "multi-workgroup needs the implicit-args layout, follow-on)")
+        num_elements = 64
     print(f"\n--- Fill kernel test ({num_elements} elements) ---")
 
-    # Allocate output buffer
-    out_size = num_elements * 4
-    out_cpu, out_bus, out_handle = ctx.dev.driver.alloc_dma(
-        max(out_size, 4096))
-    ctypes.memset(out_cpu, 0, max(out_size, 4096))
+    out = ctx.dev.alloc_memory(4096, MemoryLocation.VRAM)
+    ctypes.memset(out.cpu_addr, 0, out.size)
 
-    # Dispatch
-    block_size = 64
-    grid_x = (num_elements + block_size - 1) // block_size
-    success = dispatch_elf_kernel(
-        ctx,
-        co_path,
-        grid=(grid_x, 1, 1),
-        block=(block_size, 1, 1),
-        args=[out_bus, fill_value],
+    if not dispatch_elf_kernel(
+        ctx, co_path,
+        grid=(1, 1, 1),
+        block=(num_elements, 1, 1),
+        args=[out, fill_value],
         kernel_name=kernel_name,
-    )
-
-    if not success:
-        ctx.dev.driver.free_dma(out_handle)
+    ):
         return False
 
-    # Verify output
-    result = (ctypes.c_uint32 * num_elements).from_address(out_cpu)
-    mismatches = 0
-    first_mismatch = -1
-    for i in range(num_elements):
-        if result[i] != fill_value:
-            mismatches += 1
-            if first_mismatch < 0:
-                first_mismatch = i
-
-    ctx.dev.driver.free_dma(out_handle)
-
-    if mismatches > 0:
-        print(f"  FAIL: {mismatches}/{num_elements} mismatches "
-              f"(first at index {first_mismatch}: "
-              f"got 0x{result[first_mismatch]:08X})")
+    result = (ctypes.c_uint32 * num_elements).from_address(out.cpu_addr)
+    bad = [i for i in range(num_elements) if result[i] != fill_value]
+    if bad:
+        print(f"  FAIL: {len(bad)}/{num_elements} mismatches "
+              f"(first at index {bad[0]}: got 0x{result[bad[0]]:08X})")
         return False
 
     print(f"  PASS: All {num_elements} elements = 0x{fill_value:08X}")

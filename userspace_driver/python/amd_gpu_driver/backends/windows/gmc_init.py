@@ -838,16 +838,19 @@ def init_gmc(
     return config
 
 
-def build_compute_gpuvm(
+def _program_compute_gpuvm(
     dev: WindowsDevice,
     config: GMCConfig,
     nbio_config,
-    target_gpu_addr: int,
-    va: int = 0x200000000000,
-) -> int:
-    """Build a 4-level GFXHUB GPUVM page table mapping virtual address ``va`` to
-    ``target_gpu_addr`` (a VRAM MC address) for VMID-0 compute waves, and enable
-    GCVM_CONTEXT0 at depth 3. Returns ``va`` for use as COMPUTE_PGM.
+    mappings,
+    va_root: int = 0x200000000000,
+) -> None:
+    """Build a 4-level GFXHUB page table for VMID-0 compute and enable CONTEXT0.
+
+    ``mappings`` is a list of ``(virtual_address, target_gpu_addr)`` pairs, one
+    per 4KB page. All pages must fall in the same 2MB region as ``va_root`` (one
+    leaf PTB) -- enough for a kernel's code + kernargs + small buffers; larger
+    working sets need multiple PTBs (follow-on).
 
     gfx12 specifics (verified against a live amdgpu compute dispatch on gfx1201):
     - 4 levels PDB2(root)->PDB1->PDB0->PTB(leaf), each a 4KB VRAM page.
@@ -858,7 +861,7 @@ def build_compute_gpuvm(
     - CONTEXT0_CNTL = ENABLE | PAGE_TABLE_DEPTH=3 | fault-enable bits (0x03FFFC07,
       matching amdgpu). Must be programmed AFTER AUTOLOAD_RLC (which resets it).
     Caller keeps the ring/MQD/fence on the FB-aperture physical fast-path (VMID 0);
-    only the shader needs this translation.
+    only the kernel's code + data need this translation.
     """
     from amd_gpu_driver.backends.base import MemoryLocation
     from amd_gpu_driver.backends.windows.nbio_init import hdp_flush
@@ -881,17 +884,22 @@ def build_compute_gpuvm(
     def off(h):
         return (h.gpu_addr - vram) & addr_mask
 
-    i2 = (va >> 39) & 0x1FF
-    i1 = (va >> 30) & 0x1FF
-    i0 = (va >> 21) & 0x1FF
-    ip_ = (va >> 12) & 0x1FF
+    i2 = (va_root >> 39) & 0x1FF
+    i1 = (va_root >> 30) & 0x1FF
+    i0 = (va_root >> 21) & 0x1FF
     leaf_flags = (AMDGPU_PTE_VALID | AMDGPU_PTE_EXECUTABLE | AMDGPU_PTE_READABLE
                   | AMDGPU_PTE_WRITEABLE | AMDGPU_PTE_IS_PTE)
     ctypes.c_uint64.from_address(pdb2.cpu_addr + i2 * 8).value = AMDGPU_PTE_VALID | off(pdb1)
     ctypes.c_uint64.from_address(pdb1.cpu_addr + i1 * 8).value = AMDGPU_PTE_VALID | off(pdb0)
     ctypes.c_uint64.from_address(pdb0.cpu_addr + i0 * 8).value = AMDGPU_PTE_VALID | off(ptb)
-    ctypes.c_uint64.from_address(ptb.cpu_addr + ip_ * 8).value = (
-        leaf_flags | ((target_gpu_addr - vram) & addr_mask))
+    for va, target_gpu_addr in mappings:
+        if (va >> 21) != (va_root >> 21):
+            raise ValueError(
+                f"compute GPUVM mapping 0x{va:X} is outside the 2MB region of "
+                f"0x{va_root:X} (multi-PTB mapping not yet supported)")
+        ip_ = (va >> 12) & 0x1FF
+        ctypes.c_uint64.from_address(ptb.cpu_addr + ip_ * 8).value = (
+            leaf_flags | ((target_gpu_addr - vram) & addr_mask))
     hdp_flush(dev, nbio_config)
 
     root = ((pdb2.gpu_addr - vram) & addr_mask) | AMDGPU_PTE_VALID
@@ -906,4 +914,41 @@ def build_compute_gpuvm(
     _gfxhub_wreg(dev, config, regGCVM_CONTEXT0_CNTL, 0x03FFFC07)
     hdp_flush(dev, nbio_config)
     flush_gpu_tlb(dev, config, vmid=0, hub="gfxhub")
+
+
+def build_compute_gpuvm(
+    dev: WindowsDevice,
+    config: GMCConfig,
+    nbio_config,
+    target_gpu_addr: int,
+    va: int = 0x200000000000,
+) -> int:
+    """Map a single VRAM page ``target_gpu_addr`` -> ``va`` for VMID-0 compute
+    (the noop shader self-test). Returns ``va`` for use as COMPUTE_PGM."""
+    _program_compute_gpuvm(dev, config, nbio_config, [(va, target_gpu_addr)], va)
     return va
+
+
+def map_compute_buffers(
+    dev: WindowsDevice,
+    config: GMCConfig,
+    nbio_config,
+    handles,
+    va_base: int = 0x200000000000,
+) -> list:
+    """GPUVM-map a list of VRAM buffers (MemoryHandles) contiguously for VMID-0
+    compute and enable CONTEXT0; return each handle's assigned virtual address
+    (in order). Used to dispatch a real kernel: map [code, kernargs,
+    *pointer-arg buffers]. All buffers must fit in one 2MB PTB (follow-on:
+    multi-PTB for larger working sets)."""
+    vas = []
+    mappings = []
+    cur = va_base
+    for h in handles:
+        npages = (h.size + 0xFFF) // 0x1000
+        vas.append(cur)
+        for p in range(npages):
+            mappings.append((cur + p * 0x1000, h.gpu_addr + p * 0x1000))
+        cur += npages * 0x1000
+    _program_compute_gpuvm(dev, config, nbio_config, mappings, va_base)
+    return vas
