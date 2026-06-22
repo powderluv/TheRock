@@ -1647,3 +1647,790 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
            (bootStatus & 0x80000000) ? "set" : "clear");
     return pass;
 }
+
+/* ======================================================================
+ * Increment 2a: MEC enable + direct compute HQD queue + NOP/RELEASE_MEM
+ *
+ * Faithful C++ transcription of the proven probe path:
+ *   python/amd_gpu_driver/backends/windows/ring_init.py
+ *     init_gfx_for_compute (CP PFP/ME/MEC counters from gc fw ucode_start,
+ *       RLC/SH_MEM/doorbell-range, _enable_mec), init_compute_queue +
+ *       _init_compute_mqd + _activate_compute_queue_mmio,
+ *       submit_compute_packets, wait_fence, grbm_select/deselect
+ *   python/amd_gpu_driver/commands/pm4.py (PM4PacketBuilder: NOP + RELEASE_MEM)
+ *   python/amd_gpu_driver/probe16_vmid0.py + probe_kernel.py
+ *     (rs64()/uni_mes ucode_start extraction; VMID 0 stays default)
+ *
+ * GC register addressing matches _gc_reg/_gc_wreg exactly:
+ *   byte_offset = (gc_base[base_idx] + reg) * 4
+ *   base_idx 0 -> ipd.gcBase  (gc_base[0])
+ *   base_idx 1 -> ipd.gcBase1 (gc_base[1]; == 0xA000 on gfx1201)
+ * This is the same scheme recipeBootload uses for the BOOTLOAD read
+ * (0xA000 + 0x4e7c == gcBase1 + regRLC_RLCS_BOOTLOAD_STATUS).
+ * ====================================================================== */
+
+/* ---- GC 12.0 register DWORD offsets (gc_12_0_0_offset.h, ring_init.py) ---- */
+
+/* GRBM */
+#define regGRBM_GFX_CNTL             0x0900   /* base_idx 1 */
+#define regGRBM_CNTL                 0x0DA0   /* base_idx 0 */
+
+/* CP/RLC engine bring-up */
+#define regCP_PFP_PRGRM_CNTR_START      0x1E44  /* base_idx 0 */
+#define regCP_ME_PRGRM_CNTR_START       0x1E45  /* base_idx 0 */
+#define regCP_PFP_PRGRM_CNTR_START_HI   0x1E59  /* base_idx 0 */
+#define regCP_ME_PRGRM_CNTR_START_HI    0x1E79  /* base_idx 0 */
+#define regCP_ME_CNTL                   0x0803  /* base_idx 1 */
+#define regCP_MEC_RS64_PRGRM_CNTR_START     0x2900  /* base_idx 1 */
+#define regCP_MEC_RS64_CNTL                 0x2904  /* base_idx 1 */
+#define regCP_MEC_RS64_PRGRM_CNTR_START_HI  0x2938  /* base_idx 1 */
+#define regCP_MEC_DOORBELL_RANGE_LOWER  0x1DFC  /* base_idx 0 */
+#define regCP_MEC_DOORBELL_RANGE_UPPER  0x1DFD  /* base_idx 0 */
+#define regRLC_CNTL                     0x4C00  /* base_idx 1 */
+#define regRLC_SRM_CNTL                 0x4C80  /* base_idx 1 */
+#define regRLC_SPM_MC_CNTL              0x0982  /* base_idx 1 */
+#define regSH_MEM_BASES                 0x09E3  /* base_idx 1 */
+#define regSH_MEM_CONFIG                0x09E4  /* base_idx 1 */
+#define regTCP_CNTL                     0x19A2  /* base_idx 1 */
+
+/* CP HQD registers (base_idx 0, direct queue programming) */
+#define regCP_MQD_BASE_ADDR                 0x1FA9
+#define regCP_MQD_BASE_ADDR_HI              0x1FAA
+#define regCP_HQD_ACTIVE                    0x1FAB
+#define regCP_HQD_VMID                      0x1FAC
+#define regCP_HQD_PERSISTENT_STATE          0x1FAD
+#define regCP_HQD_PIPE_PRIORITY             0x1FAE
+#define regCP_HQD_QUEUE_PRIORITY            0x1FAF
+#define regCP_HQD_QUANTUM                   0x1FB0
+#define regCP_HQD_PQ_BASE                   0x1FB1
+#define regCP_HQD_PQ_BASE_HI                0x1FB2
+#define regCP_HQD_PQ_RPTR                   0x1FB3
+#define regCP_HQD_PQ_RPTR_REPORT_ADDR       0x1FB4
+#define regCP_HQD_PQ_RPTR_REPORT_ADDR_HI    0x1FB5
+#define regCP_HQD_PQ_WPTR_POLL_ADDR         0x1FB6
+#define regCP_HQD_PQ_WPTR_POLL_ADDR_HI      0x1FB7
+#define regCP_HQD_PQ_DOORBELL_CONTROL       0x1FB8
+#define regCP_HQD_PQ_CONTROL                0x1FBA
+#define regCP_HQD_IB_CONTROL                0x1FBE
+#define regCP_MQD_CONTROL                   0x1FCB
+#define regCP_HQD_EOP_BASE_ADDR             0x1FCE
+#define regCP_HQD_EOP_BASE_ADDR_HI          0x1FCF
+#define regCP_HQD_EOP_CONTROL               0x1FD0
+#define regCP_HQD_HQ_STATUS0                0x1FC9
+#define regCP_HQD_AQL_CONTROL               0x1FDE
+#define regCP_HQD_PQ_WPTR_LO                0x1FDF
+#define regCP_HQD_PQ_WPTR_HI                0x1FE0
+
+/* GRBM_GFX_CNTL bit shifts */
+#define GRBM_GFX_CNTL__PIPEID__SHIFT   0
+#define GRBM_GFX_CNTL__MEID__SHIFT     2
+#define GRBM_GFX_CNTL__VMID__SHIFT     4
+#define GRBM_GFX_CNTL__QUEUEID__SHIFT  8
+
+/* CP engine control bits */
+#define CP_ME_CNTL__PFP_PIPE0_RESET    0x00040000
+#define CP_ME_CNTL__ME_PIPE0_RESET     0x00100000
+#define CP_ME_CNTL__PFP_HALT           0x04000000
+#define CP_ME_CNTL__ME_HALT            0x10000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_RESET    0x00010000
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_RESET    0x00020000
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_RESET    0x00040000
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_RESET    0x00080000
+#define CP_MEC_RS64_CNTL__MEC_PIPE0_ACTIVE   0x04000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE1_ACTIVE   0x08000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE2_ACTIVE   0x10000000
+#define CP_MEC_RS64_CNTL__MEC_PIPE3_ACTIVE   0x20000000
+#define CP_MEC_RS64_CNTL__MEC_INVALIDATE_ICACHE 0x00000010
+#define CP_MEC_RS64_CNTL__MEC_HALT           0x40000000
+
+/* CP_HQD_PQ_DOORBELL_CONTROL bits */
+#define HQD_DOORBELL_OFFSET__SHIFT   2
+#define HQD_DOORBELL_EN              (1u << 30)
+
+/* CP_HQD_PQ_CONTROL bits */
+#define PQ_CONTROL__QUEUE_SIZE__SHIFT       0
+#define PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT  8
+#define PQ_CONTROL__PQ_EMPTY                (1u << 15)
+#define PQ_CONTROL__MIN_AVAIL_SIZE__SHIFT   20
+#define PQ_CONTROL__NO_UPDATE_RPTR          (1u << 27)
+#define PQ_CONTROL__UNORD_DISPATCH          (1u << 28)
+#define PQ_CONTROL__PRIV_STATE              (1u << 30)
+#define PQ_CONTROL__KMD_QUEUE               (1u << 31)
+
+/* CP_HQD_PERSISTENT_STATE */
+#define HQD_PERSISTENT_STATE__PRELOAD_REQ        (1u << 0)
+#define HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT 8
+#define HQD_PERSISTENT_STATE__PRELOAD_SIZE       0x55
+#define HQD_PERSISTENT_STATE_DEFAULT             0x0BE05501u
+
+/* v12_compute_mqd */
+#define MQD_HEADER          0xC0310800u
+#define MQD_SIZE_BYTES      (256 * 4)
+
+/* Default ring/EOP sizes (match the lite direct queue). */
+#define COMPUTE_RING_SIZE   (4 * 1024)
+#define EOP_BUFFER_SIZE     (4 * 1024)
+
+/* Doorbell layout (SOC24/Navi). DWORD offsets (slots << 1). */
+#define DOORBELL_MEC_RING_START   0x006
+#define DOORBELL_MEC_RING_STRIDE  0x2
+
+/* NBIF/NBIO (base_idx 2). nbio_init.py. */
+#define RCP_HWID_NBIF                108
+#define regRCC_DOORBELL_APER_EN      0x00C0
+#define BIF_DOORBELL_APER_EN__BIT    0x00000001
+#define regBIF_FB_EN                 0x0100
+#define BIF_FB_EN__FB_READ_EN        0x00000001
+#define BIF_FB_EN__FB_WRITE_EN       0x00000002
+#define regHDP_MEM_COHERENCY_FLUSH   0x00F7
+
+/* PM4 (pm4.py). */
+#define PACKET3_NOP                  0x10
+#define PACKET3_RELEASE_MEM          0x49
+#define EVENT_TYPE_CACHE_FLUSH_AND_INV_TS_EVENT 0x14
+#define DATA_SEL_SEND_64BIT          2
+#define INT_SEL_SEND_INT_ON_CONFIRM  2
+#define RELEASE_MEM_EVENT_INDEX_EOP  5
+#define PACKET3_RELEASE_MEM_GCR_GLM_WB   (1u << 12)
+#define PACKET3_RELEASE_MEM_GCR_GLM_INV  (1u << 13)
+#define PACKET3_RELEASE_MEM_GCR_GLV_INV  (1u << 14)
+#define PACKET3_RELEASE_MEM_GCR_GL1_INV  (1u << 15)
+#define PACKET3_RELEASE_MEM_GCR_GL2_INV  (1u << 20)
+#define PACKET3_RELEASE_MEM_GCR_GL2_WB   (1u << 21)
+#define PACKET3_RELEASE_MEM_GCR_SEQ      (1u << 22)
+
+/* Compute queue state (mirror of ComputeQueueConfig, NOP+fence subset). */
+struct CqState {
+    uint32_t gcBase0;       /* gc_base[0] */
+    uint32_t gcBase1;       /* gc_base[1] */
+
+    void    *ringCpu;
+    uint64_t ringGpu;
+    uint64_t ringHandle;
+    uint32_t ringSize;
+
+    void    *mqdCpu;
+    uint64_t mqdGpu;
+    uint64_t mqdHandle;
+
+    void    *eopCpu;
+    uint64_t eopGpu;
+    uint64_t eopHandle;
+
+    volatile uint32_t *wptrCpu;
+    uint64_t wptrGpu;
+    uint64_t wptrHandle;
+
+    volatile uint32_t *rptrCpu;
+    uint64_t rptrGpu;
+    uint64_t rptrHandle;
+
+    volatile uint64_t *fenceCpu;
+    uint64_t fenceGpu;
+    uint64_t fenceHandle;
+
+    uint32_t doorbellIndex;     /* DWORD offset */
+    volatile uint32_t *doorbellCpu;   /* 64-bit doorbell DWORD via BAR2 */
+    void    *doorbellBarHandle;
+
+    /* Queue identity for GRBM_SELECT. */
+    uint32_t me;    /* 1 = MEC0 (compute) */
+    uint32_t pipe;
+    uint32_t queue;
+
+    uint64_t wptr;  /* in DWORDs */
+
+    /* NBIO base for HDP flush + doorbell aperture. */
+    uint32_t nbifBase2;
+    bool hasNbif;
+};
+
+/* integer log2 for power-of-two sizes (math.log2 in ring_init.py). */
+static uint32_t cqLog2(uint32_t v)
+{
+    uint32_t r = 0;
+    while (v > 1) { v >>= 1; r++; }
+    return r;
+}
+
+/* GC register access: byte_offset = (gc_base[base_idx] + reg) * 4. */
+static uint32_t gcReg(WddmLite &gpu, const CqState &cq, uint32_t reg, int baseIdx)
+{
+    uint32_t base = (baseIdx == 0) ? cq.gcBase0 : cq.gcBase1;
+    uint32_t v = 0;
+    gpu.readReg32((base + reg) * 4, &v);
+    return v;
+}
+
+static void gcWreg(WddmLite &gpu, const CqState &cq, uint32_t reg,
+                   uint32_t val, int baseIdx)
+{
+    uint32_t base = (baseIdx == 0) ? cq.gcBase0 : cq.gcBase1;
+    gpu.writeReg32((base + reg) * 4, val);
+}
+
+static void gcWregPair(WddmLite &gpu, const CqState &cq, uint32_t regLo,
+                       uint32_t regHi, uint64_t value, int baseIdx)
+{
+    gcWreg(gpu, cq, regLo, (uint32_t)(value & 0xFFFFFFFF), baseIdx);
+    gcWreg(gpu, cq, regHi, (uint32_t)((value >> 32) & 0xFFFFFFFF), baseIdx);
+}
+
+/* grbm_select / grbm_deselect (ring_init.py, soc21_grbm_select). */
+static void cqGrbmSelect(WddmLite &gpu, const CqState &cq, uint32_t me,
+                         uint32_t pipe, uint32_t queue, uint32_t vmid)
+{
+    uint32_t val = 0;
+    val |= (pipe & 0x3) << GRBM_GFX_CNTL__PIPEID__SHIFT;
+    val |= (me & 0x3) << GRBM_GFX_CNTL__MEID__SHIFT;
+    val |= (vmid & 0xF) << GRBM_GFX_CNTL__VMID__SHIFT;
+    val |= (queue & 0x7) << GRBM_GFX_CNTL__QUEUEID__SHIFT;
+    /* GRBM_GFX_CNTL is base_idx 1 on GC 12. */
+    gpu.writeReg32((cq.gcBase1 + regGRBM_GFX_CNTL) * 4, val);
+}
+
+static void cqGrbmDeselect(WddmLite &gpu, const CqState &cq)
+{
+    cqGrbmSelect(gpu, cq, 0, 0, 0, 0);
+}
+
+/* _pulse_reset_bits (ring_init.py). */
+static void cqPulseReset(WddmLite &gpu, const CqState &cq, uint32_t reg,
+                         uint32_t mask, int baseIdx)
+{
+    uint32_t v = gcReg(gpu, cq, reg, baseIdx);
+    gcWreg(gpu, cq, reg, v | mask, baseIdx);
+    v = gcReg(gpu, cq, reg, baseIdx);
+    gcWreg(gpu, cq, reg, v & ~mask, baseIdx);
+}
+
+/* rs64(name): read gc_<gc>_<name>.bin, struct.unpack_from("<II", blob, off)
+ * -> entry = (hi << 32) | lo. RS64 (PFP/ME/MEC) read off=52; MES reads off=56
+ * (probe16_vmid0.py / probe_kernel.py). Returns 0 on failure (treated as
+ * "missing" by the caller, matching _config_mec_from_ucode). */
+static uint64_t cqUcodeStart(const char *fwDir, const char *gc,
+                             const char *name, size_t off, bool *ok)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s\\gc_%s_%s.bin", fwDir, gc, name);
+    std::vector<uint8_t> blob;
+    if (!loadFirmwareFile(path, blob)) {
+        if (ok) *ok = false;
+        return 0;
+    }
+    uint32_t lo = rcpU32(blob, off);
+    uint32_t hi = rcpU32(blob, off + 4);
+    if (ok) *ok = true;
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Resolve the NBIF base_idx 2 (nbio_init.py resolve_nbio_bases). Falls back to
+ * OSSSYS if NBIF is not enumerated (matches the Python fallback). */
+static bool cqResolveNbif(const IpDiscoveryResult &ipd, uint32_t *base2)
+{
+    bool found = false;
+    uint32_t fallback = 0;
+    bool haveFallback = false;
+    for (uint32_t i = 0; i < ipd.numBlocks; i++) {
+        const IpBlock &b = ipd.blocks[i];
+        if (b.hwId == RCP_HWID_NBIF && b.instance == 0) {
+            if (b.numBaseAddrs > 2) { *base2 = b.baseAddrs[2]; found = true; }
+            break;
+        }
+        if (b.hwId == HWID_OSSSYS && b.instance == 0 && b.numBaseAddrs > 2) {
+            fallback = b.baseAddrs[2];
+            haveFallback = true;
+        }
+    }
+    if (!found && haveFallback) { *base2 = fallback; found = true; }
+    return found;
+}
+
+/* hdp_flush (nbio_init.py): write 0 to regHDP_MEM_COHERENCY_FLUSH (NBIF idx 2). */
+static void cqHdpFlush(WddmLite &gpu, const CqState &cq)
+{
+    if (!cq.hasNbif) return;
+    gpu.writeReg32((cq.nbifBase2 + regHDP_MEM_COHERENCY_FLUSH) * 4, 0);
+}
+
+/* _config_mec_from_ucode (ring_init.py): program CP PFP/ME/MEC program
+ * counters from ucode_start, reset+unhalt PFP/ME, reset MEC pipes. */
+static void cqConfigMecFromUcode(WddmLite &gpu, const CqState &cq,
+                                 uint64_t pfp, uint64_t me, uint64_t mec)
+{
+    cqGrbmSelect(gpu, cq, 0, 0, 0, 0);
+    gcWregPair(gpu, cq, regCP_PFP_PRGRM_CNTR_START,
+               regCP_PFP_PRGRM_CNTR_START_HI, pfp >> 2, 0);
+    gcWregPair(gpu, cq, regCP_ME_PRGRM_CNTR_START,
+               regCP_ME_PRGRM_CNTR_START_HI, me >> 2, 0);
+    cqGrbmDeselect(gpu, cq);
+
+    cqPulseReset(gpu, cq, regCP_ME_CNTL,
+                 CP_ME_CNTL__PFP_PIPE0_RESET | CP_ME_CNTL__ME_PIPE0_RESET, 1);
+    uint32_t val = gcReg(gpu, cq, regCP_ME_CNTL, 1);
+    val &= ~(CP_ME_CNTL__PFP_HALT | CP_ME_CNTL__ME_HALT);
+    gcWreg(gpu, cq, regCP_ME_CNTL, val, 1);
+
+    for (uint32_t pipe = 0; pipe < 4; pipe++) {
+        cqGrbmSelect(gpu, cq, 1, pipe, 0, 0);
+        gcWregPair(gpu, cq, regCP_MEC_RS64_PRGRM_CNTR_START,
+                   regCP_MEC_RS64_PRGRM_CNTR_START_HI, mec >> 2, 1);
+    }
+    cqGrbmDeselect(gpu, cq);
+
+    cqPulseReset(gpu, cq, regCP_MEC_RS64_CNTL,
+                 CP_MEC_RS64_CNTL__MEC_PIPE0_RESET |
+                 CP_MEC_RS64_CNTL__MEC_PIPE1_RESET |
+                 CP_MEC_RS64_CNTL__MEC_PIPE2_RESET |
+                 CP_MEC_RS64_CNTL__MEC_PIPE3_RESET, 1);
+    printf("  GFX: CP PFP/ME/MEC program counters configured\n");
+}
+
+/* _enable_mec (ring_init.py): clear reset/halt/icache-inv, set all 4 pipes
+ * active. Expected CP_MEC_RS64_CNTL readback = 0x3C000000. */
+static void cqEnableMec(WddmLite &gpu, const CqState &cq)
+{
+    uint32_t val = gcReg(gpu, cq, regCP_MEC_RS64_CNTL, 1);
+    val &= ~(CP_MEC_RS64_CNTL__MEC_INVALIDATE_ICACHE |
+             CP_MEC_RS64_CNTL__MEC_PIPE0_RESET |
+             CP_MEC_RS64_CNTL__MEC_PIPE1_RESET |
+             CP_MEC_RS64_CNTL__MEC_PIPE2_RESET |
+             CP_MEC_RS64_CNTL__MEC_PIPE3_RESET |
+             CP_MEC_RS64_CNTL__MEC_HALT);
+    val |= (CP_MEC_RS64_CNTL__MEC_PIPE0_ACTIVE |
+            CP_MEC_RS64_CNTL__MEC_PIPE1_ACTIVE |
+            CP_MEC_RS64_CNTL__MEC_PIPE2_ACTIVE |
+            CP_MEC_RS64_CNTL__MEC_PIPE3_ACTIVE);
+    gcWreg(gpu, cq, regCP_MEC_RS64_CNTL, val, 1);
+    Sleep(50);
+}
+
+/* init_gfx_for_compute (ring_init.py), reduced to the PSP-autoload path used
+ * by the probe: _rlc_backdoor_autoload is a no-op (PSP already autoloaded),
+ * so this programs CP counters, RLC/SH_MEM/doorbell-range, and enables the MEC.
+ * MES enable is NOT needed for the direct-MMIO compute HQD (probe does not use
+ * MES for the queue; that is increment 2b/MES work). */
+static bool cqInitGfxForCompute(WddmLite &gpu, CqState &cq,
+                                uint64_t pfp, uint64_t me, uint64_t mec,
+                                bool haveUcode)
+{
+    if (haveUcode)
+        cqConfigMecFromUcode(gpu, cq, pfp, me, mec);
+    else
+        printf("  GFX: WARNING ucode_start missing; skipping CP program counters\n");
+
+    uint32_t tcp = gcReg(gpu, cq, regTCP_CNTL, 1);
+    gcWreg(gpu, cq, regTCP_CNTL, tcp | 0x20000000, 1);
+    gcWreg(gpu, cq, regRLC_CNTL, 0x1, 1);
+    uint32_t rlcSrm = gcReg(gpu, cq, regRLC_SRM_CNTL, 1);
+    gcWreg(gpu, cq, regRLC_SRM_CNTL, rlcSrm | 0x3, 1);
+    gcWreg(gpu, cq, regRLC_SPM_MC_CNTL, 0xF, 1);
+
+    uint32_t grbmCntl = gcReg(gpu, cq, regGRBM_CNTL, 0);
+    gcWreg(gpu, cq, regGRBM_CNTL, (grbmCntl & ~0xFFF) | 0xFF, 0);
+
+    uint32_t shMemConfig = (3u << 2) | (3u << 14);
+    uint32_t shMemBases = (1u << 16) | 2u;
+    for (uint32_t vmid = 0; vmid < 16; vmid++) {
+        cqGrbmSelect(gpu, cq, 0, 0, 0, vmid);
+        gcWreg(gpu, cq, regSH_MEM_CONFIG, shMemConfig, 1);
+        gcWreg(gpu, cq, regSH_MEM_BASES, shMemBases, 1);
+    }
+    cqGrbmDeselect(gpu, cq);
+
+    gcWreg(gpu, cq, regCP_MEC_DOORBELL_RANGE_LOWER, 0, 0);
+    gcWreg(gpu, cq, regCP_MEC_DOORBELL_RANGE_UPPER, (0x8A * 2) << 2, 0);
+
+    cqEnableMec(gpu, cq);
+    uint32_t mecCntl = gcReg(gpu, cq, regCP_MEC_RS64_CNTL, 1);
+    printf("  GFX: MEC enabled (CP_MEC_RS64_CNTL=0x%08X)\n", mecCntl);
+    return true;
+}
+
+/* _init_compute_mqd (ring_init.py): build the v12 compute MQD image. */
+static void cqInitMqd(CqState &cq)
+{
+    volatile uint32_t *mqd = (volatile uint32_t *)cq.mqdCpu;
+    memset(cq.mqdCpu, 0, MQD_SIZE_BYTES);
+
+    mqd[0] = MQD_HEADER;
+    mqd[1] = 1;                  /* compute_dispatch_initiator */
+    mqd[11] = 1;                 /* compute_pipelinestat_enable */
+    mqd[23] = 0xFFFFFFFF;        /* SE0 thread mgmt */
+    mqd[24] = 0xFFFFFFFF;        /* SE1 */
+    mqd[26] = 0xFFFFFFFF;        /* SE2 */
+    mqd[27] = 0xFFFFFFFF;        /* SE3 */
+    mqd[32] = 0x00000007;        /* compute_misc_reserved */
+
+    mqd[128] = (uint32_t)(cq.mqdGpu & 0xFFFFFFFC);
+    mqd[129] = (uint32_t)((cq.mqdGpu >> 32) & 0xFFFFFFFF);
+    mqd[130] = 1;                /* cp_hqd_active */
+    mqd[131] = 0;                /* cp_hqd_vmid = 0 */
+    mqd[132] = (HQD_PERSISTENT_STATE_DEFAULT & ~(0x3FFu << 8)) |
+               (HQD_PERSISTENT_STATE__PRELOAD_SIZE <<
+                HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT) |
+               HQD_PERSISTENT_STATE__PRELOAD_REQ;
+    mqd[133] = 0x2;
+    mqd[134] = 0xF;
+    mqd[135] = 0x111;
+
+    uint64_t pqBase = cq.ringGpu >> 8;
+    mqd[136] = (uint32_t)(pqBase & 0xFFFFFFFF);
+    mqd[137] = (uint32_t)((pqBase >> 32) & 0xFFFFFFFF);
+    mqd[138] = 0;
+
+    mqd[139] = (uint32_t)(cq.rptrGpu & 0xFFFFFFFC);
+    mqd[140] = (uint32_t)((cq.rptrGpu >> 32) & 0xFFFF);
+    mqd[141] = (uint32_t)(cq.wptrGpu & 0xFFFFFFF8);
+    mqd[142] = (uint32_t)((cq.wptrGpu >> 32) & 0xFFFF);
+
+    uint32_t doorbellCtrl = 0;
+    doorbellCtrl |= (cq.doorbellIndex & 0x03FFFFFF) << HQD_DOORBELL_OFFSET__SHIFT;
+    doorbellCtrl |= HQD_DOORBELL_EN;
+    mqd[143] = doorbellCtrl;
+
+    uint32_t ringSizeLog2 = cqLog2(cq.ringSize / 4) - 1;
+    uint32_t pqControl = 0;
+    pqControl |= (ringSizeLog2 & 0x3F) << PQ_CONTROL__QUEUE_SIZE__SHIFT;
+    pqControl |= (5u & 0x3F) << PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
+    pqControl |= PQ_CONTROL__PQ_EMPTY;
+    pqControl |= 3u << PQ_CONTROL__MIN_AVAIL_SIZE__SHIFT;
+    pqControl |= PQ_CONTROL__NO_UPDATE_RPTR;
+    pqControl |= PQ_CONTROL__UNORD_DISPATCH;
+    pqControl |= PQ_CONTROL__PRIV_STATE;
+    pqControl |= PQ_CONTROL__KMD_QUEUE;
+    mqd[145] = pqControl;
+
+    mqd[162] = 1u << 8;          /* cp_mqd_control PRIV_STATE */
+
+    uint64_t eopBase = cq.eopGpu >> 8;
+    mqd[165] = (uint32_t)(eopBase & 0xFFFFFFFF);
+    mqd[166] = (uint32_t)((eopBase >> 32) & 0xFFFFFFFF);
+    mqd[167] = cqLog2(EOP_BUFFER_SIZE / 4) - 1;
+
+    mqd[149] = 3u << 20;         /* cp_hqd_ib_control */
+    mqd[160] = 0x20004000;       /* cp_hqd_hq_status0 */
+    mqd[181] = 0;                /* cp_hqd_aql_control (non-AQL) */
+    mqd[182] = 0;
+    mqd[183] = 0;
+    mqd[184] = 1u << 15;         /* reserved_184: unmapped doorbell handling */
+}
+
+/* _activate_compute_queue_mmio (ring_init.py): program CP_HQD_* directly under
+ * grbm_select(me,pipe,queue) and activate. VMID 0 (cp_hqd_vmid &= ~0xF). */
+static void cqActivateQueueMmio(WddmLite &gpu, CqState &cq)
+{
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+
+    gcWreg(gpu, cq, regCP_HQD_ACTIVE, 0, 0);
+
+    uint32_t vmid = gcReg(gpu, cq, regCP_HQD_VMID, 0);
+    gcWreg(gpu, cq, regCP_HQD_VMID, vmid & ~0xFu, 0);
+
+    uint32_t dctl = gcReg(gpu, cq, regCP_HQD_PQ_DOORBELL_CONTROL, 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_DOORBELL_CONTROL, dctl & ~HQD_DOORBELL_EN, 0);
+
+    gcWreg(gpu, cq, regCP_MQD_BASE_ADDR, (uint32_t)(cq.mqdGpu & 0xFFFFFFFC), 0);
+    gcWreg(gpu, cq, regCP_MQD_BASE_ADDR_HI,
+           (uint32_t)((cq.mqdGpu >> 32) & 0xFFFFFFFF), 0);
+
+    gcWreg(gpu, cq, regCP_MQD_CONTROL, 0, 0);
+
+    uint64_t pqBase = cq.ringGpu >> 8;
+    gcWreg(gpu, cq, regCP_HQD_PQ_BASE, (uint32_t)(pqBase & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_BASE_HI,
+           (uint32_t)((pqBase >> 32) & 0xFFFFFFFF), 0);
+
+    gcWreg(gpu, cq, regCP_HQD_PQ_RPTR_REPORT_ADDR,
+           (uint32_t)(cq.rptrGpu & 0xFFFFFFFC), 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_RPTR_REPORT_ADDR_HI,
+           (uint32_t)((cq.rptrGpu >> 32) & 0xFFFF), 0);
+
+    uint32_t ringSizeLog2 = cqLog2(cq.ringSize / 4) - 1;
+    uint32_t pqControl = 0;
+    pqControl |= (ringSizeLog2 & 0x3F) << PQ_CONTROL__QUEUE_SIZE__SHIFT;
+    pqControl |= (5u & 0x3F) << PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT;
+    pqControl |= PQ_CONTROL__PQ_EMPTY;
+    pqControl |= 3u << PQ_CONTROL__MIN_AVAIL_SIZE__SHIFT;
+    pqControl |= PQ_CONTROL__NO_UPDATE_RPTR;
+    pqControl |= PQ_CONTROL__UNORD_DISPATCH;
+    pqControl |= PQ_CONTROL__PRIV_STATE;
+    pqControl |= PQ_CONTROL__KMD_QUEUE;
+    gcWreg(gpu, cq, regCP_HQD_PQ_CONTROL, pqControl, 0);
+
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_POLL_ADDR,
+           (uint32_t)(cq.wptrGpu & 0xFFFFFFF8), 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_POLL_ADDR_HI,
+           (uint32_t)((cq.wptrGpu >> 32) & 0xFFFF), 0);
+
+    gcWreg(gpu, cq, regCP_HQD_PQ_RPTR, 0, 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_LO, 0, 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_HI, 0, 0);
+
+    uint32_t doorbellCtrl = 0;
+    doorbellCtrl |= (cq.doorbellIndex & 0x03FFFFFF) << HQD_DOORBELL_OFFSET__SHIFT;
+    doorbellCtrl |= HQD_DOORBELL_EN;
+    gcWreg(gpu, cq, regCP_HQD_PQ_DOORBELL_CONTROL, doorbellCtrl, 0);
+
+    uint32_t persistent = (HQD_PERSISTENT_STATE_DEFAULT & ~(0x3FFu << 8)) |
+                          (HQD_PERSISTENT_STATE__PRELOAD_SIZE <<
+                           HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT) |
+                          HQD_PERSISTENT_STATE__PRELOAD_REQ;
+    gcWreg(gpu, cq, regCP_HQD_PERSISTENT_STATE, persistent, 0);
+    gcWreg(gpu, cq, regCP_HQD_PIPE_PRIORITY, 0x2, 0);
+    gcWreg(gpu, cq, regCP_HQD_QUEUE_PRIORITY, 0xF, 0);
+    gcWreg(gpu, cq, regCP_HQD_QUANTUM, 0x111, 0);
+    gcWreg(gpu, cq, regCP_HQD_IB_CONTROL, 3u << 20, 0);
+    gcWreg(gpu, cq, regCP_HQD_HQ_STATUS0, 0x20004000, 0);
+    gcWreg(gpu, cq, regCP_HQD_AQL_CONTROL, 0, 0);
+
+    uint64_t eopBase = cq.eopGpu >> 8;
+    gcWreg(gpu, cq, regCP_HQD_EOP_BASE_ADDR, (uint32_t)(eopBase & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regCP_HQD_EOP_BASE_ADDR_HI,
+           (uint32_t)((eopBase >> 32) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regCP_HQD_EOP_CONTROL, cqLog2(EOP_BUFFER_SIZE / 4) - 1, 0);
+
+    cqHdpFlush(gpu, cq);
+
+    gcWreg(gpu, cq, regCP_HQD_ACTIVE, 1, 0);
+
+    cqGrbmDeselect(gpu, cq);
+}
+
+/* init_compute_queue (ring_init.py), direct-MMIO path. Allocates VRAM-backed
+ * ring/MQD/EOP/wptr/rptr/fence buffers, maps the doorbell via BAR2, builds the
+ * MQD and activates the HQD. */
+static bool cqInitComputeQueue(WddmLite &gpu, CqState &cq)
+{
+    cq.ringSize = COMPUTE_RING_SIZE;
+    cq.me = 1;            /* MEC0 */
+    cq.pipe = 0;
+    cq.queue = 0;
+    cq.doorbellIndex = DOORBELL_MEC_RING_START +
+                       (cq.pipe * 4 + cq.queue) * DOORBELL_MEC_RING_STRIDE;
+    cq.wptr = 0;
+
+    void *cpu = nullptr;
+    if (!rcpAllocVram(gpu, cq.ringSize, &cpu, &cq.ringGpu, &cq.ringHandle))
+        return false;
+    cq.ringCpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cq.mqdCpu, &cq.mqdGpu, &cq.mqdHandle))
+        return false;
+    if (!rcpAllocVram(gpu, EOP_BUFFER_SIZE, &cq.eopCpu, &cq.eopGpu, &cq.eopHandle))
+        return false;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &cq.wptrGpu, &cq.wptrHandle))
+        return false;
+    cq.wptrCpu = (volatile uint32_t *)cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &cq.rptrGpu, &cq.rptrHandle))
+        return false;
+    cq.rptrCpu = (volatile uint32_t *)cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &cq.fenceGpu, &cq.fenceHandle))
+        return false;
+    cq.fenceCpu = (volatile uint64_t *)cpu;
+
+    /* Doorbell: BAR2 at byte offset doorbell_index * 4 (nbio/ring_init.py:
+     * MAP_BAR(2, idx*4, 8)). */
+    void *dbAddr = nullptr;
+    cq.doorbellCpu = nullptr;
+    cq.doorbellBarHandle = nullptr;
+    if (gpu.mapBar(2, (uint64_t)cq.doorbellIndex * 4, 8, &dbAddr,
+                   &cq.doorbellBarHandle) && dbAddr) {
+        cq.doorbellCpu = (volatile uint32_t *)dbAddr;
+    } else {
+        printf("  Compute: WARNING doorbell BAR2 map failed "
+               "(index=0x%X) -- doorbell write will be skipped\n",
+               cq.doorbellIndex);
+    }
+
+    cqInitMqd(cq);
+    cqActivateQueueMmio(gpu, cq);
+
+    printf("  Compute: Queue ME=%u pipe=%u queue=%u activated via direct MMIO\n",
+           cq.me, cq.pipe, cq.queue);
+    printf("  Compute: Ring MC=0x%012llX size=%uKB\n",
+           (unsigned long long)cq.ringGpu, cq.ringSize / 1024);
+    printf("  Compute: Doorbell index=0x%X cpu=%p\n",
+           cq.doorbellIndex, (void *)cq.doorbellCpu);
+    return true;
+}
+
+/* submit_compute_packets (ring_init.py): write packets to the ring, advance
+ * wptr, wptr-writeback, HDP flush, MMIO wptr write (LITE_NO_MMIO_WPTR=0 on this
+ * KMD), then ring the doorbell. */
+static void cqSubmitPackets(WddmLite &gpu, CqState &cq,
+                            const std::vector<uint32_t> &packets)
+{
+    uint32_t ringMask = cq.ringSize - 1;             /* byte mask */
+    uint32_t byteOffset = (cq.wptr * 4) & ringMask;
+    uint32_t bytes = (uint32_t)(packets.size() * 4);
+
+    uint8_t *ring = (uint8_t *)cq.ringCpu;
+    uint32_t spaceToEnd = cq.ringSize - byteOffset;
+    if (bytes <= spaceToEnd) {
+        memcpy(ring + byteOffset, packets.data(), bytes);
+    } else {
+        memcpy(ring + byteOffset, packets.data(), spaceToEnd);
+        memcpy(ring, (const uint8_t *)packets.data() + spaceToEnd,
+               bytes - spaceToEnd);
+    }
+
+    cq.wptr += (uint32_t)packets.size();
+
+    /* wptr writeback (64-bit). */
+    *(volatile uint64_t *)cq.wptrCpu = cq.wptr;
+
+    cqHdpFlush(gpu, cq);
+
+    /* MMIO wptr write under grbm_select (LITE_NO_MMIO_WPTR=0). */
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_LO, cq.wptr & 0xFFFFFFFF, 0);
+    gcWreg(gpu, cq, regCP_HQD_PQ_WPTR_HI, (cq.wptr >> 32) & 0xFFFFFFFF, 0);
+    cqGrbmDeselect(gpu, cq);
+
+    /* Ring the doorbell (64-bit write to the doorbell BAR). */
+    if (cq.doorbellCpu)
+        *(volatile uint64_t *)cq.doorbellCpu = cq.wptr;
+}
+
+/* wait_fence (ring_init.py): poll the 64-bit fence buffer until >= expected. */
+static bool cqWaitFence(CqState &cq, uint64_t expected, int timeoutMs)
+{
+    int waited = 0;
+    while (waited < timeoutMs) {
+        if (*cq.fenceCpu >= expected)
+            return true;
+        Sleep(1);
+        waited += 1;
+    }
+    return false;
+}
+
+/* PM4 helpers (pm4.py). Append a Type-3 packet: header + payload. */
+static void pm4Pkt3(std::vector<uint32_t> &dw, uint32_t opcode,
+                    const uint32_t *payload, uint32_t n)
+{
+    uint32_t header = (3u << 30) | (((n - 1) & 0x3FFF) << 16) | (opcode << 8);
+    dw.push_back(header);
+    for (uint32_t i = 0; i < n; i++)
+        dw.push_back(payload[i]);
+}
+
+static void pm4Nop(std::vector<uint32_t> &dw, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t zero = 0;
+        pm4Pkt3(dw, PACKET3_NOP, &zero, 1);
+    }
+}
+
+/* RELEASE_MEM fence with cache_flush=True, use_gcr=True (pm4.py defaults from
+ * test_compute_nop_fence). 7-dword body. */
+static void pm4ReleaseMemFence(std::vector<uint32_t> &dw, uint64_t addr,
+                               uint64_t value)
+{
+    uint32_t dw0 = (EVENT_TYPE_CACHE_FLUSH_AND_INV_TS_EVENT & 0x3F) |
+                   ((RELEASE_MEM_EVENT_INDEX_EOP & 0xF) << 8);
+    dw0 |= PACKET3_RELEASE_MEM_GCR_GLV_INV |
+           PACKET3_RELEASE_MEM_GCR_GL1_INV |
+           PACKET3_RELEASE_MEM_GCR_GL2_INV |
+           PACKET3_RELEASE_MEM_GCR_GLM_WB |
+           PACKET3_RELEASE_MEM_GCR_GLM_INV |
+           PACKET3_RELEASE_MEM_GCR_GL2_WB |
+           PACKET3_RELEASE_MEM_GCR_SEQ;
+    uint32_t dw1 = ((DATA_SEL_SEND_64BIT & 0x7) << 29) |
+                   ((INT_SEL_SEND_INT_ON_CONFIRM & 0x3) << 24);
+    uint32_t payload[7];
+    payload[0] = dw0;
+    payload[1] = dw1;
+    payload[2] = (uint32_t)(addr & 0xFFFFFFFF);
+    payload[3] = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
+    payload[4] = (uint32_t)(value & 0xFFFFFFFF);
+    payload[5] = (uint32_t)((value >> 32) & 0xFFFFFFFF);
+    payload[6] = 0;   /* ctxid */
+    pm4Pkt3(dw, PACKET3_RELEASE_MEM, payload, 7);
+}
+
+/* ---- Top-level: recipeNopFence -------------------------------------------- */
+
+bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase)
+{
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. recipeBootload owns the
+     * PSP ring/cmd/fence buffers; those are not needed after BOOTLOAD for the
+     * direct-MMIO compute path (the HQD reads its own ring/MQD), so we do not
+     * persist its RecipePspState. */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  NOP: recipeBootload did not reach BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    printf("\n=== recipeNopFence (MEC + compute HQD + NOP/RELEASE_MEM) ===\n");
+
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+
+    cq.hasNbif = cqResolveNbif(ipd, &cq.nbifBase2);
+    if (cq.hasNbif) {
+        /* init_nbio (nbio_init.py): enable the doorbell aperture + framebuffer
+         * so the doorbell write reaches the CP. */
+        uint32_t apEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+        gpu.writeReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                       apEn | BIF_DOORBELL_APER_EN__BIT);
+        uint32_t fbEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+        gpu.writeReg32((cq.nbifBase2 + regBIF_FB_EN) * 4,
+                       fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+        printf("  NBIO: doorbell aperture + framebuffer enabled "
+               "(NBIF base[2]=0x%04X)\n", cq.nbifBase2);
+    } else {
+        printf("  NBIO: WARNING NBIF base[2] not found; HDP flush + doorbell "
+               "aperture skipped\n");
+    }
+
+    /* ucode_start: rs64() for PFP/ME/MEC (gfx-header entry @52). */
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+    if (haveUcode)
+        printf("  GFX: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+               (unsigned long long)pfp, (unsigned long long)me,
+               (unsigned long long)mec);
+
+    /* 2. init_gfx_for_compute (MEC enable). */
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode))
+        return false;
+    uint32_t mecCntl = gcReg(gpu, cq, regCP_MEC_RS64_CNTL, 1);
+
+    /* 3. init_compute_queue (direct-MMIO HQD, VMID 0). */
+    if (!cqInitComputeQueue(gpu, cq))
+        return false;
+
+    /* 4. NOP + RELEASE_MEM fence. */
+    uint64_t fenceSeq = 1;
+    *cq.fenceCpu = 0;
+    std::vector<uint32_t> packets;
+    pm4Nop(packets, 4);
+    pm4ReleaseMemFence(packets, cq.fenceGpu, fenceSeq);
+    cqSubmitPackets(gpu, cq, packets);
+
+    bool ok = cqWaitFence(cq, fenceSeq, 5000);
+
+    /* Read rptr via grbm_select(me=1,pipe=0,queue=0) (probe16_vmid0.py). */
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    uint32_t rptr = gcReg(gpu, cq, regCP_HQD_PQ_RPTR, 0);
+    cqGrbmDeselect(gpu, cq);
+    uint64_t fenceVal = *cq.fenceCpu;
+
+    printf("\nCP_MEC_RS64_CNTL=0x%08X (expected 0x3C000000)\n", mecCntl);
+    printf("FENCE value=%llu (expected %llu)\n",
+           (unsigned long long)fenceVal, (unsigned long long)fenceSeq);
+    printf("RPTR=0x%X (wptr=%u)\n", rptr, cq.wptr);
+    printf("NOP+FENCE %s\n", ok ? "PASS" : "FAIL (fence timeout)");
+    return ok;
+}

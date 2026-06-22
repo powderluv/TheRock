@@ -329,6 +329,8 @@ public:
     bool writeReg32(uint32_t offset, uint32_t value, uint32_t barIndex = 0);
     bool mapVram(uint64_t offset, uint64_t length, void **addr, void **handle);
     bool unmapVram(void *addr, void *handle);
+    bool mapBar(uint32_t barIndex, uint64_t offset, uint64_t length,
+                void **addr, void **handle);
     bool readVram(uint64_t offset, uint64_t length, void *buffer);
     bool allocDma(uint64_t size, void **cpuAddr, uint64_t *busAddr, void **handle);
     bool freeDma(void *handle);
@@ -499,4 +501,26 @@ bool loadFirmwareFile(const char *path, std::vector<uint8_t> &data);
  * Returns true if RLC_RLCS_BOOTLOAD_STATUS bit31 is set (0x8000003f).
  * ====================================================================== */
 bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * Increment 2a: MEC enable + direct compute HQD queue + NOP + RELEASE_MEM
+ *
+ * recipeNopFence() mirrors the proven Python probe (probe16_vmid0.py +
+ * ring_init.py):
+ *   1. recipeBootload() -> BOOTLOAD_COMPLETE (PSP autoload).
+ *   2. init_gfx_for_compute equivalent: program CP PFP/ME/MEC program
+ *      counters from the gc fw ucode_start, RLC/SH_MEM/doorbell-range,
+ *      then enable the MEC (CP_MEC_RS64_CNTL -> 0x3C000000).
+ *   3. init_compute_queue equivalent: alloc ring/MQD/EOP/rptr/wptr/fence
+ *      in VRAM, build the v12 compute MQD, activate the HQD directly via
+ *      CP_HQD_* MMIO under grbm_select(me=1,pipe=0,queue=0) at VMID 0.
+ *   4. submit_compute_packets: NOP*4 + RELEASE_MEM fence to the ring,
+ *      wptr writeback + MMIO wptr write + doorbell (BAR2).
+ *   5. wait_fence: PASS iff the RELEASE_MEM fence value appears.
+ *
+ * fwDir/vramMcBase are passed straight through to recipeBootload(). This
+ * is 2a (NOP+fence) only -- no GPUVM page tables, no shader dispatch.
+ * ====================================================================== */
+bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
                     const char *fwDir, uint64_t vramMcBase);

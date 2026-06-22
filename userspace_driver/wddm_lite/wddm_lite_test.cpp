@@ -346,6 +346,36 @@ static void testRecipeBootload(WddmLite &gpu)
 }
 
 /* ======================================================================
+ * Test: MEC enable + direct compute HQD queue + NOP + RELEASE_MEM fence
+ *
+ * Runs recipeNopFence(): recipeBootload() (-> BOOTLOAD_COMPLETE) THEN
+ * init_gfx_for_compute (MEC enable) + init_compute_queue (direct-MMIO HQD,
+ * VMID 0) + NOP + RELEASE_MEM fence. Firmware is read from g_fwDir
+ * (Z:\winfw, override with argv[2]).
+ * PASS iff the RELEASE_MEM fence value appears.
+ * ====================================================================== */
+
+static void testNopFence(WddmLite &gpu)
+{
+    TEST_BEGIN("NOP + RELEASE_MEM fence (compute HQD)");
+    TEST_CHECK(g_ipd.valid, "IP discovery not valid");
+
+    /* recipeBootload (invoked inside recipeNopFence) needs the GMC VRAM MC
+     * base for the SMU driver table. Ensure GMC ran. */
+    if (g_gmc.vramSize == 0) {
+        printf("  Running GMC init first (needed for vram_mc_base)...\n");
+        TEST_CHECK(gmcInit(gpu, g_ipd, g_gmc), "GMC init failed");
+    }
+
+    printf("  Firmware dir: %s\n", g_fwDir);
+    printf("  vram_mc_base: 0x%llX\n", g_gmc.vramStart);
+
+    bool ok = recipeNopFence(gpu, g_ipd, g_fwDir, g_gmc.vramStart);
+    TEST_CHECK(ok, "NOP + RELEASE_MEM fence did not signal");
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Test: PSP Ring Destroy
  * ====================================================================== */
 
@@ -528,11 +558,15 @@ int main(int argc, char *argv[])
      * tests, so only run it when "boot" is explicitly requested as the
      * filter (not during an unfiltered full sweep). */
     bool runBoot = (filter && strstr(filter, "boot") != nullptr);
+    /* The NOP+fence recipe runs recipeBootload internally then brings up the
+     * MEC + a direct compute HQD, so (like "boot") it only runs when "nop" is
+     * explicitly requested -- not during an unfiltered full sweep. */
+    bool runNop = (filter && strstr(filter, "nop") != nullptr);
 
     bool needIpd = shouldRun(filter, "ipd") || shouldRun(filter, "gmc") ||
                    shouldRun(filter, "sol") || shouldRun(filter, "psp") ||
                    shouldRun(filter, "smu") || shouldRun(filter, "fw") ||
-                   shouldRun(filter, "pspd") || runBoot;
+                   shouldRun(filter, "pspd") || runBoot || runNop;
     if (needIpd && g_info.VendorId == 0) {
         gpu.getInfo(&g_info);
     }
@@ -543,7 +577,11 @@ int main(int argc, char *argv[])
     }
 
     if (g_ipd.valid) {
-        if (runBoot) {
+        if (runNop) {
+            /* Isolated path: bootload recipe THEN MEC + compute HQD + NOP
+             * fence (does not create the legacy PSP ring). */
+            testNopFence(gpu);
+        } else if (runBoot) {
             /* Isolated path: run only the bootload recipe (does not create
              * the legacy PSP ring). */
             testRecipeBootload(gpu);

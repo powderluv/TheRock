@@ -243,6 +243,22 @@ bool WddmLite::mapVram(uint64_t offset, uint64_t length, void **addr, void **han
     return true;
 }
 
+bool WddmLite::mapBar(uint32_t barIndex, uint64_t offset, uint64_t length,
+                      void **addr, void **handle)
+{
+    AMDGPU_ESCAPE_MAP_BAR_DATA data = {};
+    data.Header.Command = AMDGPU_ESCAPE_MAP_BAR;
+    data.Header.Size = sizeof(data);
+    data.BarIndex = barIndex;
+    data.Offset = offset;
+    data.Length = length;
+
+    if (!escape(&data, sizeof(data))) return false;
+    if (addr) *addr = data.MappedAddress;
+    if (handle) *handle = data.MappingHandle;
+    return true;
+}
+
 bool WddmLite::readVram(uint64_t offset, uint64_t length, void *buffer)
 {
     /* Allocate escape buffer: header fields + data */
