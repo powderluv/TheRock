@@ -712,6 +712,7 @@ def dispatch_elf_kernel(
     """
     from amd_gpu_driver.kernel.elf_parser import parse_elf_file
     from amd_gpu_driver.kernel.descriptor import KernelDescriptor
+    from amd_gpu_driver.kernel.metadata import kernel_arg_layout
     from amd_gpu_driver.backends.base import MemoryLocation, MemoryHandle
     from amd_gpu_driver.backends.windows.gmc_init import map_compute_buffers
     from amd_gpu_driver.backends.windows.nbio_init import hdp_flush
@@ -783,12 +784,45 @@ def dispatch_elf_kernel(
     handle_va = {id(h): v for h, v in zip(ptr_handles, vas[2:])}
 
     kbuf = (ctypes.c_char * kernarg.size).from_address(kernarg.cpu_addr)
-    offset = 0
-    for arg in args:
-        value = (handle_va[id(arg)] if isinstance(arg, MemoryHandle)
-                 else arg & 0xFFFFFFFFFFFFFFFF)
-        struct.pack_into("<Q", kbuf, offset, value)
-        offset += 8
+    layout = kernel_arg_layout(co, kernel_sym.name)
+    _fmt = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}
+    if layout:
+        # Pack explicit args at their metadata offsets (positional match), then
+        # fill the COV5 hidden args so get_local_size()/get_num_groups()/the grid
+        # are correct -- required for multi-workgroup dispatches.
+        explicit = [a for a in layout if not a["value_kind"].startswith("hidden_")]
+        if len(args) != len(explicit):
+            raise RuntimeError(
+                f"{kernel_sym.name} expects {len(explicit)} args, got {len(args)}")
+        for user_arg, ma in zip(args, explicit):
+            value = (handle_va[id(user_arg)] if isinstance(user_arg, MemoryHandle)
+                     else user_arg)
+            sz = ma["size"]
+            struct.pack_into(_fmt.get(sz, "<Q"), kbuf, ma["offset"],
+                             value & ((1 << (sz * 8)) - 1))
+        dims = (3 if (grid[2] > 1 or block[2] > 1)
+                else 2 if (grid[1] > 1 or block[1] > 1) else 1)
+        hidden = {
+            "hidden_block_count_x": grid[0], "hidden_block_count_y": grid[1],
+            "hidden_block_count_z": grid[2],
+            "hidden_group_size_x": block[0], "hidden_group_size_y": block[1],
+            "hidden_group_size_z": block[2],
+            "hidden_remainder_x": 0, "hidden_remainder_y": 0, "hidden_remainder_z": 0,
+            "hidden_grid_dims": dims,
+        }
+        for ma in layout:
+            if ma["value_kind"] in hidden:
+                sz = ma["size"]
+                struct.pack_into(_fmt.get(sz, "<I"), kbuf, ma["offset"],
+                                 hidden[ma["value_kind"]] & ((1 << (sz * 8)) - 1))
+    else:
+        # No metadata: sequential 8-byte packing (single-workgroup only).
+        offset = 0
+        for arg in args:
+            value = (handle_va[id(arg)] if isinstance(arg, MemoryHandle)
+                     else arg & 0xFFFFFFFFFFFFFFFF)
+            struct.pack_into("<Q", kbuf, offset, value)
+            offset += 8
 
     code_entry_va = code_va + (kd_sym.st_value + kd.kernel_code_entry_byte_offset)
 
@@ -837,25 +871,23 @@ def test_fill_dispatch(
     ctx: GPUContext,
     co_path: str | Path,
     *,
-    num_elements: int = 64,
+    num_elements: int = 256,
     fill_value: int = 0xDEADBEEF,
     kernel_name: str = "fill_kernel",
 ) -> bool:
     """Dispatch a real compiled fill kernel and verify the output buffer.
 
     The kernel reads its output pointer from the kernarg segment and writes
-    ``fill_value`` to ``out[tid]``. Output lives in VRAM and is GPUVM-mapped;
-    the kernarg's pointer arg is the output's mapped VA.
-
-    Uses a single workgroup (grid=1) so ``tid == local_id`` and the per-kernel
-    hidden args (get_local_size, multiplied by group_id=0) don't matter -- this
-    is the validated path. Filling >64 elements needs the COV5 implicit-args
-    layout for multi-workgroup grids (follow-on), so num_elements is clamped.
+    ``fill_value`` to ``out[tid]`` where ``tid = local_id + group_id*group_size``.
+    Output lives in VRAM and is GPUVM-mapped; the kernarg's pointer arg is the
+    output's mapped VA. Launches ceil(num_elements/64) workgroups of 64 threads;
+    dispatch_elf_kernel populates the COV5 hidden args so get_local_size() across
+    workgroups is correct.
 
     Args:
         ctx: Initialized GPU context.
         co_path: Path to compiled fill kernel .co file.
-        num_elements: Number of uint32 elements to fill (clamped to one block).
+        num_elements: Number of uint32 elements to fill.
         fill_value: Value to fill with.
         kernel_name: Name of the kernel in the .co file.
 
@@ -864,19 +896,16 @@ def test_fill_dispatch(
     """
     from amd_gpu_driver.backends.base import MemoryLocation
 
-    if num_elements > 64:
-        print(f"  NOTE: clamping {num_elements} -> 64 (single workgroup; "
-              "multi-workgroup needs the implicit-args layout, follow-on)")
-        num_elements = 64
     print(f"\n--- Fill kernel test ({num_elements} elements) ---")
-
-    out = ctx.dev.alloc_memory(4096, MemoryLocation.VRAM)
+    block = min(num_elements, 64) or 1
+    grid = (num_elements + block - 1) // block
+    out = ctx.dev.alloc_memory(max(grid * block * 4, 4096), MemoryLocation.VRAM)
     ctypes.memset(out.cpu_addr, 0, out.size)
 
     if not dispatch_elf_kernel(
         ctx, co_path,
-        grid=(1, 1, 1),
-        block=(num_elements, 1, 1),
+        grid=(grid, 1, 1),
+        block=(block, 1, 1),
         args=[out, fill_value],
         kernel_name=kernel_name,
     ):
