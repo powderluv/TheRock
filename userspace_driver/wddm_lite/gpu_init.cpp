@@ -878,42 +878,69 @@ static bool rcpSlice(const std::vector<uint8_t> &d, size_t off, size_t size,
     return true;
 }
 
-/* Allocate a PSP-visible VRAM buffer (mirrors _alloc_psp_buffer alloc_memory
- * branch). Returns CPU mapping + raw VRAM MC GPU address. */
+/* VRAM bump allocator state (mirrors Python backends/windows/device.py
+ * _vram_cursor + _VRAM_MC_BASE). recipeBootload initializes both once; the
+ * cursor persists across the bootload -> dispatch sequence so that every VRAM
+ * allocation gets a unique FB-aperture MC address (g_vramMcBase + offset). */
+static uint64_t g_vramCursor = 0;
+static uint64_t g_vramMcBase = 0;
+
+/* Allocate a PSP-visible VRAM buffer by bump-allocating over the VRAM BAR and
+ * mapping it via MAP_VRAM (mirrors Python alloc_memory). The returned gpuAddr
+ * is an FB MC address (g_vramMcBase + offset), which the CP accesses directly
+ * and which the page table encodes as offset = gpuAddr - g_vramMcBase. The
+ * returned handle is the MAP_VRAM mapping handle. */
 static bool rcpAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
                          uint64_t *gpuAddr, uint64_t *handle)
 {
-    uint32_t flags = AMDGPU_MEM_TYPE_VRAM | AMDGPU_MEM_FLAG_HOST_ACCESS;
-    if (!gpu.allocMemory(size, flags, cpu, gpuAddr, handle)) {
+    size = (size + 4095) & ~4095ull;
+    uint64_t offset = g_vramCursor;
+    g_vramCursor += size;
+
+    void *addr = nullptr, *mh = nullptr;
+    if (!gpu.mapVram(offset, size, &addr, &mh)) {
         printf("  PSP[recipe]: ERROR VRAM alloc failed (size=0x%llX)\n",
                (unsigned long long)size);
         return false;
     }
-    if (*cpu == nullptr) {
+    if (addr == nullptr) {
         printf("  PSP[recipe]: ERROR VRAM alloc not CPU mapped\n");
         return false;
     }
-    memset(*cpu, 0, (size_t)size);
+    memset(addr, 0, (size_t)size);
+    if (cpu) *cpu = addr;
+    if (gpuAddr) *gpuAddr = g_vramMcBase + offset;
+    if (handle) *handle = (uint64_t)mh;
     return true;
 }
 
-/* Allocate a PSP-visible VRAM buffer aligned to `alignment` (mirrors
- * _alloc_psp_buffer with an explicit alignment: over-allocate then advance
- * the CPU pointer + MC address by the same delta). Used for the bootloader
- * fw staging buffer, which is written to C2PMSG_36 as (addr >> 20) and so
- * must be 1MB-aligned. */
+/* Allocate a PSP-visible VRAM buffer aligned to `alignment` by rounding the
+ * bump-allocator offset up to `alignment` before mapping (mirrors Python
+ * alloc_memory + the explicit-alignment _alloc_psp_buffer path). Used for the
+ * bootloader fw staging buffer, which is written to C2PMSG_36 as (addr >> 20)
+ * and so must be 1MB-aligned. Because g_vramMcBase is 1MB-aligned (0x80..),
+ * aligning the offset also aligns the returned MC address. */
 static bool rcpAllocVramAligned(WddmLite &gpu, uint64_t size, uint64_t alignment,
                                 void **cpu, uint64_t *gpuAddr, uint64_t *handle)
 {
-    uint64_t allocSize = size + alignment;
-    void *rawCpu = nullptr;
-    uint64_t rawGpu = 0, rawHandle = 0;
-    if (!rcpAllocVram(gpu, allocSize, &rawCpu, &rawGpu, &rawHandle))
+    size = (size + 4095) & ~4095ull;
+    uint64_t offset = (g_vramCursor + (alignment - 1)) & ~(alignment - 1);
+    g_vramCursor = offset + size;
+
+    void *addr = nullptr, *mh = nullptr;
+    if (!gpu.mapVram(offset, size, &addr, &mh)) {
+        printf("  PSP[recipe]: ERROR aligned VRAM alloc failed (size=0x%llX)\n",
+               (unsigned long long)size);
         return false;
-    uint64_t delta = ((~rawGpu) + 1) & (alignment - 1);   /* (-rawGpu) & (align-1) */
-    *cpu = (void *)((uint8_t *)rawCpu + delta);
-    *gpuAddr = rawGpu + delta;
-    *handle = rawHandle;
+    }
+    if (addr == nullptr) {
+        printf("  PSP[recipe]: ERROR aligned VRAM alloc not CPU mapped\n");
+        return false;
+    }
+    memset(addr, 0, (size_t)size);
+    if (cpu) *cpu = addr;
+    if (gpuAddr) *gpuAddr = g_vramMcBase + offset;
+    if (handle) *handle = (uint64_t)mh;
     return true;
 }
 
@@ -1459,6 +1486,14 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
     printf("\n=== recipeBootload (LITE_MES_RECIPE) ===\n");
     printf("MP0=0x%04X MP1=0x%04X fwDir=%s vramMcBase=0x%llX\n",
            ipd.mp0Base, ipd.mp1Base, fwDir, (unsigned long long)vramMcBase);
+
+    /* Initialize the VRAM bump allocator once, here at the entry to bootload.
+     * The cursor PERSISTS through recipeDispatch/buildComputeGpuvm (only reset
+     * here), so every VRAM allocation in the bootload -> dispatch sequence gets
+     * a unique FB MC address. Initial cursor mirrors Python device.py
+     * _vram_cursor = 32 * 1024 * 1024 (reserve the low 32MB for scratch). */
+    g_vramMcBase = vramMcBase;
+    g_vramCursor = 32ull * 1024 * 1024;
 
     /* IP version strings the probe resolves (gc=12_0_1, sdma=12_0_1, mp1=14_0_3).
      * The probe passes GC="12_0_1" and SOS uses mp0 14_0_3. */
@@ -2433,4 +2468,592 @@ bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
     printf("RPTR=0x%X (wptr=%u)\n", rptr, cq.wptr);
     printf("NOP+FENCE %s\n", ok ? "PASS" : "FAIL (fence timeout)");
     return ok;
+}
+
+/* ======================================================================
+ * Increment 2b: single s_endpgm compute dispatch (GPUVM + DISPATCH_DIRECT)
+ *
+ * Faithful C++ transcription of the proven probe path:
+ *   python/amd_gpu_driver/probe16_vmid0.py (THE authoritative VMID-0 dispatch
+ *     that PASSES on this gfx1201): build a 4-level GFXHUB page table in VRAM,
+ *     enable GCVM_CONTEXT0 AFTER the autoload, dispatch.
+ *   python/amd_gpu_driver/backends/windows/gmc_init.py: gfxhub_gart_enable,
+ *     build_compute_gpuvm / _program_compute_gpuvm, _gfxhub_wreg, flush_gpu_tlb.
+ *   python/amd_gpu_driver/backends/windows/compute_dispatch.py:
+ *     _build_noop_kernel_image (16x s_endpgm = 0xBF810000),
+ *     _build_dispatch_packets, test_noop_dispatch (fault-status verify).
+ *   python/amd_gpu_driver/commands/pm4.py: acquire_mem (gfx12 GCR 7-dword),
+ *     set_sh_reg, dispatch_direct, event_write.
+ *
+ * GFXHUB register addressing == GC base_idx 0 (the probe reads
+ * _gc_reg(dev, gc, C8_CNTL, base_idx=0) and _gfxhub_wreg writes
+ * config.gfxhub_base[0] == ipd.gcBase). So all GFXHUB writes here go through
+ * gcWreg(..., baseIdx=0) just like CP_HQD_* programming.
+ * ====================================================================== */
+
+/* ---- GFXHUB / GCVM register DWORD offsets (gc_12_0_0_offset.h, gmc_init.py).
+ * base_idx 0 (GC base[0]). ------------------------------------------------ */
+
+/* GCMC system aperture / TLB */
+#define regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB  0x15A8
+#define regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB  0x15A9
+#define regGCMC_VM_AGP_TOP                           0x1616
+#define regGCMC_VM_AGP_BOT                           0x1617
+#define regGCMC_VM_AGP_BASE                          0x1618
+#define regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR          0x1619
+#define regGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR         0x161A
+#define regGCMC_VM_MX_L1_TLB_CNTL                    0x161B
+
+/* GCVM L2 cache / fault */
+#define regGCVM_L2_CNTL                              0x15C4
+#define regGCVM_L2_CNTL2                             0x15C5
+#define regGCVM_L2_CNTL3                             0x15C6
+#define regGCVM_L2_CNTL5                             0x15E3
+#define regGCVM_L2_PROTECTION_FAULT_STATUS          0x15D0
+#define regGCVM_L2_PROTECTION_FAULT_ADDR_LO32       0x15D2
+#define regGCVM_L2_PROTECTION_FAULT_ADDR_HI32       0x15D3
+#define regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32 0x15D4
+#define regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32 0x15D5
+#define regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32  0x15D7
+#define regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32  0x15D8
+#define regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32 0x15D9
+#define regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32 0x15DA
+#define regGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32     0x15DB
+#define regGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32     0x15DC
+
+/* GCVM contexts (VMID 0 == CONTEXT0; VMID 1..15 == CONTEXT1..15). */
+#define regGCVM_CONTEXT0_CNTL                        0x1624
+#define regGCVM_CONTEXT1_CNTL                        0x1625
+#define regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32   0x168F
+#define regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32   0x1690
+#define regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32  0x16AF
+#define regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32  0x16B0
+#define regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32    0x16CF
+#define regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32    0x16D0
+#define regGCVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32  0x16B1
+#define regGCVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32    0x16D1
+
+/* GCVM invalidation engine 0 (flush_gpu_tlb gfxhub). */
+#define regGCVM_INVALIDATE_ENG0_SEM                  0x1635
+#define regGCVM_INVALIDATE_ENG0_REQ                  0x1647
+#define regGCVM_INVALIDATE_ENG0_ACK                  0x1659
+#define regGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32      0x166B
+
+/* CP debug (disable UTCL1 error halt for GFXHUB). */
+#define regCP_DEBUG                                  0x1E1F
+
+#define GFXHUB_CTX_DISTANCE       1
+#define GFXHUB_CTX_ADDR_DISTANCE  2
+#define GFXHUB_ENG_ADDR_DISTANCE  2
+
+/* L1 TLB control bits (gmc_init.py). */
+#define L1_TLB_ENABLE                       (1u << 0)
+#define L1_TLB_SYSTEM_ACCESS_MODE_MASK      (0x3u << 3)
+#define L1_TLB_ENABLE_ADV_DRIVER_MODEL      (1u << 6)
+#define L1_TLB_SYSTEM_APERTURE_UNMAPPED_ACCESS (1u << 5)
+
+#define VM_CONTEXT_ENABLE_CONTEXT           (1u << 0)
+
+/* gfx12 GPUVM PTE/PDE flags (gmc_init.py). */
+#define AMDGPU_PTE_VALID        (1ull << 0)
+#define AMDGPU_PTE_EXECUTABLE   (1ull << 4)
+#define AMDGPU_PTE_READABLE     (1ull << 5)
+#define AMDGPU_PTE_WRITEABLE    (1ull << 6)
+#define AMDGPU_PTE_IS_PTE       (1ull << 63)
+/* leaf PTE flag word = VALID|EXEC|READ|WRITE|IS_PTE (== 0x8000000000000071). */
+#define GPUVM_LEAF_FLAGS  (AMDGPU_PTE_IS_PTE | AMDGPU_PTE_WRITEABLE | \
+                           AMDGPU_PTE_READABLE | AMDGPU_PTE_EXECUTABLE | \
+                           AMDGPU_PTE_VALID)
+/* 0-based VRAM offset mask used for PDE/PTE address fields. */
+#define GPUVM_ADDR_MASK   0x0000FFFFFFFFF000ull
+
+/* depth-3 CONTEXT0_CNTL: ENABLE | PAGE_TABLE_DEPTH=3 | all fault-enable bits. */
+#define GCVM_CONTEXT0_CNTL_DEPTH3  0x03FFFC07u
+
+/* compute dispatch (probe16_vmid0.py / compute_dispatch.py). */
+#define COMPUTE_VA_ROOT          0x200000000000ull   /* shader virtual address */
+#define NOOP_SHADER_DWORD        0xBF810000u          /* s_endpgm (SOPP op 1) */
+#define NOOP_RSRC1               0xE00C0003u
+#define NOOP_RSRC2               0x00000080u          /* ENABLE_SGPR_WORKGROUP_ID_X */
+#define DISPATCH_INITIATOR_W32   0x8045u              /* SHADER_EN|FORCE_000|ORDER|W32 */
+
+/* SET_SH_REG base + COMPUTE_* SH register addresses (registers.py). */
+#define SH_REG_BASE              0x2C00
+#define regCOMPUTE_START_X       0x2E04
+#define regCOMPUTE_PGM_LO        0x2E0C
+#define regCOMPUTE_PGM_RSRC1     0x2E12
+#define regCOMPUTE_RESOURCE_LIMITS 0x2E15
+#define regCOMPUTE_TMPRING_SIZE  0x2E18
+#define regCOMPUTE_RESTART_X     0x2E1B
+#define regCOMPUTE_PGM_RSRC3     0x2E28
+#define regCOMPUTE_USER_DATA_0   0x2E40
+
+/* PM4 opcodes (pm4.py) extended for dispatch. */
+#define PACKET3_DISPATCH_DIRECT  0x15
+#define PACKET3_EVENT_WRITE      0x46
+#define PACKET3_ACQUIRE_MEM      0x58
+#define PACKET3_SET_SH_REG       0x76
+
+/* ACQUIRE_MEM GCR_CNTL full invalidate (gfx12; == 0xC3F1). */
+#define ACQUIRE_MEM_GCR_CNTL_FULL_INVALIDATE  0x0000C3F1u
+
+/* EVENT_WRITE: CS_PARTIAL_FLUSH event type / index. */
+#define CS_PARTIAL_FLUSH                7
+#define EVENT_INDEX_CS_PARTIAL_FLUSH    4
+
+/* ---- PM4 builder extensions (pm4.py) -------------------------------------- */
+
+/* acquire_mem (gfx12 GCR 7-dword form): CP_COHER_CNTL=0, COHER_SIZE lo/hi
+ * (full = 0xFFFFFFFFFFFFFFFF), COHER_BASE lo/hi = 0, POLL_INTERVAL = 0,
+ * GCR_CNTL = full invalidate. */
+static void pm4AcquireMem(std::vector<uint32_t> &dw)
+{
+    uint32_t payload[7];
+    payload[0] = 0;                 /* CP_COHER_CNTL = 0 (gfx10+) */
+    payload[1] = 0xFFFFFFFF;        /* COHER_SIZE lo */
+    payload[2] = 0xFFFFFFFF;        /* COHER_SIZE hi */
+    payload[3] = 0;                 /* COHER_BASE lo */
+    payload[4] = 0;                 /* COHER_BASE hi */
+    payload[5] = 0;                 /* POLL_INTERVAL */
+    payload[6] = ACQUIRE_MEM_GCR_CNTL_FULL_INVALIDATE;  /* GCR_CNTL */
+    pm4Pkt3(dw, PACKET3_ACQUIRE_MEM, payload, 7);
+}
+
+/* set_sh_reg(offset, *values): offset is reg - SH_REG_BASE; payload is the
+ * offset dword followed by the values (matches PM4PacketBuilder.set_sh_reg with
+ * a raw reg >= SH_REG_BASE). */
+static void pm4SetShReg(std::vector<uint32_t> &dw, uint32_t reg,
+                        const uint32_t *values, uint32_t n)
+{
+    std::vector<uint32_t> payload;
+    payload.reserve(n + 1);
+    payload.push_back(reg - SH_REG_BASE);
+    for (uint32_t i = 0; i < n; i++)
+        payload.push_back(values[i]);
+    pm4Pkt3(dw, PACKET3_SET_SH_REG, payload.data(), (uint32_t)payload.size());
+}
+
+/* dispatch_direct(dim_x, dim_y, dim_z, initiator). */
+static void pm4DispatchDirect(std::vector<uint32_t> &dw, uint32_t dimX,
+                              uint32_t dimY, uint32_t dimZ, uint32_t initiator)
+{
+    uint32_t payload[4] = { dimX, dimY, dimZ, initiator };
+    pm4Pkt3(dw, PACKET3_DISPATCH_DIRECT, payload, 4);
+}
+
+/* event_write(event_type, event_index). */
+static void pm4EventWrite(std::vector<uint32_t> &dw, uint32_t eventType,
+                          uint32_t eventIndex)
+{
+    uint32_t dw0 = (eventType & 0x3F) | ((eventIndex & 0xF) << 8);
+    pm4Pkt3(dw, PACKET3_EVENT_WRITE, &dw0, 1);
+}
+
+/* ---- GFXHUB GART enable (gmc_init.py gfxhub_gart_enable) ------------------- */
+
+/* GMC parameters the GFXHUB bring-up needs that GmcState already holds plus the
+ * two DMA buffers the system aperture / fault default address point at. */
+struct GfxhubParams {
+    uint64_t vramStart;
+    uint64_t vramEnd;
+    uint64_t gartStart;
+    uint64_t gartEnd;
+    uint64_t agpStart;
+    uint64_t agpEnd;
+    uint64_t gartTableBus;   /* DMA bus address of the GART page table */
+    uint64_t dummyPageBus;   /* DMA bus address of the fault/dummy page */
+};
+
+static void gfxhubGartEnable(WddmLite &gpu, const CqState &cq,
+                             const GfxhubParams &p)
+{
+    /* _gfxhub_init_gart_aperture: VMID0 GART base/start/end. The compute path
+     * overwrites CONTEXT0 below with the depth-3 page table, but mirror the
+     * probe's full enable so the rest of the GFXHUB state matches amdgpu. */
+    uint64_t ptBase = p.gartTableBus | AMDGPU_PTE_VALID;
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32,
+           (uint32_t)(ptBase & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32,
+           (uint32_t)((ptBase >> 32) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32,
+           (uint32_t)((p.gartStart >> 12) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32,
+           (uint32_t)((p.gartStart >> 44) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+           (uint32_t)((p.gartEnd >> 12) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
+           (uint32_t)((p.gartEnd >> 44) & 0xFFFFFFFF), 0);
+
+    /* _gfxhub_init_system_aperture. */
+    gcWreg(gpu, cq, regGCMC_VM_AGP_BASE, 0, 0);
+    gcWreg(gpu, cq, regGCMC_VM_AGP_BOT, (uint32_t)(p.agpStart >> 24), 0);
+    gcWreg(gpu, cq, regGCMC_VM_AGP_TOP, (uint32_t)(p.agpEnd >> 24), 0);
+    gcWreg(gpu, cq, regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR,
+           (uint32_t)(p.vramStart >> 18), 0);
+    gcWreg(gpu, cq, regGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR,
+           (uint32_t)(p.vramEnd >> 18), 0);
+    gcWreg(gpu, cq, regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB,
+           (uint32_t)(p.dummyPageBus >> 12), 0);
+    gcWreg(gpu, cq, regGCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB,
+           (uint32_t)(p.dummyPageBus >> 44), 0);
+    gcWreg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32,
+           (uint32_t)(p.dummyPageBus >> 12), 0);
+    gcWreg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32,
+           (uint32_t)(p.dummyPageBus >> 44), 0);
+
+    /* _gfxhub_init_tlb. */
+    uint32_t l1 = gcReg(gpu, cq, regGCMC_VM_MX_L1_TLB_CNTL, 0);
+    l1 |= L1_TLB_ENABLE;
+    l1 = (l1 & ~L1_TLB_SYSTEM_ACCESS_MODE_MASK) | (3u << 3);
+    l1 |= L1_TLB_ENABLE_ADV_DRIVER_MODEL;
+    l1 &= ~L1_TLB_SYSTEM_APERTURE_UNMAPPED_ACCESS;
+    gcWreg(gpu, cq, regGCMC_VM_MX_L1_TLB_CNTL, l1, 0);
+
+    /* _gfxhub_init_cache. */
+    uint32_t l2 = gcReg(gpu, cq, regGCVM_L2_CNTL, 0);
+    l2 |= (1u << 0);
+    l2 |= (1u << 8);
+    l2 &= ~(1u << 6);
+    gcWreg(gpu, cq, regGCVM_L2_CNTL, l2, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CNTL2, (1u << 0) | (1u << 1), 0);
+    uint32_t l2c3 = gcReg(gpu, cq, regGCVM_L2_CNTL3, 0);
+    l2c3 = (l2c3 & ~0x3F000u) | (9u << 15);
+    l2c3 = (l2c3 & ~0x1F00000u) | (6u << 20);
+    gcWreg(gpu, cq, regGCVM_L2_CNTL3, l2c3, 0);
+    uint32_t l2c5 = gcReg(gpu, cq, regGCVM_L2_CNTL5, 0);
+    l2c5 &= ~0x7E0u;
+    gcWreg(gpu, cq, regGCVM_L2_CNTL5, l2c5, 0);
+
+    /* _gfxhub_enable_system_domain (VMID 0 base enable; depth set later). */
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_CNTL, VM_CONTEXT_ENABLE_CONTEXT, 0);
+
+    /* _gfxhub_disable_identity_aperture. */
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32,
+           0xFFFFFFFF, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32,
+           0x0000000F, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32, 0, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32, 0, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32, 0, 0);
+    gcWreg(gpu, cq, regGCVM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32, 0, 0);
+
+    /* _gfxhub_setup_vmid_config: VMIDs 1..15 (num_level=3, block_size=9). */
+    uint64_t maxPfn = (1ull << 36) - 1;
+    for (uint32_t vmid = 1; vmid < 16; vmid++) {
+        uint32_t val = VM_CONTEXT_ENABLE_CONTEXT;
+        val |= (3u & 0x3u) << 1;                       /* num_level = 3 */
+        val |= (1u << 7) | (1u << 8) | (1u << 9) | (1u << 10);
+        val |= (1u << 11) | (1u << 12) | (1u << 13);
+        /* block_size - 9 == 0. */
+        uint32_t ctxReg = regGCVM_CONTEXT1_CNTL + (vmid - 1) * GFXHUB_CTX_DISTANCE;
+        gcWreg(gpu, cq, ctxReg, val, 0);
+
+        uint32_t startLo = regGCVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32 +
+                           (vmid - 1) * GFXHUB_CTX_ADDR_DISTANCE;
+        gcWreg(gpu, cq, startLo, 0, 0);
+        gcWreg(gpu, cq, startLo + 1, 0, 0);
+
+        uint32_t endLo = regGCVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32 +
+                         (vmid - 1) * GFXHUB_CTX_ADDR_DISTANCE;
+        gcWreg(gpu, cq, endLo, (uint32_t)(maxPfn & 0xFFFFFFFF), 0);
+        gcWreg(gpu, cq, endLo + 1, (uint32_t)((maxPfn >> 32) & 0xFFFFFFFF), 0);
+    }
+
+    /* _gfxhub_program_invalidation: engines 0..17. */
+    for (uint32_t eng = 0; eng < 18; eng++) {
+        uint32_t loReg = regGCVM_INVALIDATE_ENG0_ADDR_RANGE_LO32 +
+                         eng * GFXHUB_ENG_ADDR_DISTANCE;
+        gcWreg(gpu, cq, loReg, 0xFFFFFFFF, 0);
+        gcWreg(gpu, cq, loReg + 1, 0x1F, 0);
+    }
+
+    /* Disable CP UTCL1 error halt (CPG_UTCL1_ERROR_HALT_DISABLE). */
+    uint32_t cpDbg = gcReg(gpu, cq, regCP_DEBUG, 0);
+    cpDbg |= (1u << 15);
+    gcWreg(gpu, cq, regCP_DEBUG, cpDbg, 0);
+
+    printf("  GFXHUB: gart_enable done (VMID0 base + TLB/L2 + VMID1-15 + inv)\n");
+}
+
+/* flush_gpu_tlb(hub="gfxhub", vmid) (gmc_init.py): engine 0 invalidate. */
+static void gfxhubFlushTlb(WddmLite &gpu, const CqState &cq, uint32_t vmid)
+{
+    /* Acquire semaphore. */
+    for (int i = 0; i < 10; i++) {
+        uint32_t v = gcReg(gpu, cq, regGCVM_INVALIDATE_ENG0_SEM, 0);
+        if (v & 0x1) break;
+        gcWreg(gpu, cq, regGCVM_INVALIDATE_ENG0_SEM, 1, 0);
+    }
+    /* Request: PER_VMID_INVALIDATE_REQ | (vmid << 16). */
+    uint32_t req = (1u << 0) | ((vmid & 0xF) << 16);
+    gcWreg(gpu, cq, regGCVM_INVALIDATE_ENG0_REQ, req, 0);
+    /* Poll for completion. */
+    for (int i = 0; i < 100; i++) {
+        uint32_t ack = gcReg(gpu, cq, regGCVM_INVALIDATE_ENG0_ACK, 0);
+        if (ack & (1u << vmid)) break;
+    }
+    /* Release semaphore. */
+    gcWreg(gpu, cq, regGCVM_INVALIDATE_ENG0_SEM, 0, 0);
+}
+
+/* ---- 4-level compute GPUVM page table (build_compute_gpuvm) ---------------- */
+
+struct DispatchGpuvm {
+    void    *pdb2Cpu; uint64_t pdb2Gpu; uint64_t pdb2Handle;
+    void    *pdb1Cpu; uint64_t pdb1Gpu; uint64_t pdb1Handle;
+    void    *pdb0Cpu; uint64_t pdb0Gpu; uint64_t pdb0Handle;
+    void    *ptbCpu;  uint64_t ptbGpu;  uint64_t ptbHandle;
+};
+
+/* Build the 4-level page table (PDB2->PDB1->PDB0->PTB), map COMPUTE_VA_ROOT ->
+ * codeGpu, then enable GCVM_CONTEXT0 = depth-3 and flush the GFXHUB TLB.
+ * Entries are 0-BASED VRAM OFFSETS (gpu_addr - vramMcBase), matching amdgpu's
+ * CTX page-table base form. Must run AFTER gfxhubGartEnable (which re-inits the
+ * hub post-autoload) and BEFORE the queue (probe16 ordering). */
+static bool buildComputeGpuvm(WddmLite &gpu, const CqState &cq,
+                              uint64_t vramMcBase, uint64_t codeGpu,
+                              DispatchGpuvm &pt)
+{
+    void *cpu = nullptr;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb2Gpu, &pt.pdb2Handle)) return false;
+    pt.pdb2Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb1Gpu, &pt.pdb1Handle)) return false;
+    pt.pdb1Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb0Gpu, &pt.pdb0Handle)) return false;
+    pt.pdb0Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.ptbGpu, &pt.ptbHandle)) return false;
+    pt.ptbCpu = cpu;
+    /* rcpAllocVram already zeroes each page. */
+
+    uint64_t va = COMPUTE_VA_ROOT;
+    uint32_t i2 = (uint32_t)((va >> 39) & 0x1FF);
+    uint32_t i1 = (uint32_t)((va >> 30) & 0x1FF);
+    uint32_t i0 = (uint32_t)((va >> 21) & 0x1FF);
+    uint32_t ip = (uint32_t)((va >> 12) & 0x1FF);
+
+    uint64_t pdb1Off = (pt.pdb1Gpu - vramMcBase) & GPUVM_ADDR_MASK;
+    uint64_t pdb0Off = (pt.pdb0Gpu - vramMcBase) & GPUVM_ADDR_MASK;
+    uint64_t ptbOff  = (pt.ptbGpu  - vramMcBase) & GPUVM_ADDR_MASK;
+    uint64_t codeOff = (codeGpu    - vramMcBase) & GPUVM_ADDR_MASK;
+
+    *(volatile uint64_t *)((uint8_t *)pt.pdb2Cpu + i2 * 8) = AMDGPU_PTE_VALID | pdb1Off;
+    *(volatile uint64_t *)((uint8_t *)pt.pdb1Cpu + i1 * 8) = AMDGPU_PTE_VALID | pdb0Off;
+    *(volatile uint64_t *)((uint8_t *)pt.pdb0Cpu + i0 * 8) = AMDGPU_PTE_VALID | ptbOff;
+    *(volatile uint64_t *)((uint8_t *)pt.ptbCpu  + ip * 8) = GPUVM_LEAF_FLAGS | codeOff;
+
+    cqHdpFlush(gpu, cq);
+
+    /* Re-point CONTEXT0 at the depth-3 page table (root = 0-based offset|VALID). */
+    uint64_t root = ((pt.pdb2Gpu - vramMcBase) & GPUVM_ADDR_MASK) | AMDGPU_PTE_VALID;
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32,
+           (uint32_t)(root & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32,
+           (uint32_t)((root >> 32) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32, 0, 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32, 0, 0);
+    uint64_t end = 0x7FFFFFFFFFFFull;
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+           (uint32_t)((end >> 12) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
+           (uint32_t)((end >> 44) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_CNTL, GCVM_CONTEXT0_CNTL_DEPTH3, 0);
+
+    cqHdpFlush(gpu, cq);
+    gfxhubFlushTlb(gpu, cq, 0);
+
+    printf("  GPUVM: VA=0x%llX idx=[%u,%u,%u,%u] root=0x%llX shaderMC=0x%llX\n",
+           (unsigned long long)va, i2, i1, i0, ip,
+           (unsigned long long)(root & GPUVM_ADDR_MASK),
+           (unsigned long long)codeGpu);
+    return true;
+}
+
+/* ---- Top-level: recipeDispatch -------------------------------------------- */
+
+bool recipeDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase)
+{
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  DISP: recipeBootload did not reach BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    printf("\n=== recipeDispatch (GPUVM + s_endpgm DISPATCH_DIRECT) ===\n");
+
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+
+    cq.hasNbif = cqResolveNbif(ipd, &cq.nbifBase2);
+    if (cq.hasNbif) {
+        uint32_t apEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+        gpu.writeReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                       apEn | BIF_DOORBELL_APER_EN__BIT);
+        uint32_t fbEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+        gpu.writeReg32((cq.nbifBase2 + regBIF_FB_EN) * 4,
+                       fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+        printf("  NBIO: doorbell aperture + framebuffer enabled "
+               "(NBIF base[2]=0x%04X)\n", cq.nbifBase2);
+    } else {
+        printf("  NBIO: WARNING NBIF base[2] not found; HDP flush + doorbell "
+               "aperture skipped\n");
+    }
+
+    /* ucode_start: rs64() for PFP/ME/MEC (gfx-header entry @52). */
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+    if (haveUcode)
+        printf("  GFX: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+               (unsigned long long)pfp, (unsigned long long)me,
+               (unsigned long long)mec);
+
+    /* 2. init_gfx_for_compute (MEC enable). */
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode))
+        return false;
+
+    /* 3. gfxhub_gart_enable: re-init the GFXHUB after AUTOLOAD_RLC. Allocate the
+     * GART page table + dummy page in DMA (system-memory) so the system aperture
+     * / fault-default registers point at valid bus addresses. The depth-3
+     * CONTEXT0 below overrides the GART CONTEXT0, so the GART table contents are
+     * unused by the compute mapping; only its bus address matters here. */
+    void *gartCpu = nullptr, *dummyCpu = nullptr;
+    uint64_t gartBus = 0, dummyBus = 0;
+    void *gartHandle = nullptr, *dummyHandle = nullptr;
+    if (!gpu.allocDma(1 << 20, &gartCpu, &gartBus, &gartHandle)) {
+        printf("  DISP: ERROR GART table DMA alloc failed\n");
+        return false;
+    }
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  DISP: ERROR dummy page DMA alloc failed\n");
+        return false;
+    }
+    memset(gartCpu, 0, 1 << 20);
+    memset(dummyCpu, 0, 4096);
+
+    GfxhubParams gp;
+    memset(&gp, 0, sizeof(gp));
+    /* VRAM range from GMC FB location (mirror gmcInit's derivation, since the
+     * NOP/dispatch path does not carry a GmcState). vramMcBase == GmcState.vramStart. */
+    uint32_t fbBase = 0, fbTop = 0;
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_BASE, &fbBase);
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_TOP, &fbTop);
+    gp.vramStart = (uint64_t)fbBase << 24;
+    gp.vramEnd = ((uint64_t)fbTop << 24) | 0xFFFFFF;
+    gp.gartStart = gp.vramEnd + 1;
+    gp.gartEnd = gp.gartStart + (512ull * 1024 * 1024) - 1;  /* 512MB GART */
+    gp.agpStart = gp.gartEnd + 1;
+    gp.agpEnd = gp.agpStart;                                  /* AGP disabled */
+    gp.gartTableBus = gartBus;
+    gp.dummyPageBus = dummyBus;
+    gfxhubGartEnable(gpu, cq, gp);
+
+    /* 4. Stage 16 dwords of s_endpgm in a 4KB VRAM page. */
+    void *codeCpu = nullptr;
+    uint64_t codeGpu = 0, codeHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &codeCpu, &codeGpu, &codeHandle)) {
+        printf("  DISP: ERROR shader VRAM alloc failed\n");
+        return false;
+    }
+    {
+        volatile uint32_t *code = (volatile uint32_t *)codeCpu;
+        for (int i = 0; i < 16; i++)
+            code[i] = NOOP_SHADER_DWORD;
+    }
+
+    /* 5. Build the 4-level GPUVM page table + enable CONTEXT0 (depth-3). */
+    DispatchGpuvm pt;
+    memset(&pt, 0, sizeof(pt));
+    if (!buildComputeGpuvm(gpu, cq, vramMcBase, codeGpu, pt))
+        return false;
+
+    /* 6. init_compute_queue (direct-MMIO HQD, VMID 0). Queue stays VMID 0. */
+    if (!cqInitComputeQueue(gpu, cq))
+        return false;
+
+    /* Readback CONTEXT0_CNTL via gc base[0] (probe16 prints this). */
+    uint32_t c0 = gcReg(gpu, cq, regGCVM_CONTEXT0_CNTL, 0);
+    printf("  GPUVM: GCVM_CONTEXT0_CNTL readback=0x%08X (enable=%u)\n",
+           c0, c0 & 1u);
+
+    /* Clear the fault status before dispatch (probe16 zeroes 0x15D0/0x15D1). */
+    gpu.writeReg32((cq.gcBase0 + regGCVM_L2_PROTECTION_FAULT_STATUS) * 4, 0);
+    gpu.writeReg32((cq.gcBase0 + (regGCVM_L2_PROTECTION_FAULT_STATUS + 1)) * 4, 0);
+
+    /* 7. Build the dispatch PM4 stream (probe16_vmid0.py / _build_dispatch_packets).
+     * NO STATIC_THREAD_MGMT override -- the autoload set the correct CU masks. */
+    uint64_t pgm = COMPUTE_VA_ROOT >> 8;   /* COMPUTE_PGM = shader VA >> 8 */
+    uint64_t fenceSeq = 1;
+    *cq.fenceCpu = 0;
+
+    std::vector<uint32_t> packets;
+    pm4AcquireMem(packets);
+
+    uint32_t pgmLoHi[2] = { (uint32_t)(pgm & 0xFFFFFFFF),
+                            (uint32_t)((pgm >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_PGM_LO, pgmLoHi, 2);     /* PGM_LO, PGM_HI */
+
+    uint32_t rsrc12[2] = { NOOP_RSRC1, NOOP_RSRC2 };
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC1, rsrc12, 2);   /* RSRC1, RSRC2 */
+
+    uint32_t rsrc3 = 0;
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC3, &rsrc3, 1);
+
+    uint32_t tmpring = 0;
+    pm4SetShReg(packets, regCOMPUTE_TMPRING_SIZE, &tmpring, 1);
+
+    uint32_t restart[3] = { 0, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_RESTART_X, restart, 3);
+
+    uint32_t userData[2] = { 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_USER_DATA_0, userData, 2);
+
+    uint32_t resLimits = 0;
+    pm4SetShReg(packets, regCOMPUTE_RESOURCE_LIMITS, &resLimits, 1);
+
+    /* COMPUTE_START_X..: start xyz, num_thread xyz=(1,1,1), two trailing zeros. */
+    uint32_t startBlock[8] = { 0, 0, 0, 1, 1, 1, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_START_X, startBlock, 8);
+
+    pm4DispatchDirect(packets, 1, 1, 1, DISPATCH_INITIATOR_W32);
+    pm4EventWrite(packets, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+    pm4ReleaseMemFence(packets, cq.fenceGpu, fenceSeq);
+
+    cqSubmitPackets(gpu, cq, packets);
+
+    /* 8. Wait for the EOP fence, then read fault status + RPTR. */
+    bool ok = cqWaitFence(cq, fenceSeq, 5000);
+
+    uint32_t faultStatus = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_STATUS, 0);
+    uint32_t faultAddrLo = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, 0);
+    uint32_t faultAddrHi = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, 0);
+    uint64_t faultVa = (((uint64_t)faultAddrHi << 32) | faultAddrLo) << 12;
+
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    uint32_t rptr = gcReg(gpu, cq, regCP_HQD_PQ_RPTR, 0);
+    cqGrbmDeselect(gpu, cq);
+    uint64_t fenceVal = *cq.fenceCpu;
+
+    uint32_t walker = (faultStatus >> 1) & 0x7;
+    uint32_t perm = (faultStatus >> 4) & 0xF;
+
+    printf("\nGCVM_CONTEXT0_CNTL=0x%08X (expected 0x%08X)\n",
+           c0, GCVM_CONTEXT0_CNTL_DEPTH3);
+    printf("FAULT_STATUS=0x%08X [walker=%u perm=0x%X] FAULT_VA=0x%llX\n",
+           faultStatus, walker, perm, (unsigned long long)faultVa);
+    printf("FENCE value=%llu (expected %llu)\n",
+           (unsigned long long)fenceVal, (unsigned long long)fenceSeq);
+    printf("RPTR=0x%X (wptr=%u)\n", rptr, cq.wptr);
+
+    bool pass = ok && (faultStatus == 0);
+    printf("DISPATCH %s\n", pass ? "PASS (fence signaled, no GPUVM fault)"
+           : (ok ? "FAIL (GPUVM fault)" : "FAIL (fence timeout)"));
+    return pass;
 }

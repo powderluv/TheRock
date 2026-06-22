@@ -376,6 +376,37 @@ static void testNopFence(WddmLite &gpu)
 }
 
 /* ======================================================================
+ * Test: single s_endpgm compute dispatch (GPUVM + DISPATCH_DIRECT)
+ *
+ * Runs recipeDispatch(): recipeBootload() (-> BOOTLOAD_COMPLETE) THEN
+ * init_gfx_for_compute (MEC enable) + gfxhub_gart_enable + a 4-level GPUVM
+ * page table mapping an s_endpgm shader (VMID 0) + init_compute_queue
+ * (direct-MMIO HQD) + DISPATCH_DIRECT + EOP fence. Firmware is read from
+ * g_fwDir (Z:\winfw, override with argv[2]).
+ * PASS iff the EOP fence signals AND GCVM fault status == 0.
+ * ====================================================================== */
+
+static void testDispatch(WddmLite &gpu)
+{
+    TEST_BEGIN("Compute dispatch (s_endpgm + GPUVM)");
+    TEST_CHECK(g_ipd.valid, "IP discovery not valid");
+
+    /* recipeBootload (invoked inside recipeDispatch) needs the GMC VRAM MC
+     * base for the SMU driver table. Ensure GMC ran. */
+    if (g_gmc.vramSize == 0) {
+        printf("  Running GMC init first (needed for vram_mc_base)...\n");
+        TEST_CHECK(gmcInit(gpu, g_ipd, g_gmc), "GMC init failed");
+    }
+
+    printf("  Firmware dir: %s\n", g_fwDir);
+    printf("  vram_mc_base: 0x%llX\n", g_gmc.vramStart);
+
+    bool ok = recipeDispatch(gpu, g_ipd, g_fwDir, g_gmc.vramStart);
+    TEST_CHECK(ok, "Dispatch did not signal fence / GPUVM fault");
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Test: PSP Ring Destroy
  * ====================================================================== */
 
@@ -562,11 +593,16 @@ int main(int argc, char *argv[])
      * MEC + a direct compute HQD, so (like "boot") it only runs when "nop" is
      * explicitly requested -- not during an unfiltered full sweep. */
     bool runNop = (filter && strstr(filter, "nop") != nullptr);
+    /* The dispatch recipe runs recipeBootload internally then brings up the
+     * MEC + GPUVM + a direct compute HQD and dispatches an s_endpgm shader, so
+     * (like "boot"/"nop") it only runs when "disp" is explicitly requested --
+     * not during an unfiltered full sweep. */
+    bool runDisp = (filter && strstr(filter, "disp") != nullptr);
 
     bool needIpd = shouldRun(filter, "ipd") || shouldRun(filter, "gmc") ||
                    shouldRun(filter, "sol") || shouldRun(filter, "psp") ||
                    shouldRun(filter, "smu") || shouldRun(filter, "fw") ||
-                   shouldRun(filter, "pspd") || runBoot || runNop;
+                   shouldRun(filter, "pspd") || runBoot || runNop || runDisp;
     if (needIpd && g_info.VendorId == 0) {
         gpu.getInfo(&g_info);
     }
@@ -577,7 +613,12 @@ int main(int argc, char *argv[])
     }
 
     if (g_ipd.valid) {
-        if (runNop) {
+        if (runDisp) {
+            /* Isolated path: bootload recipe THEN MEC + GPUVM + compute HQD +
+             * a single s_endpgm DISPATCH_DIRECT (does not create the legacy
+             * PSP ring). */
+            testDispatch(gpu);
+        } else if (runNop) {
             /* Isolated path: bootload recipe THEN MEC + compute HQD + NOP
              * fence (does not create the legacy PSP ring). */
             testNopFence(gpu);

@@ -524,3 +524,35 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
  * ====================================================================== */
 bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
                     const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * Increment 2b: single s_endpgm compute dispatch (GPUVM + DISPATCH_DIRECT)
+ *
+ * recipeDispatch() mirrors the proven Python probe (probe16_vmid0.py +
+ * compute_dispatch.py _build_dispatch_packets / test_noop_dispatch):
+ *   1. recipeBootload() -> BOOTLOAD_COMPLETE (PSP autoload).
+ *   2. init_gfx_for_compute (MEC enable), same as recipeNopFence.
+ *   3. gfxhub_gart_enable: re-setup the GFXHUB after AUTOLOAD_RLC (which
+ *      resets the GFXHUB contexts), using two DMA buffers for the GART
+ *      page table + dummy page (system aperture / fault default).
+ *   4. Stage 16 dwords of s_endpgm (0xBF810000) in a 4KB VRAM page.
+ *   5. build_compute_gpuvm: build a 4-level GFXHUB page table (PDB2->PDB1->
+ *      PDB0->PTB, 4KB VRAM pages, 0-based VRAM-offset entries) mapping the
+ *      shader VA 0x200000000000 -> the s_endpgm page, then enable
+ *      GCVM_CONTEXT0 = 0x03FFFC07 (ENABLE|depth3|fault-enable) and flush
+ *      the GFXHUB TLB. CONTEXT0 is enabled AFTER the queue MEC bring-up and
+ *      gfxhub_gart_enable, BEFORE init_compute_queue (probe16 ordering).
+ *   6. init_compute_queue (direct-MMIO HQD, VMID 0), same as recipeNopFence.
+ *   7. _build_dispatch_packets: ACQUIRE_MEM (gfx12 GCR full invalidate) +
+ *      SET_SH_REG COMPUTE_PGM_LO/HI/RSRC1/RSRC2/RSRC3/TMPRING/RESTART/
+ *      USER_DATA/RESOURCE_LIMITS/START..NUM_THREAD + DISPATCH_DIRECT
+ *      (1,1,1, initiator=0x8045) + CS_PARTIAL_FLUSH + RELEASE_MEM fence.
+ *      NO STATIC_THREAD_MGMT override (autoload masks are correct).
+ *   8. wait_fence + read GCVM_L2_PROTECTION_FAULT_STATUS (gc base[0]+0x15D0)
+ *      + RPTR. PASS iff the fence signals AND fault status == 0.
+ *
+ * fwDir/vramMcBase are passed straight through to recipeBootload(). This is
+ * 2b (single s_endpgm dispatch) only -- no kernargs, multi-wg, or scratch.
+ * ====================================================================== */
+bool recipeDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase);
