@@ -34,6 +34,10 @@ COMPUTE_NUM_THREAD_Z = 0x2E09
 # Scratch/temporary ring
 COMPUTE_TMPRING_SIZE = 0x2E18
 
+# Architected flat scratch base (gfx11/gfx12): backing VA >> 8 (LO=low32, HI=hi8)
+COMPUTE_DISPATCH_SCRATCH_BASE_LO = 0x2E10
+COMPUTE_DISPATCH_SCRATCH_BASE_HI = 0x2E11
+
 # Resource limits
 COMPUTE_RESOURCE_LIMITS = 0x2E15
 

@@ -63,6 +63,7 @@ from amd_gpu_driver.commands.pm4 import (
     SH_REG_BASE,
 )
 from amd_gpu_driver.gpu.registers import (
+    COMPUTE_DISPATCH_SCRATCH_BASE_LO,
     COMPUTE_PGM_LO,
     COMPUTE_PGM_RSRC1,
     COMPUTE_PGM_RSRC2,
@@ -155,8 +156,15 @@ def _build_dispatch_packets(
     fence_addr: int,
     fence_value: int,
     kernarg_sgpr_index: int = 0,
+    scratch_base_va: int = 0,
+    tmpring_size: int = 0,
 ) -> bytes:
     """Build a complete PM4 command stream for compute dispatch.
+
+    ``scratch_base_va``/``tmpring_size`` enable gfx12 architected flat scratch
+    (the SPI gives each wave its FLAT_SCRATCH from COMPUTE_DISPATCH_SCRATCH_BASE
+    + the per-wave TMPRING_SIZE.WAVESIZE offset); both 0 for a non-spilling
+    kernel.
 
     ``kernarg_sgpr_index`` is the USER_DATA SGPR slot that receives the kernarg
     segment pointer (0 when kernarg is the first enabled preload SGPR, as for a
@@ -221,8 +229,15 @@ def _build_dispatch_packets(
     # 4. RSRC3
     pm4.set_sh_reg(sh_reg_offset(COMPUTE_PGM_RSRC3), pgm_rsrc3)
 
-    # 5. Scratch (none)
-    pm4.set_sh_reg(sh_reg_offset(COMPUTE_TMPRING_SIZE), 0)
+    # 5. Scratch (architected flat scratch; base = backing VA >> 8)
+    if scratch_base_va:
+        sbase = scratch_base_va >> 8
+        pm4.set_sh_reg(
+            sh_reg_offset(COMPUTE_DISPATCH_SCRATCH_BASE_LO),
+            sbase & 0xFFFFFFFF,
+            (sbase >> 32) & 0xFF,
+        )
+    pm4.set_sh_reg(sh_reg_offset(COMPUTE_TMPRING_SIZE), tmpring_size)
 
     # 6. Restart coordinates (zero)
     pm4.set_sh_reg(sh_reg_offset(COMPUTE_RESTART_X), 0, 0, 0)
@@ -751,10 +766,19 @@ def dispatch_elf_kernel(
     print(f"  RSRC1=0x{kd.compute_pgm_rsrc1:08X} RSRC2=0x{kd.compute_pgm_rsrc2:08X} "
           f"RSRC3=0x{kd.compute_pgm_rsrc3:08X} kernarg={kd.kernarg_size} "
           f"LDS={kd.group_segment_fixed_size}")
-    if kd.private_segment_fixed_size:
-        raise RuntimeError(
-            f"kernel needs {kd.private_segment_fixed_size} bytes of scratch "
-            "per work-item (scratch programming not yet implemented)")
+    # gfx12 architected flat scratch: size a VRAM backing + COMPUTE_TMPRING_SIZE
+    # for a register-spilling kernel (private_segment_fixed_size > 0).
+    psfs = kd.private_segment_fixed_size
+    tmpring_size = 0
+    scratch_bytes = 0
+    if psfs:
+        lanes = 32 if (kd.kernel_code_properties & (1 << 10)) else 64  # WAVEFRONT_SIZE32
+        waves = 32  # concurrent scratch slots; one 2MB PTB fits this (SPI serializes beyond)
+        bpt = (psfs + (256 // lanes) - 1) & ~((256 // lanes) - 1)
+        wave_bytes = bpt * lanes
+        wavesize = (wave_bytes + 255) // 256
+        scratch_bytes = (wave_bytes * waves * 4 + 0xFFF) & ~0xFFF  # 4x SE-stripe over-alloc
+        tmpring_size = (waves & 0xFFF) | ((wavesize & 0x3FFFF) << 12)
 
     # Assemble the loadable image by SECTION VADDR -- on AMDGPU code objects the
     # section vaddrs differ from their file offsets (e.g. .text loads above the
@@ -776,12 +800,26 @@ def dispatch_elf_kernel(
     kernarg = ctx.dev.alloc_memory(max(kd.kernarg_size, 4096), MemoryLocation.VRAM)
     ctypes.memset(kernarg.cpu_addr, 0, kernarg.size)
     ptr_handles = [a for a in args if isinstance(a, MemoryHandle)]
+    scratch = (ctx.dev.alloc_memory(scratch_bytes, MemoryLocation.VRAM)
+               if psfs else None)
 
-    # GPUVM-map code + kernarg + pointer-arg buffers (one PTB, VMID 0).
-    vas = map_compute_buffers(ctx.dev, ctx.gmc_config, ctx.nbio_config,
-                              [code, kernarg] + ptr_handles)
+    # GPUVM-map code + kernarg + pointer-arg buffers (+ scratch) (one PTB, VMID 0).
+    bufs = [code, kernarg] + ptr_handles + ([scratch] if scratch else [])
+    vas = map_compute_buffers(ctx.dev, ctx.gmc_config, ctx.nbio_config, bufs)
     code_va, kernarg_va = vas[0], vas[1]
-    handle_va = {id(h): v for h, v in zip(ptr_handles, vas[2:])}
+    handle_va = {id(h): v for h, v in zip(ptr_handles, vas[2:2 + len(ptr_handles)])}
+    scratch_base_va = vas[2 + len(ptr_handles)] if scratch else 0
+
+    if scratch:
+        # Architected flat scratch needs the private aperture + UNALIGNED mode
+        # (sub-dword scratch ops) set on the queue's VMID before dispatch.
+        from amd_gpu_driver.backends.windows.ring_init import (
+            grbm_select, grbm_deselect, _gc_wreg, regSH_MEM_BASES, regSH_MEM_CONFIG)
+        gc = ctx.compute_queue.gc_base
+        grbm_select(ctx.dev, gc, 0, 0, 0, vmid=0)
+        _gc_wreg(ctx.dev, gc, regSH_MEM_CONFIG, 0xC00C, base_idx=1)  # UNALIGNED|prefetch
+        _gc_wreg(ctx.dev, gc, regSH_MEM_BASES, 0x00010002, base_idx=1)  # PRIVATE_BASE=2
+        grbm_deselect(ctx.dev, gc)
 
     kbuf = (ctypes.c_char * kernarg.size).from_address(kernarg.cpu_addr)
     layout = kernel_arg_layout(co, kernel_sym.name)
@@ -851,9 +889,13 @@ def dispatch_elf_kernel(
         fence_addr=cq.fence_bus_addr,
         fence_value=fence_seq,
         kernarg_sgpr_index=slot,
+        scratch_base_va=scratch_base_va,
+        tmpring_size=tmpring_size,
     )
     print(f"  code_entry=0x{code_entry_va:X} kernarg=0x{kernarg_va:X} "
-          f"sgpr_slot={slot} grid={grid} block={block}")
+          f"sgpr_slot={slot} grid={grid} block={block}"
+          + (f" scratch=0x{scratch_base_va:X} tmpring=0x{tmpring_size:X}"
+             if scratch else ""))
     submit_compute_packets(cq, packets)
     if not wait_fence(cq, fence_seq, timeout_ms=timeout_ms):
         print(f"  FAIL: Fence timeout after {timeout_ms}ms")
