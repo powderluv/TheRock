@@ -315,6 +315,37 @@ static void testFirmwareLoad(WddmLite &gpu)
 }
 
 /* ======================================================================
+ * Test: macOS-proven gfx1201 cold-boot recipe -> BOOTLOAD_COMPLETE
+ *
+ * Runs recipeBootload(), which mirrors the Python
+ * load_all_firmware_recipe + init_smu(EnableAllSmuFeatures) + BOOTLOAD poll.
+ * Firmware is read from the guest path Z:\winfw (override with argv[2]).
+ * PASS iff RLC_RLCS_BOOTLOAD_STATUS == 0x8000003f.
+ * ====================================================================== */
+
+static const char *g_fwDir = "Z:\\winfw";
+
+static void testRecipeBootload(WddmLite &gpu)
+{
+    TEST_BEGIN("Recipe bootload (BOOTLOAD_COMPLETE)");
+    TEST_CHECK(g_ipd.valid, "IP discovery not valid");
+
+    /* The recipe needs the GMC VRAM MC base for the SMU driver table
+     * (probe passes init_smu(vram_mc_base=gmc.vram_start)). Ensure GMC ran. */
+    if (g_gmc.vramSize == 0) {
+        printf("  Running GMC init first (needed for vram_mc_base)...\n");
+        TEST_CHECK(gmcInit(gpu, g_ipd, g_gmc), "GMC init failed");
+    }
+
+    printf("  Firmware dir: %s\n", g_fwDir);
+    printf("  vram_mc_base: 0x%llX\n", g_gmc.vramStart);
+
+    bool ok = recipeBootload(gpu, g_ipd, g_fwDir, g_gmc.vramStart);
+    TEST_CHECK(ok, "BOOTLOAD did not reach 0x8000003f");
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Test: PSP Ring Destroy
  * ====================================================================== */
 
@@ -470,6 +501,10 @@ int main(int argc, char *argv[])
         filter = argv[1];
         printf("Filter: '%s'\n", filter);
     }
+    if (argc > 2) {
+        g_fwDir = argv[2];
+        printf("Firmware dir override: '%s'\n", g_fwDir);
+    }
     printf("Testing WDDM escape interface and GPU bring-up\n\n");
 
     WddmLite gpu;
@@ -489,10 +524,15 @@ int main(int argc, char *argv[])
 
     /* Phase 2: IP Discovery + Hardware init */
     /* Ensure GET_INFO is populated for IP discovery */
+    /* The bootload recipe is heavy and conflicts with the legacy PSP ring
+     * tests, so only run it when "boot" is explicitly requested as the
+     * filter (not during an unfiltered full sweep). */
+    bool runBoot = (filter && strstr(filter, "boot") != nullptr);
+
     bool needIpd = shouldRun(filter, "ipd") || shouldRun(filter, "gmc") ||
                    shouldRun(filter, "sol") || shouldRun(filter, "psp") ||
                    shouldRun(filter, "smu") || shouldRun(filter, "fw") ||
-                   shouldRun(filter, "pspd");
+                   shouldRun(filter, "pspd") || runBoot;
     if (needIpd && g_info.VendorId == 0) {
         gpu.getInfo(&g_info);
     }
@@ -503,12 +543,18 @@ int main(int argc, char *argv[])
     }
 
     if (g_ipd.valid) {
-        if (shouldRun(filter, "gmc"))  testGmcInit(gpu);
-        if (shouldRun(filter, "sol"))  testPspSol(gpu);
-        if (shouldRun(filter, "psp"))  testPspRing(gpu);
-        if (shouldRun(filter, "smu"))  testSmuGfxOff(gpu);
-        if (shouldRun(filter, "fw"))   testFirmwareLoad(gpu);
-        if (shouldRun(filter, "pspd")) testPspRingDestroy(gpu);
+        if (runBoot) {
+            /* Isolated path: run only the bootload recipe (does not create
+             * the legacy PSP ring). */
+            testRecipeBootload(gpu);
+        } else {
+            if (shouldRun(filter, "gmc"))  testGmcInit(gpu);
+            if (shouldRun(filter, "sol"))  testPspSol(gpu);
+            if (shouldRun(filter, "psp"))  testPspRing(gpu);
+            if (shouldRun(filter, "smu"))  testSmuGfxOff(gpu);
+            if (shouldRun(filter, "fw"))   testFirmwareLoad(gpu);
+            if (shouldRun(filter, "pspd")) testPspRingDestroy(gpu);
+        }
     }
 
     /* Phase 3: Compute escape tests */

@@ -477,3 +477,26 @@ bool smuDisableGfxOff(WddmLite &gpu, const IpDiscoveryResult &ipd);
 
 /* Firmware file loading */
 bool loadFirmwareFile(const char *path, std::vector<uint8_t> &data);
+
+/* ======================================================================
+ * macOS-proven gfx1201 cold-boot recipe (LITE_MES_RECIPE=1 equivalent)
+ *
+ * recipeBootload() faithfully mirrors the Python
+ * load_all_firmware_recipe + init_smu(EnableAllSmuFeatures) + BOOTLOAD poll
+ * from python/amd_gpu_driver/backends/windows/{psp_init,smu_init}.py.
+ *
+ * It uses VRAM-backed PSP buffers (alloc_memory equivalent) and the PSP
+ * GPCOM command-buffer ABI (use_cmd_buffer=True), which differ from the
+ * legacy DMA-based pspLoadFirmware/pspRingCreate path above. The legacy
+ * path is left untouched.
+ *
+ * fwDir: path to the firmware .bin directory as seen by the guest, e.g.
+ *        "Z:\\winfw".
+ * vramMcBase: GMC VRAM MC base (GmcState.vramStart) used by the SMU driver
+ *        table address translation, matching probe_kernel.py's
+ *        init_smu(vram_mc_base=gmc.vram_start).
+ *
+ * Returns true if RLC_RLCS_BOOTLOAD_STATUS bit31 is set (0x8000003f).
+ * ====================================================================== */
+bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase);
