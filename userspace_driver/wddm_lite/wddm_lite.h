@@ -556,3 +556,32 @@ bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
  * ====================================================================== */
 bool recipeDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
                     const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * Increment 3a: real compiled kernel + kernargs compute dispatch
+ *
+ * recipeKernargDispatch() mirrors the proven Python probe (probe_kernel.py +
+ * compute_dispatch.py dispatch_elf_kernel):
+ *   1. recipeBootload() -> BOOTLOAD_COMPLETE (PSP autoload).
+ *   2. init_gfx_for_compute (MEC enable), same as recipeDispatch.
+ *   3. gfxhub_gart_enable: re-init the GFXHUB after AUTOLOAD_RLC.
+ *   4. Load fill_kernel_raw.co from fwDir; parse the AMDGPU ELF + the 64-byte
+ *      KERNEL_DESCRIPTOR (RSRC1/2/3, kernarg_size, entry offset, props);
+ *      assemble the loadable image by SECTION VADDR and stage it in VRAM.
+ *   5. Allocate a kernarg buffer + an output buffer (FB-MC bump allocator);
+ *      fill the kernarg with the output VA (off 0) + the u32 fill value (off 8).
+ *   6. buildComputeGpuvmMulti: 4-level GFXHUB page table mapping EVERY code
+ *      page + kernarg + output (one shared PTB; all VAs in the same 2MB block
+ *      at 0x200000000000), enable GCVM_CONTEXT0 = depth-3, flush the TLB.
+ *   7. init_compute_queue (direct-MMIO HQD, VMID 0).
+ *   8. _build_dispatch_packets with the KD RSRC1/2/3 and the kernarg base VA
+ *      in USER_DATA_<kernarg_sgpr_index> (slot 0 for this kernel); DISPATCH
+ *      grid=1 block=64 (single workgroup -> COV5 hidden args irrelevant).
+ *   9. wait_fence, HDP flush, read GCVM fault status + the output buffer.
+ *      PASS iff the fence signals AND fault status == 0 AND out[0..63] == val.
+ *
+ * fwDir/vramMcBase are passed straight through to recipeBootload(). fwDir must
+ * also contain fill_kernel_raw.co (e.g. copied into Z:\winfw).
+ * ====================================================================== */
+bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase);

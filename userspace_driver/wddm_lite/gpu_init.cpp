@@ -3057,3 +3057,664 @@ bool recipeDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
            : (ok ? "FAIL (GPUVM fault)" : "FAIL (fence timeout)"));
     return pass;
 }
+
+/* ======================================================================
+ * Increment 3a: real compiled kernel + kernargs compute dispatch
+ *
+ * Faithful C++ transcription of the proven probe path:
+ *   python/probe_kernel.py (THE probe that PASSED on this gfx1201): load the
+ *     fill_kernel_raw.co into VRAM honoring section vaddrs, GPUVM-map code +
+ *     kernarg + output (one PTB, VMID 0), pack the kernarg (out VA + u32 val),
+ *     DISPATCH_DIRECT wave32 grid=1 block=64, then read out[0..63] == val.
+ *   python/amd_gpu_driver/kernel/elf_parser.py: parse_elf (header/sections/
+ *     symbols), assemble image by SECTION VADDR.
+ *   python/amd_gpu_driver/kernel/descriptor.py: KernelDescriptor (the 64-byte
+ *     amdhsa kernel descriptor at the "<name>.kd" symbol).
+ *   python/amd_gpu_driver/backends/windows/compute_dispatch.py:
+ *     dispatch_elf_kernel / _build_dispatch_packets (kernarg base VA -> the
+ *     USER_DATA SGPR at the kernarg_segment_ptr slot index).
+ *
+ * Kernarg layout source -- KD, NOT msgpack: the probe derives the layout
+ * directly from the 64-byte KERNEL_DESCRIPTOR plus the known fill_kernel ABI
+ * (off0 = output pointer (8B), off8 = u32 fill value), and it PASSED. The
+ * dispatch is a SINGLE workgroup (grid=1,1,1), so tid = local_id and the COV5
+ * hidden args (get_local_size()*group_id == 0) are irrelevant; a 64-byte KD is
+ * sufficient and no msgpack decoder is needed. This mirrors probe_kernel.py
+ * exactly (compute_dispatch.kernel_arg_layout / msgpack is only required for
+ * MULTI-workgroup grids, which this increment does not exercise).
+ *
+ * kernarg_sgpr_index == 0: the KD properties (props=0x408 -> bit3 kernarg-ptr,
+ * bit10 wave32; bits 0/1/2 = private-seg-buffer/dispatch-ptr/queue-ptr all 0)
+ * mean the kernarg segment pointer is the FIRST preload SGPR, landing in
+ * USER_DATA_0 (s[0:1]). The slot computation below reproduces that.
+ * ====================================================================== */
+
+/* ---- Minimal AMDGPU ELF parser (elf_parser.py) ---------------------------- */
+
+#define RCP_ELF_SHT_NOBITS  8
+#define RCP_ELF_SHF_ALLOC   0x2
+/* STT_AMDGPU_HSA_KERNEL == 10; STT_FUNC == 2; STB_GLOBAL == 1 (kernel_symbols). */
+#define RCP_ELF_STT_AMDGPU_HSA_KERNEL  10
+#define RCP_ELF_STT_FUNC               2
+#define RCP_ELF_STB_GLOBAL             1
+
+struct RcpElfSection {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+    char     name[64];
+};
+
+struct RcpElfSymbol {
+    uint32_t st_name;
+    uint8_t  st_info;
+    uint8_t  st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+    char     name[96];
+};
+
+struct RcpElf {
+    const std::vector<uint8_t> *data;
+    uint16_t e_machine;
+    uint16_t e_type;
+    std::vector<RcpElfSection> sections;
+    std::vector<RcpElfSymbol> symbols;
+};
+
+/* Little-endian readers over the byte vector (the .co is ELFDATA2LSB; the host
+ * is x86-64 LE, but read field-by-field so the parse is endianness-explicit and
+ * matches struct.unpack_from in elf_parser.py). */
+static uint16_t rcpElfU16(const std::vector<uint8_t> &d, size_t off)
+{
+    return (uint16_t)(d[off] | ((uint16_t)d[off + 1] << 8));
+}
+static uint32_t rcpElfU32(const std::vector<uint8_t> &d, size_t off)
+{
+    return (uint32_t)d[off] | ((uint32_t)d[off + 1] << 8) |
+           ((uint32_t)d[off + 2] << 16) | ((uint32_t)d[off + 3] << 24);
+}
+static uint64_t rcpElfU64(const std::vector<uint8_t> &d, size_t off)
+{
+    uint64_t lo = rcpElfU32(d, off);
+    uint64_t hi = rcpElfU32(d, off + 4);
+    return lo | (hi << 32);
+}
+
+static void rcpElfCopyStr(const std::vector<uint8_t> &d, size_t strtabOff,
+                          size_t strtabSize, uint32_t nameIdx,
+                          char *out, size_t outSize)
+{
+    out[0] = '\0';
+    if (nameIdx >= strtabSize)
+        return;
+    size_t p = strtabOff + nameIdx;
+    size_t i = 0;
+    while (i + 1 < outSize && p < d.size() && d[p] != 0) {
+        out[i++] = (char)d[p++];
+    }
+    out[i] = '\0';
+}
+
+/* Parse a 64-bit AMDGPU ELF (parse_elf). Returns false on a bad/short file. */
+static bool rcpElfParse(const std::vector<uint8_t> &data, RcpElf &elf)
+{
+    if (data.size() < 64) return false;
+    if (!(data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F'))
+        return false;
+    if (data[4] != 2) return false;     /* ELFCLASS64 */
+
+    elf.data = &data;
+    elf.e_type = rcpElfU16(data, 16);
+    elf.e_machine = rcpElfU16(data, 18);
+    uint64_t e_shoff = rcpElfU64(data, 40);
+    uint16_t e_shentsize = rcpElfU16(data, 58);
+    uint16_t e_shnum = rcpElfU16(data, 60);
+    uint16_t e_shstrndx = rcpElfU16(data, 62);
+
+    if (e_shentsize < 64) return false;
+    if (e_shoff + (uint64_t)e_shnum * e_shentsize > data.size()) return false;
+
+    elf.sections.clear();
+    elf.sections.reserve(e_shnum);
+    for (uint16_t i = 0; i < e_shnum; i++) {
+        size_t o = (size_t)e_shoff + (size_t)i * e_shentsize;
+        RcpElfSection s;
+        s.sh_name = rcpElfU32(data, o + 0);
+        s.sh_type = rcpElfU32(data, o + 4);
+        s.sh_flags = rcpElfU64(data, o + 8);
+        s.sh_addr = rcpElfU64(data, o + 16);
+        s.sh_offset = rcpElfU64(data, o + 24);
+        s.sh_size = rcpElfU64(data, o + 32);
+        s.sh_link = rcpElfU32(data, o + 40);
+        s.sh_info = rcpElfU32(data, o + 44);
+        s.sh_addralign = rcpElfU64(data, o + 48);
+        s.sh_entsize = rcpElfU64(data, o + 56);
+        s.name[0] = '\0';
+        elf.sections.push_back(s);
+    }
+
+    /* Resolve section names from shstrtab. */
+    if (e_shstrndx < elf.sections.size()) {
+        const RcpElfSection &sh = elf.sections[e_shstrndx];
+        for (auto &s : elf.sections)
+            rcpElfCopyStr(data, (size_t)sh.sh_offset, (size_t)sh.sh_size,
+                          s.sh_name, s.name, sizeof(s.name));
+    }
+
+    /* Find SYMTAB + its linked STRTAB (parse_elf: SHT_SYMTAB == 2). */
+    const RcpElfSection *symtab = nullptr;
+    for (const auto &s : elf.sections) {
+        if (s.sh_type == 2) { symtab = &s; break; }
+    }
+    elf.symbols.clear();
+    if (symtab) {
+        size_t strOff = 0, strSize = 0;
+        if (symtab->sh_link < elf.sections.size()) {
+            const RcpElfSection &linked = elf.sections[symtab->sh_link];
+            strOff = (size_t)linked.sh_offset;
+            strSize = (size_t)linked.sh_size;
+        }
+        const size_t SYM_SIZE = 24;     /* Elf64_Sym */
+        size_t nsym = (size_t)symtab->sh_size / SYM_SIZE;
+        for (size_t i = 0; i < nsym; i++) {
+            size_t o = (size_t)symtab->sh_offset + i * SYM_SIZE;
+            if (o + SYM_SIZE > data.size()) break;
+            RcpElfSymbol sym;
+            sym.st_name = rcpElfU32(data, o + 0);
+            sym.st_info = data[o + 4];
+            sym.st_other = data[o + 5];
+            sym.st_shndx = rcpElfU16(data, o + 6);
+            sym.st_value = rcpElfU64(data, o + 8);
+            sym.st_size = rcpElfU64(data, o + 16);
+            sym.name[0] = '\0';
+            if (strSize)
+                rcpElfCopyStr(data, strOff, strSize, sym.st_name,
+                              sym.name, sizeof(sym.name));
+            elf.symbols.push_back(sym);
+        }
+    }
+    return true;
+}
+
+/* The 64-byte amdhsa kernel descriptor (descriptor.py KernelDescriptor).
+ * Only the fields the dispatch consumes are surfaced. */
+struct RcpKernelDescriptor {
+    uint32_t group_segment_fixed_size;     /* off 0  */
+    uint32_t private_segment_fixed_size;   /* off 4  */
+    uint32_t kernarg_size;                 /* off 8  */
+    int64_t  kernel_code_entry_byte_offset;/* off 16 */
+    uint32_t compute_pgm_rsrc3;            /* off 44 */
+    uint32_t compute_pgm_rsrc1;            /* off 48 */
+    uint32_t compute_pgm_rsrc2;            /* off 52 */
+    uint16_t kernel_code_properties;       /* off 56 */
+};
+
+/* Parse the 64-byte KD out of `data` starting at `off` (from_bytes). */
+static bool rcpKdFromBytes(const std::vector<uint8_t> &data, size_t off,
+                           RcpKernelDescriptor &kd)
+{
+    if (off + 64 > data.size()) return false;
+    kd.group_segment_fixed_size = rcpElfU32(data, off + 0);
+    kd.private_segment_fixed_size = rcpElfU32(data, off + 4);
+    kd.kernarg_size = rcpElfU32(data, off + 8);
+    kd.kernel_code_entry_byte_offset = (int64_t)rcpElfU64(data, off + 16);
+    kd.compute_pgm_rsrc3 = rcpElfU32(data, off + 44);
+    kd.compute_pgm_rsrc1 = rcpElfU32(data, off + 48);
+    kd.compute_pgm_rsrc2 = rcpElfU32(data, off + 52);
+    kd.kernel_code_properties = rcpElfU16(data, off + 56);
+    return true;
+}
+
+/* ---- Multi-region 4-level compute GPUVM page table ------------------------ */
+
+/* One mapped buffer: a GPU VA and the FB-MC address it maps to. */
+struct GpuvmRegion {
+    uint64_t va;        /* virtual address the kernel uses */
+    uint64_t gpuAddr;   /* FB-MC address (g_vramMcBase + offset) of the page */
+};
+
+/* Build a 4-level page table (PDB2->PDB1->PDB0->PTB) mapping MULTIPLE 4KB
+ * regions, then enable GCVM_CONTEXT0 = depth-3 and flush the GFXHUB TLB.
+ *
+ * This generalizes buildComputeGpuvm: instead of one leaf it writes one LEAF
+ * PTE per region. All regions in this increment lie inside the same 2MB block
+ * at COMPUTE_VA_ROOT (0x200000000000) so they share ONE PDB2/PDB1/PDB0/PTB --
+ * the assert below enforces that (matching probe_kernel.py, which uses a single
+ * PTB for code+kernarg+output). Entries are 0-BASED VRAM OFFSETS
+ * (gpuAddr - vramMcBase), the proven 2b math. Must run AFTER gfxhubGartEnable
+ * and BEFORE the queue (probe ordering). */
+static bool buildComputeGpuvmMulti(WddmLite &gpu, const CqState &cq,
+                                   uint64_t vramMcBase,
+                                   const GpuvmRegion *regions, uint32_t numRegions,
+                                   DispatchGpuvm &pt)
+{
+    if (numRegions == 0) return false;
+
+    void *cpu = nullptr;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb2Gpu, &pt.pdb2Handle)) return false;
+    pt.pdb2Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb1Gpu, &pt.pdb1Handle)) return false;
+    pt.pdb1Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.pdb0Gpu, &pt.pdb0Handle)) return false;
+    pt.pdb0Cpu = cpu;
+    if (!rcpAllocVram(gpu, 4096, &cpu, &pt.ptbGpu, &pt.ptbHandle)) return false;
+    pt.ptbCpu = cpu;
+    /* rcpAllocVram already zeroes each page. */
+
+    /* All regions must share the i2/i1/i0 indices (same 2MB block, one PTB). */
+    uint64_t base = regions[0].va;
+    uint32_t i2 = (uint32_t)((base >> 39) & 0x1FF);
+    uint32_t i1 = (uint32_t)((base >> 30) & 0x1FF);
+    uint32_t i0 = (uint32_t)((base >> 21) & 0x1FF);
+
+    uint64_t pdb1Off = (pt.pdb1Gpu - vramMcBase) & GPUVM_ADDR_MASK;
+    uint64_t pdb0Off = (pt.pdb0Gpu - vramMcBase) & GPUVM_ADDR_MASK;
+    uint64_t ptbOff  = (pt.ptbGpu  - vramMcBase) & GPUVM_ADDR_MASK;
+
+    *(volatile uint64_t *)((uint8_t *)pt.pdb2Cpu + i2 * 8) = AMDGPU_PTE_VALID | pdb1Off;
+    *(volatile uint64_t *)((uint8_t *)pt.pdb1Cpu + i1 * 8) = AMDGPU_PTE_VALID | pdb0Off;
+    *(volatile uint64_t *)((uint8_t *)pt.pdb0Cpu + i0 * 8) = AMDGPU_PTE_VALID | ptbOff;
+
+    for (uint32_t r = 0; r < numRegions; r++) {
+        uint64_t va = regions[r].va;
+        uint32_t ri2 = (uint32_t)((va >> 39) & 0x1FF);
+        uint32_t ri1 = (uint32_t)((va >> 30) & 0x1FF);
+        uint32_t ri0 = (uint32_t)((va >> 21) & 0x1FF);
+        if (ri2 != i2 || ri1 != i1 || ri0 != i0) {
+            printf("  GPUVM(multi): ERROR region %u VA=0x%llX crosses the 2MB "
+                   "block of base VA=0x%llX (single-PTB assumption violated)\n",
+                   r, (unsigned long long)va, (unsigned long long)base);
+            return false;
+        }
+        uint32_t ip = (uint32_t)((va >> 12) & 0x1FF);
+        uint64_t off = (regions[r].gpuAddr - vramMcBase) & GPUVM_ADDR_MASK;
+        *(volatile uint64_t *)((uint8_t *)pt.ptbCpu + ip * 8) = GPUVM_LEAF_FLAGS | off;
+    }
+
+    cqHdpFlush(gpu, cq);
+
+    /* Re-point CONTEXT0 at the depth-3 page table (root = 0-based offset|VALID). */
+    uint64_t root = ((pt.pdb2Gpu - vramMcBase) & GPUVM_ADDR_MASK) | AMDGPU_PTE_VALID;
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32,
+           (uint32_t)(root & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32,
+           (uint32_t)((root >> 32) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32, 0, 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32, 0, 0);
+    uint64_t end = 0x7FFFFFFFFFFFull;
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,
+           (uint32_t)((end >> 12) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,
+           (uint32_t)((end >> 44) & 0xFFFFFFFF), 0);
+    gcWreg(gpu, cq, regGCVM_CONTEXT0_CNTL, GCVM_CONTEXT0_CNTL_DEPTH3, 0);
+
+    cqHdpFlush(gpu, cq);
+    gfxhubFlushTlb(gpu, cq, 0);
+
+    printf("  GPUVM(multi): %u regions, block idx=[%u,%u,%u] root=0x%llX\n",
+           numRegions, i2, i1, i0,
+           (unsigned long long)(root & GPUVM_ADDR_MASK));
+    return true;
+}
+
+/* ---- Top-level: recipeKernargDispatch ------------------------------------- */
+
+/* fill_kernel ABI (probe_kernel.py): kernarg[0:8] = output VA, kernarg[8:12] =
+ * u32 fill value. Single workgroup grid=1 block=64 -> out[0..N-1] == VAL. */
+#define KERN_FILL_VAL   0xDEADBEEFu
+#define KERN_FILL_N     64
+#define KERN_BLOCK_X    64
+#define KERN_CO_FILE    "fill_kernel_raw.co"
+
+bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase)
+{
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  KERN: recipeBootload did not reach BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    printf("\n=== recipeKernargDispatch (real kernel + kernargs) ===\n");
+
+    /* Load + parse the compiled kernel from the firmware dir (same dir the
+     * bootload firmware is read from, e.g. Z:\winfw). loadFirmwareFile caps at
+     * 16MB, ample for a ~5KB .co. */
+    std::vector<uint8_t> co;
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s\\%s", fwDir, KERN_CO_FILE);
+        if (!loadFirmwareFile(path, co)) {
+            printf("  KERN: ERROR cannot read kernel %s\n", path);
+            return false;
+        }
+    }
+    RcpElf elf;
+    if (!rcpElfParse(co, elf)) {
+        printf("  KERN: ERROR failed to parse %s as AMDGPU ELF\n", KERN_CO_FILE);
+        return false;
+    }
+
+    /* Find the kernel entry symbol and its "<name>.kd" descriptor symbol. */
+    const RcpElfSymbol *kSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        uint8_t type = s.st_info & 0xF;
+        uint8_t bind = s.st_info >> 4;
+        if (type == RCP_ELF_STT_AMDGPU_HSA_KERNEL ||
+            (type == RCP_ELF_STT_FUNC && bind == RCP_ELF_STB_GLOBAL)) {
+            kSym = &s;
+            break;
+        }
+    }
+    if (!kSym) {
+        printf("  KERN: ERROR no kernel symbol in %s\n", KERN_CO_FILE);
+        return false;
+    }
+    char kdName[128];
+    snprintf(kdName, sizeof(kdName), "%s.kd", kSym->name);
+    const RcpElfSymbol *kdSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        if (strcmp(s.name, kdName) == 0) { kdSym = &s; break; }
+    }
+    if (!kdSym) {
+        printf("  KERN: ERROR no kernel descriptor %s\n", kdName);
+        return false;
+    }
+    /* The KD lives in whichever ALLOC section its vaddr falls in. */
+    const RcpElfSection *kdSec = nullptr;
+    for (const auto &s : elf.sections) {
+        if (s.sh_size && s.sh_addr <= kdSym->st_value &&
+            kdSym->st_value < s.sh_addr + s.sh_size) {
+            kdSec = &s;
+            break;
+        }
+    }
+    if (!kdSec) {
+        printf("  KERN: ERROR kernel descriptor section not found\n");
+        return false;
+    }
+    RcpKernelDescriptor kd;
+    size_t kdOff = (size_t)kdSec->sh_offset + (size_t)(kdSym->st_value - kdSec->sh_addr);
+    if (!rcpKdFromBytes(co, kdOff, kd)) {
+        printf("  KERN: ERROR short kernel descriptor\n");
+        return false;
+    }
+    printf("  KERN: kernel='%s' RSRC1=0x%08X RSRC2=0x%08X RSRC3=0x%08X "
+           "kernarg=%u props=0x%X\n",
+           kSym->name, kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2,
+           kd.compute_pgm_rsrc3, kd.kernarg_size, kd.kernel_code_properties);
+
+    /* Assemble the loadable image by SECTION VADDR (alloc, non-NOBITS). The
+     * image high-water mark is max(sh_addr + sh_size) over ALLOC sections,
+     * rounded up to a page. */
+    uint64_t imgHi = 0;
+    for (const auto &s : elf.sections) {
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr) {
+            uint64_t hi = s.sh_addr + s.sh_size;
+            if (hi > imgHi) imgHi = hi;
+        }
+    }
+    if (imgHi == 0) {
+        printf("  KERN: ERROR no allocatable sections\n");
+        return false;
+    }
+    uint64_t imgBytes = (imgHi + 0xFFF) & ~0xFFFull;
+    uint32_t codePages = (uint32_t)(imgBytes / 0x1000);
+    std::vector<uint8_t> image((size_t)imgBytes, 0);
+    for (const auto &s : elf.sections) {
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr &&
+            s.sh_type != RCP_ELF_SHT_NOBITS) {
+            if ((size_t)(s.sh_offset + s.sh_size) > co.size()) continue;
+            memcpy(&image[(size_t)s.sh_addr], &co[(size_t)s.sh_offset],
+                   (size_t)s.sh_size);
+        }
+    }
+
+    /* --- bring up the GFX/MEC and GFXHUB (same as recipeDispatch) ---------- */
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+
+    cq.hasNbif = cqResolveNbif(ipd, &cq.nbifBase2);
+    if (cq.hasNbif) {
+        uint32_t apEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+        gpu.writeReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                       apEn | BIF_DOORBELL_APER_EN__BIT);
+        uint32_t fbEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+        gpu.writeReg32((cq.nbifBase2 + regBIF_FB_EN) * 4,
+                       fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+        printf("  NBIO: doorbell aperture + framebuffer enabled "
+               "(NBIF base[2]=0x%04X)\n", cq.nbifBase2);
+    } else {
+        printf("  NBIO: WARNING NBIF base[2] not found; HDP flush + doorbell "
+               "aperture skipped\n");
+    }
+
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+    if (haveUcode)
+        printf("  GFX: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+               (unsigned long long)pfp, (unsigned long long)me,
+               (unsigned long long)mec);
+
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode))
+        return false;
+
+    void *gartCpu = nullptr, *dummyCpu = nullptr;
+    uint64_t gartBus = 0, dummyBus = 0;
+    void *gartHandle = nullptr, *dummyHandle = nullptr;
+    if (!gpu.allocDma(1 << 20, &gartCpu, &gartBus, &gartHandle)) {
+        printf("  KERN: ERROR GART table DMA alloc failed\n");
+        return false;
+    }
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  KERN: ERROR dummy page DMA alloc failed\n");
+        return false;
+    }
+    memset(gartCpu, 0, 1 << 20);
+    memset(dummyCpu, 0, 4096);
+
+    GfxhubParams gp;
+    memset(&gp, 0, sizeof(gp));
+    uint32_t fbBase = 0, fbTop = 0;
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_BASE, &fbBase);
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_TOP, &fbTop);
+    gp.vramStart = (uint64_t)fbBase << 24;
+    gp.vramEnd = ((uint64_t)fbTop << 24) | 0xFFFFFF;
+    gp.gartStart = gp.vramEnd + 1;
+    gp.gartEnd = gp.gartStart + (512ull * 1024 * 1024) - 1;
+    gp.agpStart = gp.gartEnd + 1;
+    gp.agpEnd = gp.agpStart;
+    gp.gartTableBus = gartBus;
+    gp.dummyPageBus = dummyBus;
+    gfxhubGartEnable(gpu, cq, gp);
+
+    /* --- stage code + kernarg + output in VRAM (FB-MC bump allocator) ------ */
+    void *codeCpu = nullptr;
+    uint64_t codeGpu = 0, codeHandle = 0;
+    if (!rcpAllocVram(gpu, imgBytes, &codeCpu, &codeGpu, &codeHandle)) {
+        printf("  KERN: ERROR code VRAM alloc failed\n");
+        return false;
+    }
+    memcpy(codeCpu, image.data(), (size_t)imgBytes);
+
+    void *kaCpu = nullptr;
+    uint64_t kaGpu = 0, kaHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &kaCpu, &kaGpu, &kaHandle)) {
+        printf("  KERN: ERROR kernarg VRAM alloc failed\n");
+        return false;
+    }
+
+    void *outCpu = nullptr;
+    uint64_t outGpu = 0, outHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &outCpu, &outGpu, &outHandle)) {
+        printf("  KERN: ERROR output VRAM alloc failed\n");
+        return false;
+    }
+    /* rcpAllocVram zeroes the output page. */
+
+    /* VA map: code at COMPUTE_VA_ROOT (codePages pages), kernarg + output on
+     * the next two pages (one PTB, matching probe_kernel.py). */
+    uint64_t codeVa = COMPUTE_VA_ROOT;
+    uint64_t kaVa = COMPUTE_VA_ROOT + (uint64_t)codePages * 0x1000;
+    uint64_t outVa = COMPUTE_VA_ROOT + (uint64_t)(codePages + 1) * 0x1000;
+    /* code entry = code_va + (kd_sym.st_value + entry_byte_offset). */
+    uint64_t codeEntryVa = codeVa +
+        ((uint64_t)kdSym->st_value + (uint64_t)kd.kernel_code_entry_byte_offset);
+
+    /* Fill the kernarg: [0:8] = output VA (little-endian), [8:12] = u32 val. */
+    {
+        uint8_t *kb = (uint8_t *)kaCpu;
+        for (int b = 0; b < 8; b++)
+            kb[0 + b] = (uint8_t)((outVa >> (b * 8)) & 0xFF);
+        uint32_t val = KERN_FILL_VAL;
+        for (int b = 0; b < 4; b++)
+            kb[8 + b] = (uint8_t)((val >> (b * 8)) & 0xFF);
+    }
+
+    /* Build the multi-region page table: every code page + kernarg + output. */
+    std::vector<GpuvmRegion> regions;
+    regions.reserve(codePages + 2);
+    for (uint32_t p = 0; p < codePages; p++)
+        regions.push_back({ codeVa + (uint64_t)p * 0x1000,
+                            codeGpu + (uint64_t)p * 0x1000 });
+    regions.push_back({ kaVa, kaGpu });
+    regions.push_back({ outVa, outGpu });
+
+    DispatchGpuvm pt;
+    memset(&pt, 0, sizeof(pt));
+    if (!buildComputeGpuvmMulti(gpu, cq, vramMcBase, regions.data(),
+                                (uint32_t)regions.size(), pt))
+        return false;
+
+    /* init_compute_queue (direct-MMIO HQD, VMID 0). */
+    if (!cqInitComputeQueue(gpu, cq))
+        return false;
+
+    uint32_t c0 = gcReg(gpu, cq, regGCVM_CONTEXT0_CNTL, 0);
+    printf("  GPUVM: GCVM_CONTEXT0_CNTL readback=0x%08X (enable=%u)\n",
+           c0, c0 & 1u);
+
+    /* kernarg_sgpr_index: kernarg-ptr lands after private-seg-buffer (4),
+     * dispatch-ptr (2), queue-ptr (2). props=0x408 -> none set -> slot 0. */
+    uint32_t slot = 0;
+    if (kd.kernel_code_properties & (1u << 0)) slot += 4;   /* private-seg-buffer */
+    if (kd.kernel_code_properties & (1u << 1)) slot += 2;   /* dispatch-ptr */
+    if (kd.kernel_code_properties & (1u << 2)) slot += 2;   /* queue-ptr */
+
+    printf("  KERN: code_entry=0x%llX ka_va=0x%llX out_va=0x%llX "
+           "code_pages=%u sgpr_slot=%u\n",
+           (unsigned long long)codeEntryVa, (unsigned long long)kaVa,
+           (unsigned long long)outVa, codePages, slot);
+
+    /* Clear the fault status before dispatch. */
+    gpu.writeReg32((cq.gcBase0 + regGCVM_L2_PROTECTION_FAULT_STATUS) * 4, 0);
+    gpu.writeReg32((cq.gcBase0 + (regGCVM_L2_PROTECTION_FAULT_STATUS + 1)) * 4, 0);
+
+    /* Build the dispatch PM4 (probe_kernel.py / _build_dispatch_packets). KD
+     * RSRC1/RSRC2/RSRC3 verbatim -- NO STATIC_THREAD_MGMT override. */
+    uint64_t pgm = codeEntryVa >> 8;            /* COMPUTE_PGM = entry VA >> 8 */
+    uint64_t fenceSeq = 1;
+    *cq.fenceCpu = 0;
+
+    std::vector<uint32_t> packets;
+    pm4AcquireMem(packets);
+
+    uint32_t pgmLoHi[2] = { (uint32_t)(pgm & 0xFFFFFFFF),
+                            (uint32_t)((pgm >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_PGM_LO, pgmLoHi, 2);
+
+    uint32_t rsrc12[2] = { kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2 };
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC1, rsrc12, 2);
+
+    uint32_t rsrc3 = kd.compute_pgm_rsrc3;
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC3, &rsrc3, 1);
+
+    uint32_t tmpring = 0;
+    pm4SetShReg(packets, regCOMPUTE_TMPRING_SIZE, &tmpring, 1);
+
+    uint32_t restart[3] = { 0, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_RESTART_X, restart, 3);
+
+    /* kernarg base VA -> USER_DATA_<slot> (s[slot:slot+1]). */
+    uint32_t userData[2] = { (uint32_t)(kaVa & 0xFFFFFFFF),
+                             (uint32_t)((kaVa >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_USER_DATA_0 + slot, userData, 2);
+
+    uint32_t resLimits = 0;
+    pm4SetShReg(packets, regCOMPUTE_RESOURCE_LIMITS, &resLimits, 1);
+
+    /* COMPUTE_START_X..: start xyz=0, num_thread xyz=(block,1,1), 2 trailing 0. */
+    uint32_t startBlock[8] = { 0, 0, 0, KERN_BLOCK_X, 1, 1, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_START_X, startBlock, 8);
+
+    pm4DispatchDirect(packets, 1, 1, 1, DISPATCH_INITIATOR_W32);
+    pm4EventWrite(packets, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+    pm4ReleaseMemFence(packets, cq.fenceGpu, fenceSeq);
+
+    cqSubmitPackets(gpu, cq, packets);
+
+    bool ok = cqWaitFence(cq, fenceSeq, 5000);
+
+    /* HDP flush so the GPU's VRAM writes to the output page are CPU-visible. */
+    cqHdpFlush(gpu, cq);
+
+    uint32_t faultStatus = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_STATUS, 0);
+    uint32_t faultAddrLo = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, 0);
+    uint32_t faultAddrHi = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, 0);
+    uint64_t faultVa = (((uint64_t)faultAddrHi << 32) | faultAddrLo) << 12;
+
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    uint32_t rptr = gcReg(gpu, cq, regCP_HQD_PQ_RPTR, 0);
+    cqGrbmDeselect(gpu, cq);
+    uint64_t fenceVal = *cq.fenceCpu;
+
+    /* Verify the output buffer via its CPU mapping. */
+    const volatile uint32_t *res = (const volatile uint32_t *)outCpu;
+    uint32_t nbad = 0;
+    uint32_t firstBad = 0;
+    uint32_t firstBadVal = 0;
+    for (uint32_t i = 0; i < KERN_FILL_N; i++) {
+        uint32_t v = res[i];
+        if (v != KERN_FILL_VAL) {
+            if (nbad == 0) { firstBad = i; firstBadVal = v; }
+            nbad++;
+        }
+    }
+
+    uint32_t walker = (faultStatus >> 1) & 0x7;
+    uint32_t perm = (faultStatus >> 4) & 0xF;
+
+    printf("\nFAULT_STATUS=0x%08X [walker=%u perm=0x%X] FAULT_VA=0x%llX\n",
+           faultStatus, walker, perm, (unsigned long long)faultVa);
+    printf("FENCE value=%llu (expected %llu) RPTR=0x%X\n",
+           (unsigned long long)fenceVal, (unsigned long long)fenceSeq, rptr);
+    printf("out[0]=0x%08X out[1]=0x%08X expected=0x%08X bad=%u/%u\n",
+           res[0], res[1], KERN_FILL_VAL, nbad, KERN_FILL_N);
+    if (nbad)
+        printf("  first mismatch at index %u: got 0x%08X\n",
+               firstBad, firstBadVal);
+
+    bool pass = ok && (faultStatus == 0) && (nbad == 0);
+    printf("KERNARG DISPATCH %s\n",
+           pass ? "PASS (fence signaled, no fault, output verified)"
+           : (!ok ? "FAIL (fence timeout)"
+              : (faultStatus ? "FAIL (GPUVM fault)" : "FAIL (output mismatch)")));
+    return pass;
+}
