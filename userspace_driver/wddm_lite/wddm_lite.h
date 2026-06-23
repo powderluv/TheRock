@@ -585,3 +585,23 @@ bool recipeDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
  * ====================================================================== */
 bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
                            const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * recipeMultiWgDispatch() extends recipeKernargDispatch to a MULTI-WORKGROUP
+ * grid (increment 3b). It mirrors python/probe_kernel_mw.py:
+ *   1.-7. identical bring-up to recipeKernargDispatch (bootload -> MEC enable
+ *         -> GFXHUB re-init -> load fill_kernel_raw.co -> compute HQD).
+ *   8. Parse the COV5 hidden-arg offsets from the .co NT_AMDGPU_METADATA note
+ *      and fill them in the kernarg buffer: hidden_block_count_x = GRID (the
+ *      number of WORKGROUPS), hidden_group_size_x = BLOCK (threads/wg = 64),
+ *      remainder = 0, grid_dims = 1, plus the explicit args (out VA, fill).
+ *   9. DISPATCH_DIRECT(GRID,1,1) with COMPUTE_NUM_THREAD_X = BLOCK, so the
+ *      kernel sees tid = local_id + group_id*get_local_size(0) and every
+ *      workgroup writes a distinct slice of the output.
+ *  10. The output buffer is GRID*BLOCK*4 bytes spanning MULTIPLE 4KB pages;
+ *      buildComputeGpuvmMulti maps EVERY output page (one shared PTB).
+ *      PASS iff the fence signals AND fault status == 0 AND all GRID*BLOCK
+ *      output dwords == the fill value.
+ * ====================================================================== */
+bool recipeMultiWgDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase);

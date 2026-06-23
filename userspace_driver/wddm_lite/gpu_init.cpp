@@ -3718,3 +3718,743 @@ bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
               : (faultStatus ? "FAIL (GPUVM fault)" : "FAIL (output mismatch)")));
     return pass;
 }
+
+/* ======================================================================
+ * Multi-workgroup compute dispatch (increment 3b) -- COV5 hidden args
+ *
+ * recipeKernargDispatch dispatched fill_kernel over a SINGLE workgroup, where
+ * group_id is always 0 so get_local_size()/get_num_groups() never matter. For
+ * a grid > 1 the kernel computes tid = local_id + group_id*get_local_size(0),
+ * and get_local_size(0) reads hidden_group_size_x from the COV5 implicit-args
+ * block that the compiler places in the kernarg segment. So the dispatch must
+ * fill those hidden args (block_count / group_size / remainder / grid_dims) at
+ * the metadata-declared offsets, or every workgroup past 0 writes garbage.
+ *
+ * Mirrors python/probe_kernel_mw.py (the PASSED multi-WG probe) byte-for-byte:
+ *   - explicit args:  kernarg[0:8]  = output VA (u64)
+ *                     kernarg[8:12] = fill value (u32 0xDEADBEEF)
+ *   - hidden args (offsets confirmed against fill_kernel_raw.co's
+ *     NT_AMDGPU_METADATA note; see rcpFindHiddenArgs, which parses the note so
+ *     the offsets are not hardcoded):
+ *       off 16 u32 hidden_block_count_x  = GRID   (# WORKGROUPS, not threads)
+ *       off 20 u32 hidden_block_count_y  = 1
+ *       off 24 u32 hidden_block_count_z  = 1
+ *       off 28 u16 hidden_group_size_x   = BLOCK  (64) <- the one that was missing
+ *       off 30 u16 hidden_group_size_y   = 1
+ *       off 32 u16 hidden_group_size_z   = 1
+ *       off 34 u16 hidden_remainder_x    = 0  (uniform_work_group_size=1)
+ *       off 80 u16 hidden_grid_dims      = 1
+ *   - DISPATCH_DIRECT(GRID,1,1): DIM_X is the number of WORKGROUPS.
+ *   - COMPUTE_NUM_THREAD_X = BLOCK (64): threads PER workgroup, programmed in
+ *     COMPUTE_START_X+3 (the startBlock[] num_thread fields), NOT in DIM_X.
+ *   => out[0 .. GRID*BLOCK - 1] all == fill.
+ *
+ * The probe validated the mechanism with GRID=4 (256 dwords = 1 page). This
+ * C++ path generalizes to any grid; the "mwg" test uses GRID=64 so the output
+ * (4096 dwords = 16384 bytes = 4 pages) genuinely spans MULTIPLE 4KB pages and
+ * exercises the per-page GPUVM mapping in buildComputeGpuvmMulti.
+ * ====================================================================== */
+
+#define MWG_FILL_VAL    0xDEADBEEFu
+#define MWG_BLOCK_X     64u            /* threads per workgroup (proven) */
+#define MWG_GRID_X      64u            /* workgroups: 64*64=4096 dw = 4 pages */
+
+/* One COV5 hidden arg located in the kernarg segment: its byte offset + size. */
+struct RcpHiddenArg {
+    uint32_t offset;
+    uint32_t size;
+    bool     found;
+};
+
+/* The hidden args the multi-WG dispatch must populate (parsed from metadata). */
+struct RcpHiddenArgs {
+    RcpHiddenArg blockCountX, blockCountY, blockCountZ;
+    RcpHiddenArg groupSizeX, groupSizeY, groupSizeZ;
+    RcpHiddenArg remainderX, remainderY, remainderZ;
+    RcpHiddenArg gridDims;
+};
+
+/* ---- Minimal msgpack reader for the NT_AMDGPU_METADATA note --------------- */
+
+/* The AMDGPU metadata note is msgpack (big-endian length/value fields). We walk
+ * maps/arrays/strings/ints to reach amdhsa.kernels[].args[] and read each arg's
+ * .offset / .size / .value_kind. This is the C++ port of the subset of
+ * kernel/metadata.py:_decode that fill_kernel's metadata exercises. */
+struct RcpMsgpack {
+    const uint8_t *p;
+    size_t         n;
+    size_t         i;
+    bool           err;
+};
+
+static uint16_t rcpMpBE16(const uint8_t *d) {
+    return (uint16_t)(((uint16_t)d[0] << 8) | d[1]);
+}
+static uint32_t rcpMpBE32(const uint8_t *d) {
+    return ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
+           ((uint32_t)d[2] << 8) | d[3];
+}
+static uint64_t rcpMpBE64(const uint8_t *d) {
+    return ((uint64_t)rcpMpBE32(d) << 32) | rcpMpBE32(d + 4);
+}
+
+enum RcpMpKind { MP_NIL, MP_BOOL, MP_INT, MP_STR, MP_ARRAY, MP_MAP, MP_OTHER };
+
+/* A decoded msgpack value header. For ARRAY/MAP only the count is read here; the
+ * caller decodes that many elements/pairs next. For STR the byte span is
+ * recorded and the cursor is advanced past it. Scalars are fully consumed. */
+struct RcpMpVal {
+    RcpMpKind kind;
+    uint64_t  uval;        /* MP_INT (and MP_BOOL: 0/1) */
+    size_t    strOff;      /* MP_STR: byte offset into the note */
+    size_t    strLen;
+    uint32_t  count;       /* MP_ARRAY (#elements) / MP_MAP (#pairs) */
+};
+
+static bool rcpMpNeed(RcpMsgpack &m, size_t k) {
+    if (m.err || m.i + k > m.n) { m.err = true; return false; }
+    return true;
+}
+
+static RcpMpVal rcpMpHead(RcpMsgpack &m) {
+    RcpMpVal v;
+    v.kind = MP_OTHER; v.uval = 0; v.strOff = 0; v.strLen = 0; v.count = 0;
+    if (!rcpMpNeed(m, 1)) return v;
+    uint8_t b = m.p[m.i++];
+    if (b < 0x80) { v.kind = MP_INT; v.uval = b; return v; }            /* + fixint */
+    if (b >= 0xE0) { v.kind = MP_INT; v.uval = (uint64_t)(int64_t)(int8_t)b; return v; }
+    if (b >= 0x80 && b <= 0x8F) { v.kind = MP_MAP; v.count = (uint32_t)(b & 0x0F); return v; }
+    if (b >= 0x90 && b <= 0x9F) { v.kind = MP_ARRAY; v.count = (uint32_t)(b & 0x0F); return v; }
+    if (b >= 0xA0 && b <= 0xBF) {                                       /* fixstr */
+        uint32_t len = (uint32_t)(b & 0x1F);
+        if (!rcpMpNeed(m, len)) return v;
+        v.kind = MP_STR; v.strOff = m.i; v.strLen = len; m.i += len;
+        return v;
+    }
+    switch (b) {
+    case 0xC0:
+        v.kind = MP_NIL;
+        return v;
+    case 0xC2:
+        v.kind = MP_BOOL; v.uval = 0;
+        return v;
+    case 0xC3:
+        v.kind = MP_BOOL; v.uval = 1;
+        return v;
+    case 0xCC:
+        if (!rcpMpNeed(m, 1)) return v;
+        v.kind = MP_INT; v.uval = m.p[m.i]; m.i += 1;
+        return v;
+    case 0xCD:
+        if (!rcpMpNeed(m, 2)) return v;
+        v.kind = MP_INT; v.uval = rcpMpBE16(m.p + m.i); m.i += 2;
+        return v;
+    case 0xCE:
+        if (!rcpMpNeed(m, 4)) return v;
+        v.kind = MP_INT; v.uval = rcpMpBE32(m.p + m.i); m.i += 4;
+        return v;
+    case 0xCF:
+        if (!rcpMpNeed(m, 8)) return v;
+        v.kind = MP_INT; v.uval = rcpMpBE64(m.p + m.i); m.i += 8;
+        return v;
+    case 0xD0:
+        if (!rcpMpNeed(m, 1)) return v;
+        v.kind = MP_INT; v.uval = (uint64_t)(int64_t)(int8_t)m.p[m.i]; m.i += 1;
+        return v;
+    case 0xD1:
+        if (!rcpMpNeed(m, 2)) return v;
+        v.kind = MP_INT; v.uval = (uint64_t)(int64_t)(int16_t)rcpMpBE16(m.p + m.i); m.i += 2;
+        return v;
+    case 0xD2:
+        if (!rcpMpNeed(m, 4)) return v;
+        v.kind = MP_INT; v.uval = (uint64_t)(int64_t)(int32_t)rcpMpBE32(m.p + m.i); m.i += 4;
+        return v;
+    case 0xD3:
+        if (!rcpMpNeed(m, 8)) return v;
+        v.kind = MP_INT; v.uval = rcpMpBE64(m.p + m.i); m.i += 8;
+        return v;
+    case 0xD9: {                                                        /* str8 */
+        if (!rcpMpNeed(m, 1)) return v;
+        uint32_t len = m.p[m.i]; m.i += 1;
+        if (!rcpMpNeed(m, len)) return v;
+        v.kind = MP_STR; v.strOff = m.i; v.strLen = len; m.i += len;
+        return v;
+    }
+    case 0xDA: {                                                        /* str16 */
+        if (!rcpMpNeed(m, 2)) return v;
+        uint32_t len = rcpMpBE16(m.p + m.i); m.i += 2;
+        if (!rcpMpNeed(m, len)) return v;
+        v.kind = MP_STR; v.strOff = m.i; v.strLen = len; m.i += len;
+        return v;
+    }
+    case 0xDB: {                                                        /* str32 */
+        if (!rcpMpNeed(m, 4)) return v;
+        uint32_t len = rcpMpBE32(m.p + m.i); m.i += 4;
+        if (!rcpMpNeed(m, len)) return v;
+        v.kind = MP_STR; v.strOff = m.i; v.strLen = len; m.i += len;
+        return v;
+    }
+    case 0xDC:
+        if (!rcpMpNeed(m, 2)) return v;
+        v.kind = MP_ARRAY; v.count = rcpMpBE16(m.p + m.i); m.i += 2;
+        return v;
+    case 0xDD:
+        if (!rcpMpNeed(m, 4)) return v;
+        v.kind = MP_ARRAY; v.count = rcpMpBE32(m.p + m.i); m.i += 4;
+        return v;
+    case 0xDE:
+        if (!rcpMpNeed(m, 2)) return v;
+        v.kind = MP_MAP; v.count = rcpMpBE16(m.p + m.i); m.i += 2;
+        return v;
+    case 0xDF:
+        if (!rcpMpNeed(m, 4)) return v;
+        v.kind = MP_MAP; v.count = rcpMpBE32(m.p + m.i); m.i += 4;
+        return v;
+    default:
+        m.err = true;                  /* unsupported byte (e.g. float/bin) */
+        return v;
+    }
+}
+
+/* Given an already-decoded header v, consume its children (no-op for scalars
+ * and strings; recurse for arrays/maps). */
+static void rcpMpSkipChildren(RcpMsgpack &m, const RcpMpVal &v);
+
+/* Decode the value at the cursor and fully consume it (header + children). */
+static void rcpMpSkipValue(RcpMsgpack &m) {
+    RcpMpVal v = rcpMpHead(m);
+    rcpMpSkipChildren(m, v);
+}
+
+static void rcpMpSkipChildren(RcpMsgpack &m, const RcpMpVal &v) {
+    if (m.err) return;
+    if (v.kind == MP_ARRAY) {
+        for (uint32_t k = 0; k < v.count && !m.err; k++) rcpMpSkipValue(m);
+    } else if (v.kind == MP_MAP) {
+        for (uint32_t k = 0; k < v.count && !m.err; k++) { rcpMpSkipValue(m); rcpMpSkipValue(m); }
+    }
+}
+
+/* True if the string value v equals the C string s. */
+static bool rcpMpStrEq(const RcpMsgpack &m, const RcpMpVal &v, const char *s) {
+    if (v.kind != MP_STR) return false;
+    size_t sl = strlen(s);
+    if (v.strLen != sl) return false;
+    return memcmp(m.p + v.strOff, s, sl) == 0;
+}
+
+/* Map a value_kind string -> the RcpHiddenArg field to populate; nullptr for
+ * explicit/uninteresting kinds. */
+static RcpHiddenArg *rcpHiddenSlot(RcpHiddenArgs &h, const RcpMsgpack &m,
+                                   const RcpMpVal &kindStr) {
+    if (rcpMpStrEq(m, kindStr, "hidden_block_count_x")) return &h.blockCountX;
+    if (rcpMpStrEq(m, kindStr, "hidden_block_count_y")) return &h.blockCountY;
+    if (rcpMpStrEq(m, kindStr, "hidden_block_count_z")) return &h.blockCountZ;
+    if (rcpMpStrEq(m, kindStr, "hidden_group_size_x")) return &h.groupSizeX;
+    if (rcpMpStrEq(m, kindStr, "hidden_group_size_y")) return &h.groupSizeY;
+    if (rcpMpStrEq(m, kindStr, "hidden_group_size_z")) return &h.groupSizeZ;
+    if (rcpMpStrEq(m, kindStr, "hidden_remainder_x")) return &h.remainderX;
+    if (rcpMpStrEq(m, kindStr, "hidden_remainder_y")) return &h.remainderY;
+    if (rcpMpStrEq(m, kindStr, "hidden_remainder_z")) return &h.remainderZ;
+    if (rcpMpStrEq(m, kindStr, "hidden_grid_dims")) return &h.gridDims;
+    return nullptr;
+}
+
+/* Decode one arg map ({.offset, .size, .value_kind, ...}); if it is a hidden
+ * arg we track, record its offset/size. The cursor is left just past the map. */
+static void rcpMpDecodeArg(RcpMsgpack &m, RcpHiddenArgs &h) {
+    RcpMpVal arg = rcpMpHead(m);
+    if (m.err) return;
+    if (arg.kind != MP_MAP) { rcpMpSkipChildren(m, arg); return; }
+    uint64_t off = 0, sz = 0;
+    bool haveOff = false, haveSz = false, haveKind = false;
+    RcpMpVal kindVal; kindVal.kind = MP_OTHER; kindVal.strLen = 0; kindVal.strOff = 0; kindVal.uval = 0; kindVal.count = 0;
+    for (uint32_t k = 0; k < arg.count && !m.err; k++) {
+        RcpMpVal key = rcpMpHead(m);
+        if (m.err) return;
+        RcpMpVal val = rcpMpHead(m);
+        if (m.err) return;
+        if (rcpMpStrEq(m, key, ".offset") && val.kind == MP_INT) {
+            off = val.uval; haveOff = true;
+        } else if (rcpMpStrEq(m, key, ".size") && val.kind == MP_INT) {
+            sz = val.uval; haveSz = true;
+        } else if (rcpMpStrEq(m, key, ".value_kind") && val.kind == MP_STR) {
+            kindVal = val; haveKind = true;
+        } else {
+            rcpMpSkipChildren(m, val);   /* arrays/maps need their children eaten */
+        }
+    }
+    if (haveOff && haveSz && haveKind) {
+        RcpHiddenArg *slot = rcpHiddenSlot(h, m, kindVal);
+        if (slot) { slot->offset = (uint32_t)off; slot->size = (uint32_t)sz; slot->found = true; }
+    }
+}
+
+/* Walk a kernel map looking for ".args"; decode each arg into h. */
+static void rcpMpDecodeKernel(RcpMsgpack &m, RcpHiddenArgs &h) {
+    RcpMpVal kmap = rcpMpHead(m);
+    if (m.err) return;
+    if (kmap.kind != MP_MAP) { rcpMpSkipChildren(m, kmap); return; }
+    for (uint32_t k = 0; k < kmap.count && !m.err; k++) {
+        RcpMpVal key = rcpMpHead(m);
+        if (m.err) return;
+        if (rcpMpStrEq(m, key, ".args")) {
+            RcpMpVal args = rcpMpHead(m);
+            if (m.err) return;
+            if (args.kind == MP_ARRAY) {
+                for (uint32_t a = 0; a < args.count && !m.err; a++)
+                    rcpMpDecodeArg(m, h);
+            } else {
+                rcpMpSkipChildren(m, args);
+            }
+        } else {
+            rcpMpSkipValue(m);   /* the value for this key */
+        }
+    }
+}
+
+/* Walk the top-level metadata map looking for "amdhsa.kernels" (an array of
+ * kernel maps); decode the first kernel's args into h. */
+static void rcpMpDecodeRoot(RcpMsgpack &m, RcpHiddenArgs &h) {
+    RcpMpVal root = rcpMpHead(m);
+    if (m.err) return;
+    if (root.kind != MP_MAP) { rcpMpSkipChildren(m, root); return; }
+    for (uint32_t k = 0; k < root.count && !m.err; k++) {
+        RcpMpVal key = rcpMpHead(m);
+        if (m.err) return;
+        if (rcpMpStrEq(m, key, "amdhsa.kernels")) {
+            RcpMpVal arr = rcpMpHead(m);
+            if (m.err) return;
+            if (arr.kind == MP_ARRAY && arr.count >= 1) {
+                rcpMpDecodeKernel(m, h);          /* first kernel only */
+                /* (don't bother decoding the rest; one kernel in this .co) */
+            } else {
+                rcpMpSkipChildren(m, arr);
+            }
+            return;
+        }
+        rcpMpSkipValue(m);   /* the value for this key */
+    }
+}
+
+/* Find the NT_AMDGPU_METADATA (type 32) note in any SHT_NOTE (7) section and
+ * decode the hidden-arg offsets/sizes into h. Returns true iff all ten hidden
+ * args we populate were located. Mirrors kernel/metadata.py: parse the note
+ * header (namesz/descsz/ntype, 4-byte aligned name+desc), then msgpack-decode
+ * the descriptor for amdhsa.kernels[0].args[]. */
+static bool rcpFindHiddenArgs(const std::vector<uint8_t> &co, const RcpElf &elf,
+                              RcpHiddenArgs &h) {
+    memset(&h, 0, sizeof(h));
+    const uint32_t SHT_NOTE = 7;
+    const uint32_t NT_AMDGPU_METADATA = 32;
+    for (const auto &s : elf.sections) {
+        if (s.sh_type != SHT_NOTE) continue;
+        size_t base = (size_t)s.sh_offset;
+        size_t end = base + (size_t)s.sh_size;
+        if (end > co.size()) continue;
+        size_t j = base;
+        while (j + 12 <= end) {
+            uint32_t namesz = rcpElfU32(co, j + 0);
+            uint32_t descsz = rcpElfU32(co, j + 4);
+            uint32_t ntype = rcpElfU32(co, j + 8);
+            j += 12;
+            size_t nameAdv = (namesz + 3u) & ~3u;
+            size_t descAdv = (descsz + 3u) & ~3u;
+            if (j + nameAdv + descAdv > end) break;
+            size_t nameOff = j;
+            size_t descOff = j + nameAdv;
+            bool isAmd = (namesz >= 6) && memcmp(&co[nameOff], "AMDGPU", 6) == 0;
+            if (ntype == NT_AMDGPU_METADATA && isAmd) {
+                RcpMsgpack m;
+                m.p = &co[descOff];
+                m.n = descsz;
+                m.i = 0;
+                m.err = false;
+                rcpMpDecodeRoot(m, h);
+                bool all = h.blockCountX.found && h.blockCountY.found &&
+                           h.blockCountZ.found && h.groupSizeX.found &&
+                           h.groupSizeY.found && h.groupSizeZ.found &&
+                           h.remainderX.found && h.remainderY.found &&
+                           h.remainderZ.found && h.gridDims.found;
+                return all && !m.err;
+            }
+            j += nameAdv + descAdv;
+        }
+    }
+    return false;
+}
+
+/* Write `value` little-endian, `size` bytes, at kernarg byte offset `off`. */
+static void rcpKbStore(uint8_t *kb, uint32_t off, uint64_t value, uint32_t size) {
+    for (uint32_t b = 0; b < size; b++)
+        kb[off + b] = (uint8_t)((value >> (b * 8)) & 0xFF);
+}
+
+/* Fill one hidden arg in the kernarg buffer at its metadata offset/size, with
+ * the width the metadata declares (u32 block_count, u16 group_size/remainder/
+ * grid_dims). The value is masked to the declared width. */
+static void rcpFillHidden(uint8_t *kb, const RcpHiddenArg &a, uint64_t value) {
+    if (!a.found || a.size == 0 || a.size > 8) return;
+    uint64_t mask = (a.size >= 8) ? ~0ull : ((1ull << (a.size * 8)) - 1);
+    rcpKbStore(kb, a.offset, value & mask, a.size);
+}
+
+bool recipeMultiWgDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase)
+{
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  MWG: recipeBootload did not reach BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    printf("\n=== recipeMultiWgDispatch (real kernel, multi-workgroup) ===\n");
+
+    const uint32_t grid = MWG_GRID_X;
+    const uint32_t block = MWG_BLOCK_X;
+    const uint32_t outN = grid * block;                 /* total output dwords */
+    const uint64_t outBytes = (uint64_t)outN * 4;
+    const uint32_t outPages = (uint32_t)((outBytes + 0xFFF) / 0x1000);
+    printf("  MWG: grid=%u (workgroups) block=%u (threads/wg) N=%u dwords "
+           "out=%llu bytes (%u pages)\n",
+           grid, block, outN, (unsigned long long)outBytes, outPages);
+
+    /* Load + parse the compiled kernel from fwDir. */
+    std::vector<uint8_t> co;
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s\\%s", fwDir, KERN_CO_FILE);
+        if (!loadFirmwareFile(path, co)) {
+            printf("  MWG: ERROR cannot read kernel %s\n", path);
+            return false;
+        }
+    }
+    RcpElf elf;
+    if (!rcpElfParse(co, elf)) {
+        printf("  MWG: ERROR failed to parse %s as AMDGPU ELF\n", KERN_CO_FILE);
+        return false;
+    }
+
+    /* Kernel entry + descriptor symbols (same lookup as recipeKernargDispatch). */
+    const RcpElfSymbol *kSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        uint8_t type = s.st_info & 0xF;
+        uint8_t bind = s.st_info >> 4;
+        if (type == RCP_ELF_STT_AMDGPU_HSA_KERNEL ||
+            (type == RCP_ELF_STT_FUNC && bind == RCP_ELF_STB_GLOBAL)) {
+            kSym = &s;
+            break;
+        }
+    }
+    if (!kSym) { printf("  MWG: ERROR no kernel symbol\n"); return false; }
+    char kdName[128];
+    snprintf(kdName, sizeof(kdName), "%s.kd", kSym->name);
+    const RcpElfSymbol *kdSym = nullptr;
+    for (const auto &s : elf.symbols)
+        if (strcmp(s.name, kdName) == 0) { kdSym = &s; break; }
+    if (!kdSym) { printf("  MWG: ERROR no kernel descriptor %s\n", kdName); return false; }
+    const RcpElfSection *kdSec = nullptr;
+    for (const auto &s : elf.sections)
+        if (s.sh_size && s.sh_addr <= kdSym->st_value &&
+            kdSym->st_value < s.sh_addr + s.sh_size) { kdSec = &s; break; }
+    if (!kdSec) { printf("  MWG: ERROR kernel descriptor section not found\n"); return false; }
+    RcpKernelDescriptor kd;
+    size_t kdOff = (size_t)kdSec->sh_offset + (size_t)(kdSym->st_value - kdSec->sh_addr);
+    if (!rcpKdFromBytes(co, kdOff, kd)) {
+        printf("  MWG: ERROR short kernel descriptor\n");
+        return false;
+    }
+
+    /* Parse the COV5 hidden-arg offsets from the .co metadata note (NOT
+     * hardcoded; we cross-checked these against probe_kernel_mw.py). */
+    RcpHiddenArgs ha;
+    if (!rcpFindHiddenArgs(co, elf, ha)) {
+        printf("  MWG: ERROR could not parse all COV5 hidden args from metadata\n");
+        return false;
+    }
+    printf("  MWG: kernel='%s' RSRC1=0x%08X RSRC2=0x%08X RSRC3=0x%08X "
+           "kernarg=%u props=0x%X\n",
+           kSym->name, kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2,
+           kd.compute_pgm_rsrc3, kd.kernarg_size, kd.kernel_code_properties);
+    printf("  MWG: hidden offsets block_count_x=%u(u%u) group_size_x=%u(u%u) "
+           "remainder_x=%u(u%u) grid_dims=%u(u%u)\n",
+           ha.blockCountX.offset, ha.blockCountX.size * 8,
+           ha.groupSizeX.offset, ha.groupSizeX.size * 8,
+           ha.remainderX.offset, ha.remainderX.size * 8,
+           ha.gridDims.offset, ha.gridDims.size * 8);
+
+    /* Assemble the loadable image by SECTION VADDR. */
+    uint64_t imgHi = 0;
+    for (const auto &s : elf.sections)
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr) {
+            uint64_t hi = s.sh_addr + s.sh_size;
+            if (hi > imgHi) imgHi = hi;
+        }
+    if (imgHi == 0) { printf("  MWG: ERROR no allocatable sections\n"); return false; }
+    uint64_t imgBytes = (imgHi + 0xFFF) & ~0xFFFull;
+    uint32_t codePages = (uint32_t)(imgBytes / 0x1000);
+    std::vector<uint8_t> image((size_t)imgBytes, 0);
+    for (const auto &s : elf.sections)
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr &&
+            s.sh_type != RCP_ELF_SHT_NOBITS) {
+            if ((size_t)(s.sh_offset + s.sh_size) > co.size()) continue;
+            memcpy(&image[(size_t)s.sh_addr], &co[(size_t)s.sh_offset],
+                   (size_t)s.sh_size);
+        }
+
+    /* --- bring up the GFX/MEC and GFXHUB (same as recipeKernargDispatch) --- */
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+
+    cq.hasNbif = cqResolveNbif(ipd, &cq.nbifBase2);
+    if (cq.hasNbif) {
+        uint32_t apEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+        gpu.writeReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                       apEn | BIF_DOORBELL_APER_EN__BIT);
+        uint32_t fbEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+        gpu.writeReg32((cq.nbifBase2 + regBIF_FB_EN) * 4,
+                       fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+        printf("  NBIO: doorbell aperture + framebuffer enabled "
+               "(NBIF base[2]=0x%04X)\n", cq.nbifBase2);
+    } else {
+        printf("  NBIO: WARNING NBIF base[2] not found; HDP flush + doorbell "
+               "aperture skipped\n");
+    }
+
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+    if (haveUcode)
+        printf("  GFX: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+               (unsigned long long)pfp, (unsigned long long)me,
+               (unsigned long long)mec);
+
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode))
+        return false;
+
+    void *gartCpu = nullptr, *dummyCpu = nullptr;
+    uint64_t gartBus = 0, dummyBus = 0;
+    void *gartHandle = nullptr, *dummyHandle = nullptr;
+    if (!gpu.allocDma(1 << 20, &gartCpu, &gartBus, &gartHandle)) {
+        printf("  MWG: ERROR GART table DMA alloc failed\n");
+        return false;
+    }
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  MWG: ERROR dummy page DMA alloc failed\n");
+        return false;
+    }
+    memset(gartCpu, 0, 1 << 20);
+    memset(dummyCpu, 0, 4096);
+
+    GfxhubParams gp;
+    memset(&gp, 0, sizeof(gp));
+    uint32_t fbBase = 0, fbTop = 0;
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_BASE, &fbBase);
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_TOP, &fbTop);
+    gp.vramStart = (uint64_t)fbBase << 24;
+    gp.vramEnd = ((uint64_t)fbTop << 24) | 0xFFFFFF;
+    gp.gartStart = gp.vramEnd + 1;
+    gp.gartEnd = gp.gartStart + (512ull * 1024 * 1024) - 1;
+    gp.agpStart = gp.gartEnd + 1;
+    gp.agpEnd = gp.agpStart;
+    gp.gartTableBus = gartBus;
+    gp.dummyPageBus = dummyBus;
+    gfxhubGartEnable(gpu, cq, gp);
+
+    /* --- stage code + kernarg + (multi-page) output in VRAM ---------------- */
+    void *codeCpu = nullptr;
+    uint64_t codeGpu = 0, codeHandle = 0;
+    if (!rcpAllocVram(gpu, imgBytes, &codeCpu, &codeGpu, &codeHandle)) {
+        printf("  MWG: ERROR code VRAM alloc failed\n");
+        return false;
+    }
+    memcpy(codeCpu, image.data(), (size_t)imgBytes);
+
+    void *kaCpu = nullptr;
+    uint64_t kaGpu = 0, kaHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &kaCpu, &kaGpu, &kaHandle)) {
+        printf("  MWG: ERROR kernarg VRAM alloc failed\n");
+        return false;
+    }
+
+    /* Output buffer sized N*4 bytes, rounded to whole pages. rcpAllocVram
+     * rounds the size up to a page and zeroes every page; the returned MC
+     * address is contiguous so out page p lives at outGpu + p*4096. */
+    uint64_t outAllocBytes = (uint64_t)outPages * 0x1000;
+    void *outCpu = nullptr;
+    uint64_t outGpu = 0, outHandle = 0;
+    if (!rcpAllocVram(gpu, outAllocBytes, &outCpu, &outGpu, &outHandle)) {
+        printf("  MWG: ERROR output VRAM alloc failed\n");
+        return false;
+    }
+
+    /* VA map: code at COMPUTE_VA_ROOT (codePages pages), then kernarg, then the
+     * outPages output pages -- all in one 2MB block / one PTB. */
+    uint64_t codeVa = COMPUTE_VA_ROOT;
+    uint64_t kaVa = COMPUTE_VA_ROOT + (uint64_t)codePages * 0x1000;
+    uint64_t outVa = COMPUTE_VA_ROOT + (uint64_t)(codePages + 1) * 0x1000;
+    uint64_t codeEntryVa = codeVa +
+        ((uint64_t)kdSym->st_value + (uint64_t)kd.kernel_code_entry_byte_offset);
+
+    /* Fill the kernarg: explicit args + the COV5 hidden args at their metadata
+     * offsets. block_count = GRID (workgroups), group_size = BLOCK (threads). */
+    {
+        uint8_t *kb = (uint8_t *)kaCpu;
+        rcpKbStore(kb, 0, outVa, 8);              /* [0:8] output VA  (u64) */
+        rcpKbStore(kb, 8, MWG_FILL_VAL, 4);       /* [8:12] fill val (u32) */
+        /* 1-D dispatch (only x varies), so grid_dims = 1 (matches the probe). */
+        uint32_t dims = 1u;
+        rcpFillHidden(kb, ha.blockCountX, grid);  /* u32 # workgroups */
+        rcpFillHidden(kb, ha.blockCountY, 1);
+        rcpFillHidden(kb, ha.blockCountZ, 1);
+        rcpFillHidden(kb, ha.groupSizeX, block);  /* u16 threads/wg = 64 */
+        rcpFillHidden(kb, ha.groupSizeY, 1);
+        rcpFillHidden(kb, ha.groupSizeZ, 1);
+        rcpFillHidden(kb, ha.remainderX, 0);      /* uniform_work_group_size=1 */
+        rcpFillHidden(kb, ha.remainderY, 0);
+        rcpFillHidden(kb, ha.remainderZ, 0);
+        rcpFillHidden(kb, ha.gridDims, dims);     /* u16 grid dims = 1 */
+    }
+
+    /* Build the multi-region page table: every code page + kernarg + EVERY
+     * output page. Without mapping all output pages, workgroups whose global
+     * id lands past the first 4KB would GPUVM-fault. */
+    std::vector<GpuvmRegion> regions;
+    regions.reserve(codePages + 1 + outPages);
+    for (uint32_t p = 0; p < codePages; p++)
+        regions.push_back({ codeVa + (uint64_t)p * 0x1000,
+                            codeGpu + (uint64_t)p * 0x1000 });
+    regions.push_back({ kaVa, kaGpu });
+    for (uint32_t p = 0; p < outPages; p++)
+        regions.push_back({ outVa + (uint64_t)p * 0x1000,
+                            outGpu + (uint64_t)p * 0x1000 });
+
+    DispatchGpuvm pt;
+    memset(&pt, 0, sizeof(pt));
+    if (!buildComputeGpuvmMulti(gpu, cq, vramMcBase, regions.data(),
+                                (uint32_t)regions.size(), pt))
+        return false;
+    printf("  MWG: mapped %u code + 1 kernarg + %u output pages "
+           "(out VA 0x%llX..0x%llX)\n",
+           codePages, outPages, (unsigned long long)outVa,
+           (unsigned long long)(outVa + outBytes - 1));
+
+    if (!cqInitComputeQueue(gpu, cq))
+        return false;
+
+    uint32_t c0 = gcReg(gpu, cq, regGCVM_CONTEXT0_CNTL, 0);
+    printf("  GPUVM: GCVM_CONTEXT0_CNTL readback=0x%08X (enable=%u)\n",
+           c0, c0 & 1u);
+
+    /* kernarg_sgpr_index (same derivation as recipeKernargDispatch). */
+    uint32_t slot = 0;
+    if (kd.kernel_code_properties & (1u << 0)) slot += 4;
+    if (kd.kernel_code_properties & (1u << 1)) slot += 2;
+    if (kd.kernel_code_properties & (1u << 2)) slot += 2;
+
+    printf("  MWG: code_entry=0x%llX ka_va=0x%llX out_va=0x%llX "
+           "code_pages=%u sgpr_slot=%u\n",
+           (unsigned long long)codeEntryVa, (unsigned long long)kaVa,
+           (unsigned long long)outVa, codePages, slot);
+
+    gpu.writeReg32((cq.gcBase0 + regGCVM_L2_PROTECTION_FAULT_STATUS) * 4, 0);
+    gpu.writeReg32((cq.gcBase0 + (regGCVM_L2_PROTECTION_FAULT_STATUS + 1)) * 4, 0);
+
+    uint64_t pgm = codeEntryVa >> 8;
+    uint64_t fenceSeq = 1;
+    *cq.fenceCpu = 0;
+
+    std::vector<uint32_t> packets;
+    pm4AcquireMem(packets);
+
+    uint32_t pgmLoHi[2] = { (uint32_t)(pgm & 0xFFFFFFFF),
+                            (uint32_t)((pgm >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_PGM_LO, pgmLoHi, 2);
+
+    uint32_t rsrc12[2] = { kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2 };
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC1, rsrc12, 2);
+
+    uint32_t rsrc3 = kd.compute_pgm_rsrc3;
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC3, &rsrc3, 1);
+
+    uint32_t tmpring = 0;
+    pm4SetShReg(packets, regCOMPUTE_TMPRING_SIZE, &tmpring, 1);
+
+    uint32_t restart[3] = { 0, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_RESTART_X, restart, 3);
+
+    uint32_t userData[2] = { (uint32_t)(kaVa & 0xFFFFFFFF),
+                             (uint32_t)((kaVa >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_USER_DATA_0 + slot, userData, 2);
+
+    uint32_t resLimits = 0;
+    pm4SetShReg(packets, regCOMPUTE_RESOURCE_LIMITS, &resLimits, 1);
+
+    /* COMPUTE_START_X..: start xyz=0, NUM_THREAD xyz=(BLOCK,1,1), 2 trailing 0.
+     * NUM_THREAD_X is threads PER WORKGROUP -- it is NOT the dispatch DIM_X. */
+    uint32_t startBlock[8] = { 0, 0, 0, block, 1, 1, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_START_X, startBlock, 8);
+
+    /* DISPATCH_DIRECT DIM_X = GRID = number of WORKGROUPS (not threads). */
+    pm4DispatchDirect(packets, grid, 1, 1, DISPATCH_INITIATOR_W32);
+    pm4EventWrite(packets, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+    pm4ReleaseMemFence(packets, cq.fenceGpu, fenceSeq);
+
+    cqSubmitPackets(gpu, cq, packets);
+
+    bool ok = cqWaitFence(cq, fenceSeq, 5000);
+    cqHdpFlush(gpu, cq);
+
+    uint32_t faultStatus = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_STATUS, 0);
+    uint32_t faultAddrLo = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, 0);
+    uint32_t faultAddrHi = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, 0);
+    uint64_t faultVa = (((uint64_t)faultAddrHi << 32) | faultAddrLo) << 12;
+
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    uint32_t rptr = gcReg(gpu, cq, regCP_HQD_PQ_RPTR, 0);
+    cqGrbmDeselect(gpu, cq);
+    uint64_t fenceVal = *cq.fenceCpu;
+
+    /* Verify ALL N output dwords across every page. */
+    const volatile uint32_t *res = (const volatile uint32_t *)outCpu;
+    uint32_t nbad = 0, firstBad = 0, firstBadVal = 0;
+    for (uint32_t i = 0; i < outN; i++) {
+        uint32_t v = res[i];
+        if (v != MWG_FILL_VAL) {
+            if (nbad == 0) { firstBad = i; firstBadVal = v; }
+            nbad++;
+        }
+    }
+
+    uint32_t walker = (faultStatus >> 1) & 0x7;
+    uint32_t perm = (faultStatus >> 4) & 0xF;
+
+    printf("\nFAULT_STATUS=0x%08X [walker=%u perm=0x%X] FAULT_VA=0x%llX\n",
+           faultStatus, walker, perm, (unsigned long long)faultVa);
+    printf("FENCE value=%llu (expected %llu) RPTR=0x%X\n",
+           (unsigned long long)fenceVal, (unsigned long long)fenceSeq, rptr);
+    /* Sample a dword from the last page so the log shows cross-page coverage. */
+    uint32_t lastIdx = outN - 1;
+    printf("out[0]=0x%08X out[%u]=0x%08X out[%u]=0x%08X expected=0x%08X "
+           "bad=%u/%u\n",
+           res[0], block, res[block], lastIdx, res[lastIdx],
+           MWG_FILL_VAL, nbad, outN);
+    if (nbad)
+        printf("  first mismatch at index %u (dword page %u): got 0x%08X\n",
+               firstBad, (firstBad * 4) / 0x1000, firstBadVal);
+
+    bool pass = ok && (faultStatus == 0) && (nbad == 0);
+    printf("MULTI-WG DISPATCH %s (grid=%u x block=%u, %u pages)\n",
+           pass ? "PASS (fence signaled, no fault, all output verified)"
+           : (!ok ? "FAIL (fence timeout)"
+              : (faultStatus ? "FAIL (GPUVM fault)" : "FAIL (output mismatch)")),
+           grid, block, outPages);
+    return pass;
+}

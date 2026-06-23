@@ -440,6 +440,41 @@ static void testKernargDispatch(WddmLite &gpu)
 }
 
 /* ======================================================================
+ * Test: multi-workgroup compiled-kernel compute dispatch (increment 3b)
+ *
+ * Runs recipeMultiWgDispatch(): recipeBootload() (-> BOOTLOAD_COMPLETE) THEN
+ * init_gfx_for_compute (MEC enable) + gfxhub_gart_enable + load
+ * fill_kernel_raw.co + a multi-region GPUVM page table (code + kernarg +
+ * EVERY output page, VMID 0) + init_compute_queue (direct-MMIO HQD) +
+ * DISPATCH_DIRECT(GRID,1,1) with COMPUTE_NUM_THREAD_X = 64 and the COV5
+ * hidden args populated from the .co metadata. The output spans multiple 4KB
+ * pages (GRID*64 dwords). Firmware + kernel are read from g_fwDir (Z:\winfw,
+ * override with argv[2]).
+ * PASS iff the EOP fence signals, GCVM fault status == 0, AND all GRID*64
+ * output dwords == 0xDEADBEEF.
+ * ====================================================================== */
+
+static void testMultiWgDispatch(WddmLite &gpu)
+{
+    TEST_BEGIN("Multi-WG dispatch (real kernel, multi-page output verify)");
+    TEST_CHECK(g_ipd.valid, "IP discovery not valid");
+
+    /* recipeBootload (invoked inside recipeMultiWgDispatch) needs the GMC VRAM
+     * MC base for the SMU driver table. Ensure GMC ran. */
+    if (g_gmc.vramSize == 0) {
+        printf("  Running GMC init first (needed for vram_mc_base)...\n");
+        TEST_CHECK(gmcInit(gpu, g_ipd, g_gmc), "GMC init failed");
+    }
+
+    printf("  Firmware dir: %s\n", g_fwDir);
+    printf("  vram_mc_base: 0x%llX\n", g_gmc.vramStart);
+
+    bool ok = recipeMultiWgDispatch(gpu, g_ipd, g_fwDir, g_gmc.vramStart);
+    TEST_CHECK(ok, "Multi-WG dispatch did not pass (fence/fault/output)");
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Test: PSP Ring Destroy
  * ====================================================================== */
 
@@ -636,12 +671,16 @@ int main(int argc, char *argv[])
      * real compiled kernel, so (like "boot"/"nop"/"disp") it only runs when
      * "kern" is explicitly requested -- not during an unfiltered full sweep. */
     bool runKern = (filter && strstr(filter, "kern") != nullptr);
+    /* The multi-workgroup recipe (increment 3b) is like "kern" but dispatches
+     * a GRID of 64-thread workgroups with COV5 hidden args, so it only runs
+     * when "mwg" is explicitly requested -- not during an unfiltered sweep. */
+    bool runMwg = (filter && strstr(filter, "mwg") != nullptr);
 
     bool needIpd = shouldRun(filter, "ipd") || shouldRun(filter, "gmc") ||
                    shouldRun(filter, "sol") || shouldRun(filter, "psp") ||
                    shouldRun(filter, "smu") || shouldRun(filter, "fw") ||
                    shouldRun(filter, "pspd") || runBoot || runNop || runDisp ||
-                   runKern;
+                   runKern || runMwg;
     if (needIpd && g_info.VendorId == 0) {
         gpu.getInfo(&g_info);
     }
@@ -652,7 +691,13 @@ int main(int argc, char *argv[])
     }
 
     if (g_ipd.valid) {
-        if (runKern) {
+        if (runMwg) {
+            /* Isolated path: bootload recipe THEN MEC + GPUVM (code+kernarg+
+             * multi-page output) + compute HQD + a real compiled kernel
+             * DISPATCH_DIRECT over a multi-workgroup grid with the COV5 hidden
+             * args populated; verifies every output dword across all pages. */
+            testMultiWgDispatch(gpu);
+        } else if (runKern) {
             /* Isolated path: bootload recipe THEN MEC + GPUVM (code+kernarg+
              * output) + compute HQD + a real compiled kernel DISPATCH_DIRECT
              * with output verification (does not create the legacy PSP ring). */
