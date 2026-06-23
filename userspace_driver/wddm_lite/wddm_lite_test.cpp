@@ -475,6 +475,42 @@ static void testMultiWgDispatch(WddmLite &gpu)
 }
 
 /* ======================================================================
+ * Test: register-spilling (scratch) compute dispatch (increment 3c)
+ *
+ * Runs recipeScratchDispatch(): recipeBootload() (-> BOOTLOAD_COMPLETE) THEN
+ * init_gfx_for_compute (MEC enable) + gfxhub_gart_enable + load
+ * scratch_kernel.co (a kernel that SPILLS registers to private memory) + a
+ * multi-region GPUVM page table (code + kernarg + output + EVERY scratch
+ * page, VMID 0) + init_compute_queue (direct-MMIO HQD) + the architected flat
+ * scratch programming (SH_MEM_CONFIG/BASES, COMPUTE_DISPATCH_SCRATCH_BASE,
+ * COMPUTE_TMPRING_SIZE, RSRC2.SCRATCH_EN) + DISPATCH_DIRECT(GRID,1,1) with
+ * COMPUTE_NUM_THREAD_X = 64. Firmware + kernel are read from g_fwDir (Z:\winfw,
+ * override with argv[2]).
+ * PASS iff the EOP fence signals, GCVM fault status == 0 (no GCVM/CP fault),
+ * AND all GRID*64 output dwords == 2080 (the per-thread spilled sum for val=1).
+ * ====================================================================== */
+
+static void testScratchDispatch(WddmLite &gpu)
+{
+    TEST_BEGIN("Scratch dispatch (register-spilling kernel + output verify)");
+    TEST_CHECK(g_ipd.valid, "IP discovery not valid");
+
+    /* recipeBootload (invoked inside recipeScratchDispatch) needs the GMC VRAM
+     * MC base for the SMU driver table. Ensure GMC ran. */
+    if (g_gmc.vramSize == 0) {
+        printf("  Running GMC init first (needed for vram_mc_base)...\n");
+        TEST_CHECK(gmcInit(gpu, g_ipd, g_gmc), "GMC init failed");
+    }
+
+    printf("  Firmware dir: %s\n", g_fwDir);
+    printf("  vram_mc_base: 0x%llX\n", g_gmc.vramStart);
+
+    bool ok = recipeScratchDispatch(gpu, g_ipd, g_fwDir, g_gmc.vramStart);
+    TEST_CHECK(ok, "Scratch dispatch did not pass (fence/fault/output)");
+    TEST_PASS();
+}
+
+/* ======================================================================
  * Test: PSP Ring Destroy
  * ====================================================================== */
 
@@ -675,12 +711,17 @@ int main(int argc, char *argv[])
      * a GRID of 64-thread workgroups with COV5 hidden args, so it only runs
      * when "mwg" is explicitly requested -- not during an unfiltered sweep. */
     bool runMwg = (filter && strstr(filter, "mwg") != nullptr);
+    /* The scratch recipe (increment 3c) is like "mwg" but dispatches a
+     * register-spilling kernel that needs the architected flat scratch path,
+     * so it only runs when "scr" is explicitly requested -- not during an
+     * unfiltered sweep. */
+    bool runScr = (filter && strstr(filter, "scr") != nullptr);
 
     bool needIpd = shouldRun(filter, "ipd") || shouldRun(filter, "gmc") ||
                    shouldRun(filter, "sol") || shouldRun(filter, "psp") ||
                    shouldRun(filter, "smu") || shouldRun(filter, "fw") ||
                    shouldRun(filter, "pspd") || runBoot || runNop || runDisp ||
-                   runKern || runMwg;
+                   runKern || runMwg || runScr;
     if (needIpd && g_info.VendorId == 0) {
         gpu.getInfo(&g_info);
     }
@@ -691,7 +732,14 @@ int main(int argc, char *argv[])
     }
 
     if (g_ipd.valid) {
-        if (runMwg) {
+        if (runScr) {
+            /* Isolated path: bootload recipe THEN MEC + GPUVM (code+kernarg+
+             * output+scratch) + compute HQD + a register-spilling kernel with
+             * the architected flat scratch path programmed (SH_MEM,
+             * DISPATCH_SCRATCH_BASE, TMPRING_SIZE, RSRC2.SCRATCH_EN); verifies
+             * every output dword == the spilled sum. */
+            testScratchDispatch(gpu);
+        } else if (runMwg) {
             /* Isolated path: bootload recipe THEN MEC + GPUVM (code+kernarg+
              * multi-page output) + compute HQD + a real compiled kernel
              * DISPATCH_DIRECT over a multi-workgroup grid with the COV5 hidden

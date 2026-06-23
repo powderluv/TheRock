@@ -2581,7 +2581,10 @@ bool recipeNopFence(WddmLite &gpu, const IpDiscoveryResult &ipd,
 #define SH_REG_BASE              0x2C00
 #define regCOMPUTE_START_X       0x2E04
 #define regCOMPUTE_PGM_LO        0x2E0C
+#define regCOMPUTE_DISPATCH_SCRATCH_BASE_LO 0x2E10  /* arch flat scratch VA>>8 */
+#define regCOMPUTE_DISPATCH_SCRATCH_BASE_HI 0x2E11  /* (HI takes the top 8 bits) */
 #define regCOMPUTE_PGM_RSRC1     0x2E12
+#define regCOMPUTE_PGM_RSRC2     0x2E13  /* SCRATCH_EN = bit 0 */
 #define regCOMPUTE_RESOURCE_LIMITS 0x2E15
 #define regCOMPUTE_TMPRING_SIZE  0x2E18
 #define regCOMPUTE_RESTART_X     0x2E1B
@@ -4456,5 +4459,478 @@ bool recipeMultiWgDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
            : (!ok ? "FAIL (fence timeout)"
               : (faultStatus ? "FAIL (GPUVM fault)" : "FAIL (output mismatch)")),
            grid, block, outPages);
+    return pass;
+}
+
+/* ======================================================================
+ * recipeScratchDispatch (increment 3c): a kernel that SPILLS registers
+ * ======================================================================
+ * Mirrors python/probe_kernel_scratch.py (the PASSED scratch probe on the
+ * Windows DIRECT MEC HQD) byte-for-byte. The previous increments dispatched
+ * kernels with no private segment (KD.private_segment_fixed_size == 0). This
+ * one runs scratch_kernel.co, which spills registers to the per-wave PRIVATE
+ * (scratch) segment, so the architected flat scratch path must be programmed.
+ *
+ * gfx12 architected flat scratch (proven on a direct MEC HQD): the SPI hands
+ * each wave its FLAT_SCRATCH from COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI plus the
+ * per-wave COMPUTE_TMPRING_SIZE.WAVESIZE offset. There is NO private_segment
+ * buffer V# (KD code-properties bit0/bit5 = 0). Steps added vs the multi-WG
+ * fill:
+ *   - SH_MEM_BASES = 0x00010002 (PRIVATE_BASE field = 2) +
+ *     SH_MEM_CONFIG = 0xC00C (alignment-mode UNALIGNED) for VMID 0, so the
+ *     private aperture and sub-dword scratch work. (cqInitGfxForCompute
+ *     already writes these identical values for all 16 VMIDs; the probe
+ *     re-asserts them for VMID 0 after the queue is up, and so do we.)
+ *   - allocate a VRAM scratch backing, GPUVM-map it into the same PTB, set
+ *     COMPUTE_DISPATCH_SCRATCH_BASE = scratch_VA >> 8.
+ *   - COMPUTE_TMPRING_SIZE = WAVES | (WAVESIZE << 12).
+ *   - COMPUTE_PGM_RSRC2 from the KD already has SCRATCH_EN (bit0) = 1.
+ *
+ * scratch_kernel ABI (probe_kernel_scratch.py): explicit args are the same
+ * shape as fill_kernel -- kernarg[0:8] = output VA (u64), kernarg[8:12] =
+ * u32 val -- followed by the standard COV5 hidden args (block_count/group_size/
+ * grid_dims) at the metadata-declared offsets. Every thread computes
+ *   s = sum(val + (i*7 + val) % 64  for i in 0..63)
+ * which spills enough live values to force the private segment. val=1 ->
+ * s = 2080 (0x820); out[0 .. N-1] all == 2080.
+ *
+ * Parameters match the probe exactly: GRID=4 workgroups, BLOCK=64 threads.
+ * ====================================================================== */
+
+#define SCR_CO_FILE     "scratch_kernel.co"
+#define SCR_VAL         1u                 /* by_value arg -> EXPECT 2080 */
+#define SCR_BLOCK_X     64u                /* threads per workgroup (probe) */
+#define SCR_GRID_X      4u                 /* workgroups (probe) */
+#define SCR_LANES       32u                /* wave32 */
+#define SCR_WAVES       32u                /* probe over-allocs 4x SE; fits 1 PTB */
+/* SH aperture for VMID 0 (probe values; also already set by cqInitGfxForCompute). */
+#define SCR_SH_MEM_CONFIG  0x0000C00Cu     /* alignment-mode UNALIGNED */
+#define SCR_SH_MEM_BASES   0x00010002u     /* PRIVATE_BASE field = 2 */
+
+bool recipeScratchDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase)
+{
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  SCR: recipeBootload did not reach BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    printf("\n=== recipeScratchDispatch (register-spilling kernel + scratch) ===\n");
+
+    const uint32_t grid = SCR_GRID_X;
+    const uint32_t block = SCR_BLOCK_X;
+    const uint32_t outN = grid * block;                 /* total output dwords */
+    const uint64_t outBytes = (uint64_t)outN * 4;
+    const uint32_t outPages = (uint32_t)((outBytes + 0xFFF) / 0x1000);
+    /* EXPECT = sum(val + (i*7 + val) % 64) for i in 0..63, masked to u32. */
+    uint32_t expect = 0;
+    for (uint32_t i = 0; i < 64; i++)
+        expect += SCR_VAL + ((i * 7u + SCR_VAL) % 64u);
+    printf("  SCR: grid=%u (workgroups) block=%u (threads/wg) N=%u dwords "
+           "out=%llu bytes (%u pages) EXPECT=0x%X\n",
+           grid, block, outN, (unsigned long long)outBytes, outPages, expect);
+
+    /* Load + parse the compiled kernel from fwDir. */
+    std::vector<uint8_t> co;
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s\\%s", fwDir, SCR_CO_FILE);
+        if (!loadFirmwareFile(path, co)) {
+            printf("  SCR: ERROR cannot read kernel %s\n", path);
+            return false;
+        }
+    }
+    RcpElf elf;
+    if (!rcpElfParse(co, elf)) {
+        printf("  SCR: ERROR failed to parse %s as AMDGPU ELF\n", SCR_CO_FILE);
+        return false;
+    }
+
+    /* Kernel entry + descriptor symbols (same lookup as recipeMultiWgDispatch). */
+    const RcpElfSymbol *kSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        uint8_t type = s.st_info & 0xF;
+        uint8_t bind = s.st_info >> 4;
+        if (type == RCP_ELF_STT_AMDGPU_HSA_KERNEL ||
+            (type == RCP_ELF_STT_FUNC && bind == RCP_ELF_STB_GLOBAL)) {
+            kSym = &s;
+            break;
+        }
+    }
+    if (!kSym) { printf("  SCR: ERROR no kernel symbol\n"); return false; }
+    char kdName[128];
+    snprintf(kdName, sizeof(kdName), "%s.kd", kSym->name);
+    const RcpElfSymbol *kdSym = nullptr;
+    for (const auto &s : elf.symbols)
+        if (strcmp(s.name, kdName) == 0) { kdSym = &s; break; }
+    if (!kdSym) { printf("  SCR: ERROR no kernel descriptor %s\n", kdName); return false; }
+    const RcpElfSection *kdSec = nullptr;
+    for (const auto &s : elf.sections)
+        if (s.sh_size && s.sh_addr <= kdSym->st_value &&
+            kdSym->st_value < s.sh_addr + s.sh_size) { kdSec = &s; break; }
+    if (!kdSec) { printf("  SCR: ERROR kernel descriptor section not found\n"); return false; }
+    RcpKernelDescriptor kd;
+    size_t kdOff = (size_t)kdSec->sh_offset + (size_t)(kdSym->st_value - kdSec->sh_addr);
+    if (!rcpKdFromBytes(co, kdOff, kd)) {
+        printf("  SCR: ERROR short kernel descriptor\n");
+        return false;
+    }
+
+    /* CONFIRM this kernel actually spills: private_segment_fixed_size > 0 and
+     * COMPUTE_PGM_RSRC2.SCRATCH_EN (bit 0) == 1. Otherwise the scratch path is
+     * not exercised and the test is meaningless. */
+    uint32_t psfs = kd.private_segment_fixed_size;
+    if (psfs == 0) {
+        printf("  SCR: ERROR kernel '%s' has private_segment_fixed_size=0 "
+               "(does not spill); not a scratch kernel\n", kSym->name);
+        return false;
+    }
+    if ((kd.compute_pgm_rsrc2 & 0x1u) == 0) {
+        printf("  SCR: ERROR RSRC2=0x%08X has SCRATCH_EN(bit0)=0 despite "
+               "psfs=%u\n", kd.compute_pgm_rsrc2, psfs);
+        return false;
+    }
+
+    /* Parse the COV5 hidden-arg offsets from the .co metadata note (NOT
+     * hardcoded; the same parser the multi-WG path uses). The scratch kernel
+     * has the identical explicit+hidden arg layout as fill_kernel. */
+    RcpHiddenArgs ha;
+    if (!rcpFindHiddenArgs(co, elf, ha)) {
+        printf("  SCR: ERROR could not parse all COV5 hidden args from metadata\n");
+        return false;
+    }
+    printf("  SCR: kernel='%s' psfs=%u RSRC1=0x%08X RSRC2=0x%08X "
+           "RSRC3=0x%08X kernarg=%u props=0x%X SCRATCH_EN=%u\n",
+           kSym->name, psfs, kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2,
+           kd.compute_pgm_rsrc3, kd.kernarg_size, kd.kernel_code_properties,
+           kd.compute_pgm_rsrc2 & 0x1u);
+
+    /* --- Architected flat scratch sizing (probe_kernel_scratch.py) ----------
+     * Per-thread scratch is rounded UP to a multiple of (256 / LANES) bytes so
+     * that LANES threads consume a whole 256-byte granule:
+     *   bpt        = roundup(psfs, 256/LANES)
+     *   wave_bytes = bpt * LANES                 (bytes one wave needs)
+     *   WAVESIZE   = roundup(wave_bytes, 256) / 256   (in 256-byte units)
+     * The backing is wave_bytes * WAVES * 4 (the probe's 4x SE over-allocation),
+     * rounded up to whole pages so it maps cleanly into the PTB.
+     *   TMPRING    = (WAVES & 0xFFF) | ((WAVESIZE & 0x3FFFF) << 12)
+     * Widths: WAVES is the low 12 bits (NUM_WAVES), WAVESIZE the next 18 bits
+     * (WAVESIZE field) per COMPUTE_TMPRING_SIZE. */
+    const uint32_t lanes = SCR_LANES;
+    const uint32_t waves = SCR_WAVES;
+    const uint32_t gran = 256u / lanes;                 /* 8 bytes for wave32 */
+    uint32_t bpt = (psfs + gran - 1u) & ~(gran - 1u);    /* round psfs up */
+    uint32_t waveBytes = bpt * lanes;
+    uint32_t waveSize = (waveBytes + 255u) / 256u;       /* 256-byte units */
+    uint64_t scratchBytes = ((uint64_t)waveBytes * waves * 4u + 0xFFFull) & ~0xFFFull;
+    uint32_t scratchPages = (uint32_t)(scratchBytes / 0x1000);
+    uint32_t tmpring = (waves & 0xFFFu) | ((waveSize & 0x3FFFFu) << 12);
+    printf("  SCR: psfs=%u gran=%u bpt=%u wave_bytes=%u WAVESIZE=%u WAVES=%u "
+           "TMPRING=0x%08X scratch=%lluKB (%u pages)\n",
+           psfs, gran, bpt, waveBytes, waveSize, waves, tmpring,
+           (unsigned long long)(scratchBytes / 1024), scratchPages);
+
+    /* Assemble the loadable image by SECTION VADDR. */
+    uint64_t imgHi = 0;
+    for (const auto &s : elf.sections)
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr) {
+            uint64_t hi = s.sh_addr + s.sh_size;
+            if (hi > imgHi) imgHi = hi;
+        }
+    if (imgHi == 0) { printf("  SCR: ERROR no allocatable sections\n"); return false; }
+    uint64_t imgBytes = (imgHi + 0xFFF) & ~0xFFFull;
+    uint32_t codePages = (uint32_t)(imgBytes / 0x1000);
+    std::vector<uint8_t> image((size_t)imgBytes, 0);
+    for (const auto &s : elf.sections)
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr &&
+            s.sh_type != RCP_ELF_SHT_NOBITS) {
+            if ((size_t)(s.sh_offset + s.sh_size) > co.size()) continue;
+            memcpy(&image[(size_t)s.sh_addr], &co[(size_t)s.sh_offset],
+                   (size_t)s.sh_size);
+        }
+
+    /* --- bring up the GFX/MEC and GFXHUB (same as recipeMultiWgDispatch) --- */
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+
+    cq.hasNbif = cqResolveNbif(ipd, &cq.nbifBase2);
+    if (cq.hasNbif) {
+        uint32_t apEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+        gpu.writeReg32((cq.nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                       apEn | BIF_DOORBELL_APER_EN__BIT);
+        uint32_t fbEn = 0;
+        gpu.readReg32((cq.nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+        gpu.writeReg32((cq.nbifBase2 + regBIF_FB_EN) * 4,
+                       fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+        printf("  NBIO: doorbell aperture + framebuffer enabled "
+               "(NBIF base[2]=0x%04X)\n", cq.nbifBase2);
+    } else {
+        printf("  NBIO: WARNING NBIF base[2] not found; HDP flush + doorbell "
+               "aperture skipped\n");
+    }
+
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+    if (haveUcode)
+        printf("  GFX: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+               (unsigned long long)pfp, (unsigned long long)me,
+               (unsigned long long)mec);
+
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode))
+        return false;
+
+    void *gartCpu = nullptr, *dummyCpu = nullptr;
+    uint64_t gartBus = 0, dummyBus = 0;
+    void *gartHandle = nullptr, *dummyHandle = nullptr;
+    if (!gpu.allocDma(1 << 20, &gartCpu, &gartBus, &gartHandle)) {
+        printf("  SCR: ERROR GART table DMA alloc failed\n");
+        return false;
+    }
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  SCR: ERROR dummy page DMA alloc failed\n");
+        return false;
+    }
+    memset(gartCpu, 0, 1 << 20);
+    memset(dummyCpu, 0, 4096);
+
+    GfxhubParams gp;
+    memset(&gp, 0, sizeof(gp));
+    uint32_t fbBase = 0, fbTop = 0;
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_BASE, &fbBase);
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_TOP, &fbTop);
+    gp.vramStart = (uint64_t)fbBase << 24;
+    gp.vramEnd = ((uint64_t)fbTop << 24) | 0xFFFFFF;
+    gp.gartStart = gp.vramEnd + 1;
+    gp.gartEnd = gp.gartStart + (512ull * 1024 * 1024) - 1;
+    gp.agpStart = gp.gartEnd + 1;
+    gp.agpEnd = gp.agpStart;
+    gp.gartTableBus = gartBus;
+    gp.dummyPageBus = dummyBus;
+    gfxhubGartEnable(gpu, cq, gp);
+
+    /* --- stage code + kernarg + output + scratch in VRAM ------------------- */
+    void *codeCpu = nullptr;
+    uint64_t codeGpu = 0, codeHandle = 0;
+    if (!rcpAllocVram(gpu, imgBytes, &codeCpu, &codeGpu, &codeHandle)) {
+        printf("  SCR: ERROR code VRAM alloc failed\n");
+        return false;
+    }
+    memcpy(codeCpu, image.data(), (size_t)imgBytes);
+
+    void *kaCpu = nullptr;
+    uint64_t kaGpu = 0, kaHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &kaCpu, &kaGpu, &kaHandle)) {
+        printf("  SCR: ERROR kernarg VRAM alloc failed\n");
+        return false;
+    }
+
+    uint64_t outAllocBytes = (uint64_t)outPages * 0x1000;
+    void *outCpu = nullptr;
+    uint64_t outGpu = 0, outHandle = 0;
+    if (!rcpAllocVram(gpu, outAllocBytes, &outCpu, &outGpu, &outHandle)) {
+        printf("  SCR: ERROR output VRAM alloc failed\n");
+        return false;
+    }
+
+    /* Scratch backing on the SAME FB-MC bump allocator. The kernel never CPU-
+     * touches it; the SPI writes/reads it as private memory. We map it into
+     * GPUVM (architected flat scratch on gfx12 uses the VA aperture: SH_MEM
+     * PRIVATE_BASE + SCRATCH_BASE = scratch_VA>>8), so it must live in the same
+     * 4-level page table as code/kernarg/output -- it is NOT physically
+     * addressed. */
+    void *scrCpu = nullptr;
+    uint64_t scrGpu = 0, scrHandle = 0;
+    if (!rcpAllocVram(gpu, scratchBytes, &scrCpu, &scrGpu, &scrHandle)) {
+        printf("  SCR: ERROR scratch VRAM alloc failed (%llu bytes)\n",
+               (unsigned long long)scratchBytes);
+        return false;
+    }
+    /* rcpAllocVram zeroes every page of code/kernarg/output/scratch. */
+
+    /* VA map: code (codePages), kernarg, output (outPages), scratch
+     * (scratchPages) -- all in one 2MB block / one PTB. */
+    uint64_t codeVa = COMPUTE_VA_ROOT;
+    uint64_t kaVa = COMPUTE_VA_ROOT + (uint64_t)codePages * 0x1000;
+    uint64_t outVa = COMPUTE_VA_ROOT + (uint64_t)(codePages + 1) * 0x1000;
+    uint64_t scrVa = COMPUTE_VA_ROOT + (uint64_t)(codePages + 1 + outPages) * 0x1000;
+    uint64_t codeEntryVa = codeVa +
+        ((uint64_t)kdSym->st_value + (uint64_t)kd.kernel_code_entry_byte_offset);
+
+    /* Fill the kernarg: explicit args + COV5 hidden args at metadata offsets.
+     * block_count = GRID (workgroups), group_size = BLOCK (threads). */
+    {
+        uint8_t *kb = (uint8_t *)kaCpu;
+        rcpKbStore(kb, 0, outVa, 8);              /* [0:8] output VA  (u64) */
+        rcpKbStore(kb, 8, SCR_VAL, 4);            /* [8:12] by_value  (u32) */
+        rcpFillHidden(kb, ha.blockCountX, grid);  /* u32 # workgroups */
+        rcpFillHidden(kb, ha.blockCountY, 1);
+        rcpFillHidden(kb, ha.blockCountZ, 1);
+        rcpFillHidden(kb, ha.groupSizeX, block);  /* u16 threads/wg = 64 */
+        rcpFillHidden(kb, ha.groupSizeY, 1);
+        rcpFillHidden(kb, ha.groupSizeZ, 1);
+        rcpFillHidden(kb, ha.remainderX, 0);      /* uniform_work_group_size=1 */
+        rcpFillHidden(kb, ha.remainderY, 0);
+        rcpFillHidden(kb, ha.remainderZ, 0);
+        rcpFillHidden(kb, ha.gridDims, 1);        /* u16 grid dims = 1 */
+    }
+
+    /* Page table: every code page + kernarg + every output page + every
+     * scratch page. The scratch pages MUST be mapped or the SPI faults the
+     * first spill (GCVM walker fault on the scratch VA). */
+    std::vector<GpuvmRegion> regions;
+    regions.reserve(codePages + 1 + outPages + scratchPages);
+    for (uint32_t p = 0; p < codePages; p++)
+        regions.push_back({ codeVa + (uint64_t)p * 0x1000,
+                            codeGpu + (uint64_t)p * 0x1000 });
+    regions.push_back({ kaVa, kaGpu });
+    for (uint32_t p = 0; p < outPages; p++)
+        regions.push_back({ outVa + (uint64_t)p * 0x1000,
+                            outGpu + (uint64_t)p * 0x1000 });
+    for (uint32_t p = 0; p < scratchPages; p++)
+        regions.push_back({ scrVa + (uint64_t)p * 0x1000,
+                            scrGpu + (uint64_t)p * 0x1000 });
+
+    DispatchGpuvm pt;
+    memset(&pt, 0, sizeof(pt));
+    if (!buildComputeGpuvmMulti(gpu, cq, vramMcBase, regions.data(),
+                                (uint32_t)regions.size(), pt))
+        return false;
+    printf("  SCR: mapped %u code + 1 kernarg + %u output + %u scratch pages "
+           "(scratch VA 0x%llX..0x%llX)\n",
+           codePages, outPages, scratchPages, (unsigned long long)scrVa,
+           (unsigned long long)(scrVa + scratchBytes - 1));
+
+    if (!cqInitComputeQueue(gpu, cq))
+        return false;
+
+    /* SH aperture for VMID 0: PRIVATE_BASE=2 + UNALIGNED, re-asserted under
+     * grbm_select AFTER the queue is up (probe ordering). These are the same
+     * values cqInitGfxForCompute already programmed for all 16 VMIDs. */
+    cqGrbmSelect(gpu, cq, 0, 0, 0, 0);
+    gcWreg(gpu, cq, regSH_MEM_CONFIG, SCR_SH_MEM_CONFIG, 1);
+    gcWreg(gpu, cq, regSH_MEM_BASES, SCR_SH_MEM_BASES, 1);
+    cqGrbmDeselect(gpu, cq);
+    printf("  SCR: SH_MEM_CONFIG=0x%08X SH_MEM_BASES=0x%08X (VMID 0)\n",
+           SCR_SH_MEM_CONFIG, SCR_SH_MEM_BASES);
+
+    uint32_t c0 = gcReg(gpu, cq, regGCVM_CONTEXT0_CNTL, 0);
+    printf("  GPUVM: GCVM_CONTEXT0_CNTL readback=0x%08X (enable=%u)\n",
+           c0, c0 & 1u);
+
+    /* kernarg_sgpr_index (same derivation as the other recipes; props 0/1/2). */
+    uint32_t slot = 0;
+    if (kd.kernel_code_properties & (1u << 0)) slot += 4;
+    if (kd.kernel_code_properties & (1u << 1)) slot += 2;
+    if (kd.kernel_code_properties & (1u << 2)) slot += 2;
+
+    uint64_t sbase = scrVa >> 8;          /* COMPUTE_DISPATCH_SCRATCH_BASE = VA>>8 */
+    printf("  SCR: code_entry=0x%llX ka_va=0x%llX out_va=0x%llX scr_va=0x%llX "
+           "SCRATCH_BASE=0x%llX code_pages=%u sgpr_slot=%u\n",
+           (unsigned long long)codeEntryVa, (unsigned long long)kaVa,
+           (unsigned long long)outVa, (unsigned long long)scrVa,
+           (unsigned long long)sbase, codePages, slot);
+
+    gpu.writeReg32((cq.gcBase0 + regGCVM_L2_PROTECTION_FAULT_STATUS) * 4, 0);
+    gpu.writeReg32((cq.gcBase0 + (regGCVM_L2_PROTECTION_FAULT_STATUS + 1)) * 4, 0);
+
+    uint64_t pgm = codeEntryVa >> 8;
+    uint64_t fenceSeq = 1;
+    *cq.fenceCpu = 0;
+
+    std::vector<uint32_t> packets;
+    pm4AcquireMem(packets);
+
+    uint32_t pgmLoHi[2] = { (uint32_t)(pgm & 0xFFFFFFFF),
+                            (uint32_t)((pgm >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_PGM_LO, pgmLoHi, 2);
+
+    /* COMPUTE_DISPATCH_SCRATCH_BASE_LO/HI = scratch_VA >> 8. The HI register
+     * holds the top 8 bits of the >>8 base (a 40-bit MC address). */
+    uint32_t sbaseLoHi[2] = { (uint32_t)(sbase & 0xFFFFFFFF),
+                              (uint32_t)((sbase >> 32) & 0xFFu) };
+    pm4SetShReg(packets, regCOMPUTE_DISPATCH_SCRATCH_BASE_LO, sbaseLoHi, 2);
+
+    /* RSRC1 + RSRC2 straight from the KD; RSRC2 already has SCRATCH_EN (bit0). */
+    uint32_t rsrc12[2] = { kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2 };
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC1, rsrc12, 2);
+
+    uint32_t rsrc3 = kd.compute_pgm_rsrc3;
+    pm4SetShReg(packets, regCOMPUTE_PGM_RSRC3, &rsrc3, 1);
+
+    /* COMPUTE_TMPRING_SIZE = WAVES | (WAVESIZE << 12) -- the per-wave scratch. */
+    pm4SetShReg(packets, regCOMPUTE_TMPRING_SIZE, &tmpring, 1);
+
+    uint32_t restart[3] = { 0, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_RESTART_X, restart, 3);
+
+    uint32_t userData[2] = { (uint32_t)(kaVa & 0xFFFFFFFF),
+                             (uint32_t)((kaVa >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(packets, regCOMPUTE_USER_DATA_0 + slot, userData, 2);
+
+    uint32_t resLimits = 0;
+    pm4SetShReg(packets, regCOMPUTE_RESOURCE_LIMITS, &resLimits, 1);
+
+    uint32_t startBlock[8] = { 0, 0, 0, block, 1, 1, 0, 0 };
+    pm4SetShReg(packets, regCOMPUTE_START_X, startBlock, 8);
+
+    pm4DispatchDirect(packets, grid, 1, 1, DISPATCH_INITIATOR_W32);
+    pm4EventWrite(packets, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+    pm4ReleaseMemFence(packets, cq.fenceGpu, fenceSeq);
+
+    cqSubmitPackets(gpu, cq, packets);
+
+    bool ok = cqWaitFence(cq, fenceSeq, 5000);
+    cqHdpFlush(gpu, cq);
+
+    uint32_t faultStatus = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_STATUS, 0);
+    uint32_t faultAddrLo = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32, 0);
+    uint32_t faultAddrHi = gcReg(gpu, cq, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32, 0);
+    uint64_t faultVa = (((uint64_t)faultAddrHi << 32) | faultAddrLo) << 12;
+
+    cqGrbmSelect(gpu, cq, cq.me, cq.pipe, cq.queue, 0);
+    uint32_t rptr = gcReg(gpu, cq, regCP_HQD_PQ_RPTR, 0);
+    cqGrbmDeselect(gpu, cq);
+    uint64_t fenceVal = *cq.fenceCpu;
+
+    /* Verify ALL N output dwords == EXPECT (every thread's spilled sum). */
+    const volatile uint32_t *res = (const volatile uint32_t *)outCpu;
+    uint32_t nbad = 0, firstBad = 0, firstBadVal = 0;
+    for (uint32_t i = 0; i < outN; i++) {
+        uint32_t v = res[i];
+        if (v != expect) {
+            if (nbad == 0) { firstBad = i; firstBadVal = v; }
+            nbad++;
+        }
+    }
+
+    uint32_t walker = (faultStatus >> 1) & 0x7;
+    uint32_t perm = (faultStatus >> 4) & 0xF;
+
+    printf("\nFAULT_STATUS=0x%08X [walker=%u perm=0x%X] FAULT_VA=0x%llX\n",
+           faultStatus, walker, perm, (unsigned long long)faultVa);
+    printf("FENCE value=%llu (expected %llu) RPTR=0x%X\n",
+           (unsigned long long)fenceVal, (unsigned long long)fenceSeq, rptr);
+    uint32_t lastIdx = outN - 1;
+    printf("out[0]=0x%08X out[%u]=0x%08X out[%u]=0x%08X expected=0x%08X "
+           "bad=%u/%u\n",
+           res[0], block, res[block], lastIdx, res[lastIdx], expect, nbad, outN);
+    if (nbad)
+        printf("  first mismatch at index %u (dword page %u): got 0x%08X\n",
+               firstBad, (firstBad * 4) / 0x1000, firstBadVal);
+
+    bool pass = ok && (faultStatus == 0) && (nbad == 0);
+    printf("SCRATCH DISPATCH %s (grid=%u x block=%u, psfs=%u, %u scratch pages)\n",
+           pass ? "PASS (fence signaled, no fault, all spilled output verified)"
+           : (!ok ? "FAIL (fence timeout)"
+              : (faultStatus ? "FAIL (GPUVM/CP fault)" : "FAIL (output mismatch)")),
+           grid, block, psfs, scratchPages);
     return pass;
 }

@@ -605,3 +605,24 @@ bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
  * ====================================================================== */
 bool recipeMultiWgDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
                            const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * recipeScratchDispatch() runs a REGISTER-SPILLING kernel (increment 3c). It
+ * mirrors python/probe_kernel_scratch.py:
+ *   1.-7. identical bring-up to recipeMultiWgDispatch (bootload -> MEC enable
+ *         -> GFXHUB re-init -> load scratch_kernel.co -> compute HQD).
+ *   8. Confirm the kernel spills: KD.private_segment_fixed_size > 0 and
+ *      COMPUTE_PGM_RSRC2.SCRATCH_EN (bit 0) == 1.
+ *   9. Size the architected flat scratch from psfs (bpt = roundup(psfs,256/
+ *      LANES); wave_bytes = bpt*LANES; WAVESIZE = roundup(wave_bytes,256)/256),
+ *      allocate the VRAM scratch backing on the FB-MC bump allocator and map it
+ *      into the SAME 4-level page table as code/kernarg/output.
+ *  10. Program SH_MEM_CONFIG=0xC00C + SH_MEM_BASES=0x00010002 (VMID 0),
+ *      COMPUTE_DISPATCH_SCRATCH_BASE = scratch_VA>>8, COMPUTE_TMPRING_SIZE =
+ *      WAVES | (WAVESIZE<<12), and RSRC2 (SCRATCH_EN) from the KD; then
+ *      DISPATCH_DIRECT(GRID,1,1) + EOP fence.
+ *      PASS iff the fence signals AND fault status == 0 AND every GRID*BLOCK
+ *      output dword == the spilled sum (val=1 -> 2080).
+ * ====================================================================== */
+bool recipeScratchDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                           const char *fwDir, uint64_t vramMcBase);
