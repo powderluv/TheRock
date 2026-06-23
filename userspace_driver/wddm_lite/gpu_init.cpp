@@ -4934,3 +4934,98 @@ bool recipeScratchDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
            grid, block, psfs, scratchPages);
     return pass;
 }
+
+/* ======================================================================
+ * ROCr lite:: integration surface (additive)
+ *
+ * Thin public wrappers over the proven static bring-up helpers so the ROCr
+ * WindowsLiteDriver can run the SAME recipe wddm_lite_test uses, then route
+ * its DirectQueuePlatform overrides through this WddmLite instance. No recipe
+ * behaviour changes; these only re-expose existing static helpers.
+ * ====================================================================== */
+
+/* init_nbio doorbell-aperture + framebuffer enable, factored out of
+ * recipeNopFence so both the recipe and the ROCr EnsureDoorbellAperture path
+ * use one implementation. Mirrors the lite:: Linux transport's
+ * EnsureDoorbellAperture register sequence (RCC_DOORBELL_APER_EN +
+ * BIF_FB_EN). */
+bool wddmEnsureDoorbellAperture(WddmLite &gpu, const IpDiscoveryResult &ipd)
+{
+    uint32_t nbifBase2 = 0;
+    if (!cqResolveNbif(ipd, &nbifBase2)) {
+        printf("  wddmEnsureDoorbellAperture: NBIF base[2] not found\n");
+        return false;
+    }
+    uint32_t apEn = 0;
+    gpu.readReg32((nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
+    gpu.writeReg32((nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
+                   apEn | BIF_DOORBELL_APER_EN__BIT);
+    uint32_t fbEn = 0;
+    gpu.readReg32((nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
+    gpu.writeReg32((nbifBase2 + regBIF_FB_EN) * 4,
+                   fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
+    printf("  wddmEnsureDoorbellAperture: doorbell aperture + framebuffer "
+           "enabled (NBIF base[2]=0x%04X)\n", nbifBase2);
+    return true;
+}
+
+bool wddmAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
+                   uint64_t *gpuAddr, uint64_t *handle)
+{
+    /* g_vramMcBase / g_vramCursor are seeded by recipeBootload (invoked from
+     * wddmGfxBringUp), so callers must bring up the GPU first. */
+    return rcpAllocVram(gpu, size, cpu, gpuAddr, handle);
+}
+
+bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase,
+                    WddmComputeContext &ctx)
+{
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gcBase0 = ipd.gcBase;
+    ctx.gcBase1 = ipd.gcBase1;
+    ctx.mmhubBase = ipd.mmhubBase;
+    ctx.vramMcBase = vramMcBase;
+
+    /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. Also seeds the VRAM bump
+     * allocator (g_vramMcBase = vramMcBase). */
+    if (!recipeBootload(gpu, ipd, fwDir, vramMcBase)) {
+        printf("  wddmGfxBringUp: recipeBootload did not reach "
+               "BOOTLOAD_COMPLETE\n");
+        return false;
+    }
+
+    /* 2. NBIO doorbell aperture + framebuffer enable. */
+    ctx.hasNbif = cqResolveNbif(ipd, &ctx.nbifBase2);
+    if (ctx.hasNbif)
+        wddmEnsureDoorbellAperture(gpu, ipd);
+    else
+        printf("  wddmGfxBringUp: WARNING NBIF base[2] not found; doorbell "
+               "aperture skipped\n");
+
+    /* 3. init_gfx_for_compute (CP counters, RLC/SH_MEM/doorbell-range, MEC
+     * enable), exactly as recipeNopFence. */
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+    cq.nbifBase2 = ctx.nbifBase2;
+    cq.hasNbif = ctx.hasNbif;
+
+    const char *gc = "12_0_1";
+    bool okP = false, okM = false, okC = false;
+    uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+    uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+    uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+    bool haveUcode = okP && okM && okC;
+
+    if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode)) {
+        printf("  wddmGfxBringUp: cqInitGfxForCompute failed\n");
+        return false;
+    }
+    uint32_t mecCntl = gcReg(gpu, cq, regCP_MEC_RS64_CNTL, 1);
+    ctx.mecEnabled = (mecCntl == 0x3C000000);
+    printf("  wddmGfxBringUp: CP_MEC_RS64_CNTL=0x%08X (expected 0x3C000000) "
+           "mec=%s\n", mecCntl, ctx.mecEnabled ? "ENABLED" : "NOT-ENABLED");
+    return true;
+}

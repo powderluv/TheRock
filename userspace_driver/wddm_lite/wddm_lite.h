@@ -626,3 +626,60 @@ bool recipeMultiWgDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
  * ====================================================================== */
 bool recipeScratchDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
                            const char *fwDir, uint64_t vramMcBase);
+
+/* ======================================================================
+ * ROCr lite:: integration surface (additive; foundation for the ROCr
+ * WindowsLiteDriver direct-queue leg).
+ *
+ * These expose the proven bring-up + bump-allocator primitives that are
+ * otherwise static in gpu_init.cpp, so the ROCr WindowsLiteDriver can drive
+ * the GPU with the SAME recipe wddm_lite_test uses, then hand the queue
+ * ring/MQD/doorbell to lite::CreateDirectQueue / lite::SubmitDirectQueue.
+ *
+ * The MMIO byte-offset convention is unchanged and matches the Linux
+ * transport + gcReg/mmhubRead/pspRead in gpu_init.cpp exactly:
+ *     byte_offset = (namespace_base + reg_dword) * 4   (always BAR0)
+ * so the ROCr override ReadMmio32(base,reg) maps to
+ *     gpu.readReg32((base + reg) * 4, value, 0)
+ * and WriteMmio32 likewise. The doorbell is BAR2 at doorbell_index * 4.
+ * ====================================================================== */
+
+/* Resolved bring-up context the ROCr driver caches after wddmGfxBringUp().
+ * gcBase0/gcBase1/mmhubBase/nbifBase2 are the IP-discovery namespace bases
+ * (dword indices); vramMcBase is the GMC FB MC base (GmcState.vramStart),
+ * which is ALSO the framebuffer_base lite:: adds to every queue offset. */
+struct WddmComputeContext {
+    uint32_t gcBase0;       /* ipd.gcBase  (base_idx 0) */
+    uint32_t gcBase1;       /* ipd.gcBase1 (base_idx 1, == 0xA000 on gfx1201) */
+    uint32_t mmhubBase;     /* ipd.mmhubBase */
+    uint32_t nbifBase2;     /* NBIF base_idx 2 (doorbell aperture + HDP flush) */
+    bool     hasNbif;
+    uint64_t vramMcBase;    /* GMC FB MC base; == lite framebuffer_base */
+    bool     mecEnabled;    /* CP_MEC_RS64_CNTL reached 0x3C000000 */
+};
+
+/* Full cold-boot + MEC enable + doorbell-aperture enable, exactly as
+ * recipeNopFence does before it touches the queue:
+ *   recipeBootload() -> BOOTLOAD_COMPLETE (PSP autoload),
+ *   init_nbio doorbell-aperture + framebuffer enable,
+ *   cqInitGfxForCompute() (CP counters, RLC/SH_MEM/doorbell-range, MEC enable).
+ * Resets the VRAM bump allocator to vramMcBase so wddmAllocVram() hands out
+ * FB-MC addresses the lite:: layout can use as framebuffer_base + offset.
+ * Returns true and fills ctx on success (ctx.mecEnabled set iff
+ * CP_MEC_RS64_CNTL == 0x3C000000). fwDir/vramMcBase mirror recipeNopFence. */
+bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                    const char *fwDir, uint64_t vramMcBase,
+                    WddmComputeContext &ctx);
+
+/* Bump-allocate a VRAM buffer over the FB-MC aperture (exposes rcpAllocVram).
+ * Returns cpu = CPU-mapped pointer, gpuAddr = vramMcBase + offset (the FB-MC
+ * address the CP fetches from AND the lite:: framebuffer_base + queue offset),
+ * handle = MAP_VRAM mapping handle. Must be called after wddmGfxBringUp()
+ * (which seeds the allocator's vramMcBase). */
+bool wddmAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
+                   uint64_t *gpuAddr, uint64_t *handle);
+
+/* Re-run only the NBIO doorbell-aperture + framebuffer enable (the lite::
+ * DirectQueuePlatform::EnsureDoorbellAperture analog). Safe to call repeatedly.
+ * Returns false if the NBIF base could not be resolved. */
+bool wddmEnsureDoorbellAperture(WddmLite &gpu, const IpDiscoveryResult &ipd);
