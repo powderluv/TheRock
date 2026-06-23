@@ -5029,3 +5029,132 @@ bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
            "mec=%s\n", mecCntl, ctx.mecEnabled ? "ENABLED" : "NOT-ENABLED");
     return true;
 }
+
+/* ======================================================================
+ * DIAGNOSTIC (MES-on-Windows): start the MES engine.
+ *
+ * recipeBootload loads the MES firmware (CP_MES 33 / MES_STACK 34 /
+ * CP_MES_KIQ 81 / MES_KIQ_STACK 82) as part of the PSP autoload batch, but the
+ * direct-HQD bring-up (cqInitGfxForCompute) stops at the MEC enable and never
+ * touches CP_MES_CNTL -- so on the proven path the MES engine is LOADED but NOT
+ * RUNNING. This helper releases it, faithfully transcribing
+ * ring_init.py::_enable_mes_from_ucode (the same sequence Linux lite:: used to
+ * reach CP_MES_CNTL=0x0C000000 with CP_MES_HEADER_DUMP ticking).
+ *
+ * Because the PSP already loaded the uni_mes ucode (mes_psp_loaded), the
+ * IC_BASE/MDBASE VRAM-backdoor staging (_program_mes_ucode_buffers) is skipped,
+ * exactly as the Python path does when mes_psp_loaded is set. We still must
+ * program CP_MES_PRGRM_CNTR_START with the MES entry point (from the uni_mes fw
+ * header) so the released pipe fetches from the right PC.
+ * ====================================================================== */
+#define regCP_MES_CNTL                 0x2807   /* base_idx 1 */
+#define regCP_MES_PRGRM_CNTR_START     0x2800   /* base_idx 1 */
+#define regCP_MES_PRGRM_CNTR_START_HI  0x289D   /* base_idx 1 */
+#define regCP_MES_HEADER_DUMP          0x280D   /* base_idx 1 */
+#define regCP_MES_INSTR_PNTR           0x2813   /* base_idx 1 */
+#define regCP_MES_GP3_LO               0x2849   /* base_idx 1 (version) */
+#define regRLC_CP_SCHEDULERS           0x098A   /* base_idx 1 */
+
+#define CP_MES_CNTL__MES_INVALIDATE_ICACHE  (1u << 4)
+#define CP_MES_CNTL__MES_PIPE0_RESET        (1u << 16)
+#define CP_MES_CNTL__MES_PIPE1_RESET        (1u << 17)
+#define CP_MES_CNTL__MES_PIPE0_ACTIVE       (1u << 26)
+#define CP_MES_CNTL__MES_PIPE1_ACTIVE       (1u << 27)
+#define CP_MES_CNTL__MES_HALT               (1u << 30)
+
+#define MES_ME_INDEX   3   /* MEID for MES queues */
+#define MES_PIPE_KIQ   1
+
+bool wddmStartMes(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                  const char *fwDir, const WddmComputeContext &ctx)
+{
+    printf("\n=== wddmStartMes (DIAGNOSTIC MES engine release) ===\n");
+
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ctx.gcBase0;
+    cq.gcBase1 = ctx.gcBase1;
+    cq.nbifBase2 = ctx.nbifBase2;
+    cq.hasNbif = ctx.hasNbif;
+
+    /* MES entry point: gc_<gc>_uni_mes.bin, mes_firmware_header_v1_0
+     * ucode_start_addr_lo/hi at +56/+60 (matches bringup.py _mes_entry()). */
+    const char *gc = "12_0_1";
+    bool okMes = false;
+    uint64_t mesEntry = cqUcodeStart(fwDir, gc, "uni_mes", 56, &okMes);
+    if (!okMes) {
+        printf("  wddmStartMes: cannot read MES entry from gc_%s_uni_mes.bin\n",
+               gc);
+        return false;
+    }
+    printf("  wddmStartMes: MES entry=0x%016llX (PC=0x%llX)\n",
+           (unsigned long long)mesEntry, (unsigned long long)(mesEntry >> 2));
+
+    /* CP_MES_CNTL pre-state (after bootload, before release). */
+    uint32_t mesCntlPre = gcReg(gpu, cq, regCP_MES_CNTL, 1);
+    uint32_t version = gcReg(gpu, cq, regCP_MES_GP3_LO, 1);
+    printf("  wddmStartMes: CP_MES_CNTL(pre)=0x%08X CP_MES_GP3_LO=0x%08X\n",
+           mesCntlPre, version);
+
+    /* 1. RLC_CP_SCHEDULERS: route the KIQ (me=3 pipe=KIQ hqd=0) + enable bit. */
+    uint32_t schedulers = gcReg(gpu, cq, regRLC_CP_SCHEDULERS, 1);
+    schedulers &= 0xFFFFFF00u;
+    schedulers |= (MES_ME_INDEX << 5) | (MES_PIPE_KIQ << 3) | 0u | 0x80u;
+    gcWreg(gpu, cq, regRLC_CP_SCHEDULERS, schedulers, 1);
+
+    /* 2. CP_MES_CNTL: clear ACTIVE, set INVALIDATE_ICACHE + PIPE0/1_RESET +
+     *    HALT (reset+halt both pipes before programming the PC). */
+    uint32_t val = gcReg(gpu, cq, regCP_MES_CNTL, 1);
+    val &= ~(CP_MES_CNTL__MES_PIPE0_ACTIVE | CP_MES_CNTL__MES_PIPE1_ACTIVE);
+    val |= (CP_MES_CNTL__MES_INVALIDATE_ICACHE |
+            CP_MES_CNTL__MES_PIPE0_RESET |
+            CP_MES_CNTL__MES_PIPE1_RESET |
+            CP_MES_CNTL__MES_HALT);
+    gcWreg(gpu, cq, regCP_MES_CNTL, val, 1);
+
+    /* 3. Per-pipe program counter (both MES pipe0 and pipe1 share the uni_mes
+     *    entry, mirroring bringup.py MES/MES1 = mes_entry). */
+    uint32_t activeMask = 0;
+    for (uint32_t pipe = 0; pipe < 2; pipe++) {
+        cqGrbmSelect(gpu, cq, MES_ME_INDEX, pipe, 0, 0);
+        gcWregPair(gpu, cq, regCP_MES_PRGRM_CNTR_START,
+                   regCP_MES_PRGRM_CNTR_START_HI, mesEntry >> 2, 1);
+        activeMask |= (pipe == 0) ? CP_MES_CNTL__MES_PIPE0_ACTIVE
+                                  : CP_MES_CNTL__MES_PIPE1_ACTIVE;
+    }
+    cqGrbmDeselect(gpu, cq);
+
+    /* 4. CP_MES_CNTL release: clear reset/halt/icache + set PIPE0/1_ACTIVE. */
+    val = gcReg(gpu, cq, regCP_MES_CNTL, 1);
+    val &= ~(CP_MES_CNTL__MES_INVALIDATE_ICACHE |
+             CP_MES_CNTL__MES_PIPE0_RESET |
+             CP_MES_CNTL__MES_PIPE1_RESET |
+             CP_MES_CNTL__MES_HALT |
+             CP_MES_CNTL__MES_PIPE0_ACTIVE |
+             CP_MES_CNTL__MES_PIPE1_ACTIVE);
+    val |= activeMask;
+    gcWreg(gpu, cq, regCP_MES_CNTL, val, 1);
+    Sleep(1);
+
+    /* Liveness check: HEADER_DUMP / INSTR_PNTR should change if MES executes. */
+    uint32_t hdr0 = gcReg(gpu, cq, regCP_MES_HEADER_DUMP, 1);
+    uint32_t ip0  = gcReg(gpu, cq, regCP_MES_INSTR_PNTR, 1);
+    Sleep(200);
+    uint32_t hdr1 = gcReg(gpu, cq, regCP_MES_HEADER_DUMP, 1);
+    uint32_t ip1  = gcReg(gpu, cq, regCP_MES_INSTR_PNTR, 1);
+    uint32_t mesCntlPost = gcReg(gpu, cq, regCP_MES_CNTL, 1);
+
+    bool pipesActive =
+        (mesCntlPost & (CP_MES_CNTL__MES_PIPE0_ACTIVE |
+                        CP_MES_CNTL__MES_PIPE1_ACTIVE)) ==
+        (CP_MES_CNTL__MES_PIPE0_ACTIVE | CP_MES_CNTL__MES_PIPE1_ACTIVE);
+    bool mesAlive = (hdr0 != hdr1) || (ip1 != 0);
+
+    printf("  wddmStartMes: CP_MES_CNTL(post)=0x%08X (PIPE0/1_ACTIVE=%s)\n",
+           mesCntlPost, pipesActive ? "set" : "NOT-set");
+    printf("  wddmStartMes: HEADER_DUMP 0x%08X->0x%08X INSTR_PNTR "
+           "0x%08X->0x%08X  MES %s\n",
+           hdr0, hdr1, ip0, ip1,
+           mesAlive ? "RUNNING" : "NOT visibly executing");
+    return pipesActive;
+}

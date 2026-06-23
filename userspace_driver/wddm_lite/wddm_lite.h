@@ -683,3 +683,21 @@ bool wddmAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
  * DirectQueuePlatform::EnsureDoorbellAperture analog). Safe to call repeatedly.
  * Returns false if the NBIF base could not be resolved. */
 bool wddmEnsureDoorbellAperture(WddmLite &gpu, const IpDiscoveryResult &ipd);
+
+/* DIAGNOSTIC (MES-on-Windows increment): start the MES engine after
+ * wddmGfxBringUp(). recipeBootload loads the MES firmware (CP_MES/MES_STACK/
+ * CP_MES_KIQ/MES_KIQ_STACK via the PSP autoload batch) but NEVER releases the
+ * MES engine -- the proven direct-HQD path does not use MES. This mirrors the
+ * Linux lite:: / windows ring_init.py _enable_mes_from_ucode sequence:
+ *   RLC_CP_SCHEDULERS(KIQ routing) -> CP_MES_CNTL reset+halt -> per-pipe
+ *   CP_MES_PRGRM_CNTR_START (entry from gc_<gc>_uni_mes.bin +56, >>2) ->
+ *   CP_MES_CNTL release (clear reset/halt, set PIPE0/1_ACTIVE).
+ * Because the PSP already loaded the MES ucode (mes_psp_loaded), the IC_BASE/
+ * MDBASE VRAM-backdoor staging is intentionally skipped (matches the Python
+ * "MES PSP-loaded -- skipping manual IC_BASE staging" branch).
+ * Returns true if CP_MES_CNTL reads back with both PIPE0/1_ACTIVE set. Reads
+ * CP_MES_HEADER_DUMP/INSTR_PNTR twice to report whether the engine executes.
+ * fwDir mirrors wddmGfxBringUp (e.g. "Z:\\winfw"). Additive + safe to skip --
+ * the no-arg/direct harness path never calls it. */
+bool wddmStartMes(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                  const char *fwDir, const WddmComputeContext &ctx);

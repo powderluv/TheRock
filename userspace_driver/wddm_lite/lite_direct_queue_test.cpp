@@ -180,13 +180,89 @@ class WddmLiteDirectPlatform : public lite::DirectQueuePlatform {
   mutable std::vector<DbMap> doorbells_;
 };
 
+/* ------------------------------------------------------------------------- *
+ * MES diagnostic dump: read the MES engine + KIQ HQD + compute-queue state via
+ * the same MMIO seam the lite:: MES path uses, so a stalled fence can be traced
+ * to "engine not started / KIQ not fetching / ADD_QUEUE not servicing". All
+ * reads go through the platform overrides (BAR0 (base+reg)*4). GC base_idx1 =
+ * 0xA000 (CP_MES_*), base_idx0 = 0x1260 (CP_HQD_* after GRBM_GFX_CNTL select).
+ * ------------------------------------------------------------------------- */
+namespace {
+constexpr uint32_t kGcB0 = 0x1260;
+constexpr uint32_t kGcB1 = 0xA000;
+constexpr uint32_t regGRBM_GFX_CNTL = 0x0900;   /* base_idx1 */
+constexpr uint32_t regCP_MES_CNTL_D = 0x2807;
+constexpr uint32_t regCP_MES_GP3_LO_D = 0x2849;
+constexpr uint32_t regCP_MES_HEADER_DUMP_D = 0x280D;
+constexpr uint32_t regCP_MES_INSTR_PNTR_D = 0x2813;
+constexpr uint32_t regRLC_CP_SCHEDULERS_D = 0x098A;
+constexpr uint32_t regCP_HQD_ACTIVE_D = 0x1FAB;
+constexpr uint32_t regCP_HQD_PQ_RPTR_D = 0x1FB3;
+constexpr uint32_t regCP_HQD_PQ_WPTR_LO_D = 0x1FDF;
+
+void mesSelectHqd(const lite::DirectQueuePlatform &p, uint32_t me, uint32_t pipe,
+                  uint32_t hqd) {
+  uint32_t v = ((pipe & 0x3) << 0) | ((me & 0x3) << 2) | ((hqd & 0x7) << 8);
+  p.WriteMmio32(kGcB1, regGRBM_GFX_CNTL, v);
+}
+void mesDeselectHqd(const lite::DirectQueuePlatform &p) {
+  p.WriteMmio32(kGcB1, regGRBM_GFX_CNTL, 0);
+}
+
+void dumpMesDiag(const lite::DirectQueuePlatform &p,
+                 const lite::DirectQueueState &queue, const char *phase) {
+  uint32_t mesCntl = 0, version = 0, sched = 0, hdr = 0, ip = 0;
+  p.ReadMmio32(kGcB1, regCP_MES_CNTL_D, &mesCntl);
+  p.ReadMmio32(kGcB1, regCP_MES_GP3_LO_D, &version);
+  p.ReadMmio32(kGcB1, regRLC_CP_SCHEDULERS_D, &sched);
+  p.ReadMmio32(kGcB1, regCP_MES_HEADER_DUMP_D, &hdr);
+  p.ReadMmio32(kGcB1, regCP_MES_INSTR_PNTR_D, &ip);
+  bool p0 = (mesCntl & (1u << 26)) != 0;
+  bool p1 = (mesCntl & (1u << 27)) != 0;
+  printf("  [MES %s] CP_MES_CNTL=0x%08X (PIPE0_ACTIVE=%d PIPE1_ACTIVE=%d) "
+         "GP3_LO(ver)=0x%08X RLC_SCHED=0x%08X HEADER_DUMP=0x%08X "
+         "INSTR_PNTR=0x%08X\n",
+         phase, mesCntl, p0, p1, version, sched, hdr, ip);
+
+  /* KIQ HQD (me=3 pipe=1 hqd=0): is the KIQ ring active + fetching? */
+  mesSelectHqd(p, 3, 1, 0);
+  uint32_t kiqActive = 0, kiqRptr = 0, kiqWptr = 0;
+  p.ReadMmio32(kGcB0, regCP_HQD_ACTIVE_D, &kiqActive);
+  p.ReadMmio32(kGcB0, regCP_HQD_PQ_RPTR_D, &kiqRptr);
+  p.ReadMmio32(kGcB0, regCP_HQD_PQ_WPTR_LO_D, &kiqWptr);
+  mesDeselectHqd(p);
+  printf("  [MES %s] KIQ HQD(me3,pipe1,hqd0) ACTIVE=0x%X RPTR=0x%X WPTR=0x%X\n",
+         phase, kiqActive, kiqRptr, kiqWptr);
+
+  /* The MES-backed compute queue's HQD is NOT MMIO-owned (MES owns it), so on
+   * the MES path read the VRAM rptr/wptr the queue tracks instead. */
+  uint64_t qWptr = queue.wptr_cpu ? *queue.wptr_cpu : 0;
+  uint64_t qRptr = queue.rptr_cpu ? *queue.rptr_cpu : 0;
+  printf("  [MES %s] compute queue qid=%u doorbell=0x%X mes_backed=%d "
+         "vram_wptr=%llu vram_rptr=%llu\n",
+         phase, queue.queue_id, queue.doorbell_index, queue.mes_backed ? 1 : 0,
+         (unsigned long long)qWptr, (unsigned long long)qRptr);
+}
+}  // namespace
+
 int main(int argc, char *argv[]) {
   const char *fwDir = "Z:\\winfw";
-  if (argc > 1) fwDir = argv[1];
+  bool mesMode = false;
+  /* Args (order-independent): "mes" selects the MES queue path; any other
+   * positional arg is the firmware dir. Default (no "mes") = the proven direct
+   * HQD path, unchanged. e.g.  lite_direct_queue_test.exe mes Z:\\winfw  */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "mes") == 0)
+      mesMode = true;
+    else
+      fwDir = argv[i];
+  }
 
   printf("=== lite_direct_queue_test (ROCr lite:: NOP fence over wddm_lite) "
          "===\n");
   printf("Firmware dir: %s\n", fwDir);
+  printf("Queue path  : %s\n", mesMode ? "MES (use_mes_queue=TRUE) [DIAGNOSTIC]"
+                                       : "DIRECT HQD (proven)");
 
   WddmLite gpu;
   if (!gpu.open()) {
@@ -222,15 +298,29 @@ int main(int argc, char *argv[]) {
   if (!ctx.mecEnabled)
     printf("WARNING: MEC not at 0x3C000000; queue activate may fail\n");
 
+  /* MES mode: recipeBootload LOADED the MES firmware but never released the
+   * engine (the direct path does not use MES). Start it here BEFORE lite::
+   * CreateDirectQueue -- EnsureMesScheduler reads CP_MES_CNTL/GP3 and bails if
+   * the engine is not running. wddmStartMes is additive + the direct path
+   * never calls it. A false return (pipes not ACTIVE) is reported but we
+   * CONTINUE so EnsureMesScheduler's own diagnostics still print. */
+  WddmLiteDirectPlatform platform(gpu, ipd, ctx);
+  if (mesMode) {
+    bool mesUp = wddmStartMes(gpu, ipd, fwDir, ctx);
+    printf("wddmStartMes -> %s\n",
+           mesUp ? "MES pipes ACTIVE" : "MES NOT active (continuing for diag)");
+  }
+
   /* lite:: direct queue. framebuffer_base = vramMcBase: lite:: adds it to the
    * queue offset, and AllocateQueueMemory already returns vramMcBase+offset,
    * so the allocated path is self-consistent. */
-  WddmLiteDirectPlatform platform(gpu, ipd, ctx);
-
   lite::DirectQueueOptions options;
-  options.use_mes_queue = false;       /* direct HQD; MES is the next increment */
+  options.use_mes_queue = mesMode;     /* DIAGNOSTIC: route through the MES KIQ */
   options.use_firmware_dequeue = true;
-  options.trace = (getenv("LITE_TRACE") != nullptr);
+  /* In MES mode force verbose tracing so EnsureMesScheduler/SubmitMesApiFrame
+   * dump CP_MES_CNTL + KIQ ring + SET_HW_RESOURCES/ADD_QUEUE fence state. */
+  options.trace = mesMode || (getenv("LITE_TRACE") != nullptr);
+  options.trace_verbose = mesMode || (getenv("LITE_TRACE_VERBOSE") != nullptr);
   options.trace_prefix = "lite_direct_queue_test";
 
   lite::DirectQueueState queue;
@@ -238,11 +328,16 @@ int main(int argc, char *argv[]) {
                                             ctx.vramMcBase, options);
   if (st != HSA_STATUS_SUCCESS) {
     printf("FAIL: lite::CreateDirectQueue status=%u\n", st);
+    /* In MES mode the failure is usually inside EnsureMesScheduler (KIQ never
+     * activates / SET_HW_RESOURCES times out). Dump the MES engine state so the
+     * stall is diagnosable even though the queue was never mapped. */
+    if (mesMode) dumpMesDiag(platform, queue, "create-failed");
     return 1;
   }
   printf("lite::CreateDirectQueue OK: qid=%u doorbell=0x%X ring_gpu=0x%llX\n",
          queue.queue_id, queue.doorbell_index,
          (unsigned long long)queue.ring_gpu);
+  if (mesMode) dumpMesDiag(platform, queue, "post-create");
 
   /* A separate fence buffer (FB-MC addressable + CPU mapped). */
   void *fenceCpu = nullptr;
@@ -275,9 +370,13 @@ int main(int argc, char *argv[]) {
   uint32_t rptr = 0;
   lite::ReadDirectQueueRptr(platform, queue, &rptr);
 
+  if (mesMode) dumpMesDiag(platform, queue, ok ? "post-submit-PASS"
+                                               : "post-submit-FAIL");
+
   printf("\nFENCE value=%llu (expected 1) RPTR=0x%X\n",
          (unsigned long long)*fence, rptr);
-  printf("LITE NOP+FENCE %s\n", ok ? "PASS" : "FAIL (fence timeout)");
+  printf("LITE %s NOP+FENCE %s\n", mesMode ? "MES" : "DIRECT",
+         ok ? "PASS" : "FAIL (fence timeout)");
 
   lite::DestroyDirectQueue(platform, queue, options);
   gpu.close();
