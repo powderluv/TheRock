@@ -28,6 +28,7 @@
 #include "wddm_lite.h"
 #include "core/inc/amd_lite_direct_queue.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -285,15 +286,278 @@ void dumpMesDiag(const lite::DirectQueuePlatform &p,
 }
 }  // namespace
 
+/* ------------------------------------------------------------------------- *
+ * dbprobe: the decisive "does a host doorbell write actually reach the GPU"
+ * test for this WDDM/passthrough setup.
+ *
+ * WHY: The proven direct compute HQD (me=1/pipe0/queue0, doorbell 0x20) advances
+ * via lite::SubmitDirectQueue, which writes CP_HQD_PQ_WPTR_LO/HI over MMIO *and*
+ * rings the doorbell (amd_lite_direct_queue.cpp ~2322-2347). So the working HQD
+ * has never isolated doorbell delivery -- the MMIO wptr poke alone can latch the
+ * CP's internal wptr and trigger the fetch. The MES KIQ doorbell (idx 0x18,
+ * me=3) does nothing despite every routing register matching amdgpu. dbprobe
+ * answers: is the doorbell-DELIVERY path itself broken on this WDDM/passthrough
+ * stack (a KMD-side wall that equally kills the MES KIQ), or is the MES stall
+ * pipe-specific?
+ *
+ * HOW (two sub-runs on the SAME proven direct compute HQD):
+ *   RUN 1 (mmio baseline): create a direct compute HQD, submit NOP+RELEASE_MEM
+ *     via the normal lite::SubmitDirectQueue (MMIO wptr + doorbell). Expect PASS.
+ *     This proves the ring/MQD/EOP/fence are correct on THIS queue.
+ *   RUN 2 (doorbell-only): re-arm the same queue, then advance it relying on the
+ *     DOORBELL ALONE:
+ *       - disable WPTR_POLL so the CP cannot autonomously poll the in-memory
+ *         wptr: write the global CP_PQ_WPTR_POLL_CNTL=0 AND zero the per-HQD
+ *         CP_HQD_PQ_WPTR_POLL_ADDR/_HI (mqd[0x8D/0x8E]) so there is no memory
+ *         wptr-poll source. (gfx12 has no CP_HQD_PQ_WPTR_POLL_CNTL.EN; poll is
+ *         gated by a valid poll address + the global cntl.)
+ *       - write the PM4 to the ring + write the NEW wptr ONLY to the in-memory
+ *         wptr dword (queue.wptr_cpu). FlushHdp.
+ *       - DO NOT write CP_HQD_PQ_WPTR_LO/HI over MMIO.
+ *       - ring the doorbell (queue.doorbell_cpu = new_wptr) and ONLY that.
+ *     Read CP_HQD_PQ_WPTR/RPTR (MMIO) before + after the doorbell, poll the fence
+ *     ~2s.
+ *
+ * VERDICT for RUN 2:
+ *   "DOORBELL DELIVERS"  iff the fence signals (the CP fetched + executed purely
+ *                        from the doorbell ring -- RPTR advances too).
+ *   "DOORBELL DOES NOT DELIVER" iff fence stays 0 AND RPTR stays 0 (the doorbell
+ *                        write never reached the CP).
+ *
+ * INTERPRETATION:
+ *   mmio:PASS doorbell-only:PASS => doorbells DO deliver; the MES KIQ stall is
+ *     MES-pipe-specific (ADD_QUEUE / scheduler servicing), not delivery.
+ *   mmio:PASS doorbell-only:FAIL => doorbell DELIVERY is the wall on this
+ *     WDDM/passthrough setup (a KMD-side issue). That explains the MES KIQ stall
+ *     and means MES needs a kernel-side doorbell fix, not a userspace one.
+ * ------------------------------------------------------------------------- */
+namespace {
+/* CP_HQD_* are base_idx0 (kGcB0=0x1260); GRBM_GFX_CNTL is base_idx1. These
+ * mirror amd_lite_direct_queue.cpp's reg constants so the probe pokes exactly
+ * the registers the queue uses. */
+constexpr uint32_t regCP_HQD_PQ_WPTR_LO_DB = 0x1FDF;
+constexpr uint32_t regCP_HQD_PQ_WPTR_HI_DB = 0x1FE0;
+constexpr uint32_t regCP_HQD_PQ_RPTR_DB = 0x1FB3;
+constexpr uint32_t regCP_HQD_PQ_WPTR_POLL_ADDR_DB = 0x1FB6;
+constexpr uint32_t regCP_HQD_PQ_WPTR_POLL_ADDR_HI_DB = 0x1FB7;
+constexpr uint32_t regCP_HQD_ACTIVE_DB = 0x1FAB;
+constexpr uint32_t regCP_PQ_WPTR_POLL_CNTL_DB = 0x1E23; /* global poll cntl */
+constexpr uint32_t kGcB0_DB = 0x1260;
+constexpr uint32_t kGcB1_DB = 0xA000;
+constexpr uint32_t regGRBM_GFX_CNTL_DB = 0x0900;
+
+/* GRBM_GFX_CNTL selector for me=1/pipe0/queue0 (DirectQueuePipe(0)=0,
+ * DirectQueueHqd(0)=0) -- matches lite::SelectHqd's bit layout. */
+void dbSelectHqd(const lite::DirectQueuePlatform &p, uint32_t me, uint32_t pipe,
+                 uint32_t queue) {
+  uint32_t v = ((pipe & 0x3u) << 0) | ((me & 0x3u) << 2) | ((queue & 0x7u) << 8);
+  p.WriteMmio32(kGcB1_DB, regGRBM_GFX_CNTL_DB, v);
+}
+void dbDeselectHqd(const lite::DirectQueuePlatform &p) {
+  p.WriteMmio32(kGcB1_DB, regGRBM_GFX_CNTL_DB, 0);
+}
+
+struct DbHqdSnapshot {
+  uint32_t active;
+  uint32_t rptr;
+  uint32_t wptr_lo;
+  uint32_t wptr_hi;
+};
+DbHqdSnapshot dbReadHqd(const lite::DirectQueuePlatform &p) {
+  DbHqdSnapshot s{};
+  dbSelectHqd(p, 1, 0, 0);
+  p.ReadMmio32(kGcB0_DB, regCP_HQD_ACTIVE_DB, &s.active);
+  p.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_RPTR_DB, &s.rptr);
+  p.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_LO_DB, &s.wptr_lo);
+  p.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_HI_DB, &s.wptr_hi);
+  dbDeselectHqd(p);
+  return s;
+}
+
+/* Build the NOP*4 + RELEASE_MEM(fence,1) block (identical to the main path). */
+void dbBuildNopFence(std::vector<uint32_t> &pm4, uint64_t fenceGpu) {
+  pm4Nop(pm4, 4);
+  pm4ReleaseMemFence(pm4, fenceGpu, 1);
+}
+
+/* Advance the queue via the DOORBELL ALONE: write ring + in-memory wptr,
+ * FlushHdp, ring the doorbell. NO MMIO CP_HQD_PQ_WPTR write. Mirrors the
+ * memory-side of SubmitDirectQueue but deliberately omits the MMIO wptr poke. */
+bool dbSubmitDoorbellOnly(const lite::DirectQueuePlatform &platform,
+                          lite::DirectQueueState &queue, const uint32_t *pm4,
+                          size_t dword_count) {
+  if (queue.ring_cpu == nullptr || queue.wptr_cpu == nullptr ||
+      queue.doorbell_cpu == nullptr)
+    return false;
+  const uint64_t ring_dw = queue.ring_size_bytes / sizeof(uint32_t);
+  uint64_t wptr = queue.wptr;
+  uint64_t start = wptr % ring_dw;
+  /* The probe block (NOP*4 + RELEASE_MEM = ~13 dwords) fits well inside the
+   * 1 KiB-dword ring at wptr 0; no wrap handling needed for the single submit. */
+  for (size_t i = 0; i < dword_count; i++)
+    queue.ring_cpu[(start + i) % ring_dw] = pm4[i];
+  std::atomic_thread_fence(std::memory_order_release);
+  const uint64_t new_wptr = wptr + dword_count;
+  *queue.wptr_cpu = new_wptr;  /* in-memory wptr ONLY */
+  std::atomic_thread_fence(std::memory_order_release);
+  if (platform.FlushHdp() != HSA_STATUS_SUCCESS) return false;
+  /* Ring the doorbell and ONLY the doorbell. */
+  *queue.doorbell_cpu = new_wptr;
+  queue.wptr = new_wptr;
+  return true;
+}
+
+int runDbProbe(const lite::DirectQueuePlatform &platform,
+               lite::DirectQueueState &queue,
+               const lite::DirectQueueOptions &options, WddmLite &gpu) {
+  printf("\n=== dbprobe: doorbell-delivery isolation on the direct compute HQD "
+         "===\n");
+  printf("HQD: me=1 pipe=0 queue0 doorbell=0x%X (DirectQueueDoorbell(0))\n",
+         queue.doorbell_index);
+
+  /* Shared fence buffer (re-zeroed between runs). */
+  void *fenceCpu = nullptr;
+  uint64_t fenceGpu = 0, fenceHandle = 0;
+  if (!wddmAllocVram(gpu, 4096, &fenceCpu, &fenceGpu, &fenceHandle)) {
+    printf("FAIL: fence buffer alloc\n");
+    return 1;
+  }
+  volatile uint64_t *fence = (volatile uint64_t *)fenceCpu;
+
+  /* ---------------- RUN 1: MMIO-wptr baseline (proven path) ---------------- */
+  *fence = 0;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  platform.FlushHdp();
+
+  std::vector<uint32_t> pm4a;
+  dbBuildNopFence(pm4a, fenceGpu);
+
+  DbHqdSnapshot a_pre = dbReadHqd(platform);
+  printf("\n[RUN 1 mmio] pre-submit HQD active=0x%X rptr=0x%X wptr=0x%08X:%08X\n",
+         a_pre.active, a_pre.rptr, a_pre.wptr_hi, a_pre.wptr_lo);
+
+  hsa_status_t st =
+      lite::SubmitDirectQueue(platform, queue, pm4a.data(), pm4a.size(), options);
+  if (st != HSA_STATUS_SUCCESS) {
+    printf("[RUN 1 mmio] SubmitDirectQueue status=%u\n", st);
+  }
+  bool mmioOk = false;
+  for (int i = 0; i < 2000; i++) {
+    if (*fence == 1) { mmioOk = true; break; }
+    ::Sleep(1);
+  }
+  DbHqdSnapshot a_post = dbReadHqd(platform);
+  printf("[RUN 1 mmio] post HQD active=0x%X rptr=0x%X wptr=0x%08X:%08X "
+         "fence=%llu\n",
+         a_post.active, a_post.rptr, a_post.wptr_hi, a_post.wptr_lo,
+         (unsigned long long)*fence);
+  printf("[RUN 1 mmio] result: %s\n", mmioOk ? "PASS" : "FAIL");
+
+  /* ---------------- RUN 2: doorbell-only (delivery isolation) ----------------
+   * Re-arm the SAME queue. The queue is still active; we keep advancing its
+   * monotonic wptr (the in-memory wptr + doorbell value both carry the absolute
+   * wptr), so the second block lands right after the first. */
+  *fence = 0;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  platform.FlushHdp();
+
+  /* Disable WPTR_POLL so a fence signal in RUN 2 can ONLY come from the doorbell:
+   *   (a) global CP_PQ_WPTR_POLL_CNTL = 0
+   *   (b) per-HQD CP_HQD_PQ_WPTR_POLL_ADDR/_HI = 0 (no memory poll source)
+   * After this the CP has no autonomous way to learn the new wptr from memory;
+   * only a doorbell write latches it into the HQD's internal wptr. */
+  dbSelectHqd(platform, 1, 0, 0);
+  uint32_t pollCntlBefore = 0, pollAddrBefore = 0, pollAddrHiBefore = 0;
+  platform.ReadMmio32(kGcB0_DB, regCP_PQ_WPTR_POLL_CNTL_DB, &pollCntlBefore);
+  platform.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_POLL_ADDR_DB, &pollAddrBefore);
+  platform.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_POLL_ADDR_HI_DB,
+                      &pollAddrHiBefore);
+  platform.WriteMmio32(kGcB0_DB, regCP_PQ_WPTR_POLL_CNTL_DB, 0);
+  platform.WriteMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_POLL_ADDR_DB, 0);
+  platform.WriteMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_POLL_ADDR_HI_DB, 0);
+  uint32_t pollCntlAfter = 0, pollAddrAfter = 0;
+  platform.ReadMmio32(kGcB0_DB, regCP_PQ_WPTR_POLL_CNTL_DB, &pollCntlAfter);
+  platform.ReadMmio32(kGcB0_DB, regCP_HQD_PQ_WPTR_POLL_ADDR_DB, &pollAddrAfter);
+  dbDeselectHqd(platform);
+  printf("\n[RUN 2 doorbell-only] WPTR_POLL disabled: CP_PQ_WPTR_POLL_CNTL "
+         "0x%08X->0x%08X  CP_HQD_PQ_WPTR_POLL_ADDR 0x%08X(hi 0x%08X)->0x%08X\n",
+         pollCntlBefore, pollCntlAfter, pollAddrBefore, pollAddrHiBefore,
+         pollAddrAfter);
+
+  std::vector<uint32_t> pm4b;
+  dbBuildNopFence(pm4b, fenceGpu);
+
+  DbHqdSnapshot b_pre = dbReadHqd(platform);
+  const uint64_t db_value = queue.wptr + pm4b.size();
+  printf("[RUN 2 doorbell-only] pre-doorbell HQD active=0x%X rptr=0x%X "
+         "wptr=0x%08X:%08X | will write in-mem wptr=%llu, ring doorbell idx=0x%X "
+         "value=%llu, NO MMIO wptr write\n",
+         b_pre.active, b_pre.rptr, b_pre.wptr_hi, b_pre.wptr_lo,
+         (unsigned long long)db_value, queue.doorbell_index,
+         (unsigned long long)db_value);
+
+  if (!dbSubmitDoorbellOnly(platform, queue, pm4b.data(), pm4b.size())) {
+    printf("[RUN 2 doorbell-only] FAIL: submit setup error\n");
+    return 1;
+  }
+
+  bool dbOk = false;
+  for (int i = 0; i < 2000; i++) {
+    if (*fence == 1) { dbOk = true; break; }
+    ::Sleep(1);
+  }
+  DbHqdSnapshot b_post = dbReadHqd(platform);
+  printf("[RUN 2 doorbell-only] post-doorbell HQD active=0x%X rptr=0x%X "
+         "wptr=0x%08X:%08X fence=%llu\n",
+         b_post.active, b_post.rptr, b_post.wptr_hi, b_post.wptr_lo,
+         (unsigned long long)*fence);
+
+  const bool rptrAdvanced = b_post.rptr != b_pre.rptr;
+  const char *verdict;
+  if (dbOk)
+    verdict = "DOORBELL DELIVERS";
+  else if (!rptrAdvanced && b_post.rptr == 0 && b_pre.rptr == 0)
+    verdict = "DOORBELL DOES NOT DELIVER";
+  else
+    verdict = "INCONCLUSIVE (fence=0 but RPTR moved -- queue/ring fault, not "
+              "clean delivery failure)";
+  printf("[RUN 2 doorbell-only] VERDICT: %s\n", verdict);
+
+  /* ---------------------------- summary ---------------------------- */
+  printf("\n=== dbprobe summary: mmio:%s doorbell-only:%s ===\n",
+         mmioOk ? "PASS" : "FAIL", dbOk ? "PASS" : "FAIL");
+  if (mmioOk && dbOk) {
+    printf("INTERPRETATION: doorbells DO reach the GPU. The MES KIQ stall is "
+           "pipe-specific (MES scheduler/ADD_QUEUE servicing), NOT doorbell "
+           "delivery.\n");
+  } else if (mmioOk && !dbOk) {
+    printf("INTERPRETATION: doorbell DELIVERY is the wall on this WDDM/"
+           "passthrough setup (KMD-side). This explains the MES KIQ stall; MES "
+           "needs a kernel-side doorbell fix, not a userspace one.\n");
+  } else {
+    printf("INTERPRETATION: the MMIO baseline itself FAILED -- the queue/ring/"
+           "fence is not healthy on this HQD, so the doorbell-only result is "
+           "not isolating. Fix the baseline first.\n");
+  }
+  return (mmioOk && dbOk) ? 0 : 1;
+}
+}  // namespace
+
 int main(int argc, char *argv[]) {
   const char *fwDir = "Z:\\winfw";
   bool mesMode = false;
-  /* Args (order-independent): "mes" selects the MES queue path; any other
-   * positional arg is the firmware dir. Default (no "mes") = the proven direct
-   * HQD path, unchanged. e.g.  lite_direct_queue_test.exe mes Z:\\winfw  */
+  bool dbProbeMode = false;
+  /* Args (order-independent): "mes" selects the MES queue path; "dbprobe"
+   * selects the doorbell-delivery isolation probe (direct HQD, MMIO baseline +
+   * doorbell-only); any other positional arg is the firmware dir. Default (no
+   * mode arg) = the proven direct HQD path, unchanged.
+   *   lite_direct_queue_test.exe mes Z:\\winfw
+   *   lite_direct_queue_test.exe dbprobe Z:\\winfw  */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "mes") == 0)
       mesMode = true;
+    else if (strcmp(argv[i], "dbprobe") == 0)
+      dbProbeMode = true;
     else
       fwDir = argv[i];
   }
@@ -301,8 +565,10 @@ int main(int argc, char *argv[]) {
   printf("=== lite_direct_queue_test (ROCr lite:: NOP fence over wddm_lite) "
          "===\n");
   printf("Firmware dir: %s\n", fwDir);
-  printf("Queue path  : %s\n", mesMode ? "MES (use_mes_queue=TRUE) [DIAGNOSTIC]"
-                                       : "DIRECT HQD (proven)");
+  printf("Queue path  : %s\n",
+         dbProbeMode ? "DIRECT HQD (proven) [DBPROBE: doorbell-delivery probe]"
+         : mesMode    ? "MES (use_mes_queue=TRUE) [DIAGNOSTIC]"
+                      : "DIRECT HQD (proven)");
 
   WddmLite gpu;
   if (!gpu.open()) {
@@ -370,7 +636,7 @@ int main(int argc, char *argv[]) {
   options.use_firmware_dequeue = true;
   /* In MES mode force verbose tracing so EnsureMesScheduler/SubmitMesApiFrame
    * dump CP_MES_CNTL + KIQ ring + SET_HW_RESOURCES/ADD_QUEUE fence state. */
-  options.trace = mesMode || (getenv("LITE_TRACE") != nullptr);
+  options.trace = mesMode || dbProbeMode || (getenv("LITE_TRACE") != nullptr);
   options.trace_verbose = mesMode || (getenv("LITE_TRACE_VERBOSE") != nullptr);
   options.trace_prefix = "lite_direct_queue_test";
 
@@ -389,6 +655,16 @@ int main(int argc, char *argv[]) {
          queue.queue_id, queue.doorbell_index,
          (unsigned long long)queue.ring_gpu);
   if (mesMode) dumpMesDiag(platform, queue, "post-create", &ih);
+
+  /* dbprobe mode: run the doorbell-delivery isolation on this proven direct HQD
+   * (MMIO baseline then doorbell-only), then tear down + exit. Never touches the
+   * MES path. */
+  if (dbProbeMode) {
+    int rc = runDbProbe(platform, queue, options, gpu);
+    lite::DestroyDirectQueue(platform, queue, options);
+    gpu.close();
+    return rc;
+  }
 
   /* A separate fence buffer (FB-MC addressable + CPU mapped). */
   void *fenceCpu = nullptr;
