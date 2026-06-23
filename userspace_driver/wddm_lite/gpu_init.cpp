@@ -3723,6 +3723,334 @@ bool recipeKernargDispatch(WddmLite &gpu, const IpDiscoveryResult &ipd,
 }
 
 /* ======================================================================
+ * MES harness reuse: stage the SAME real-kernel GPUVM as recipeKernargDispatch,
+ * but return the staged VAs + dispatch parameters so a CALLER (the "meskern"
+ * harness mode) can route the DISPATCH through the lite:: MES-backed queue
+ * instead of the direct-MMIO HQD. This is purely additive: recipeKernargDispatch
+ * above is unchanged; this duplicates only the bring-up/stage/GPUVM portion (it
+ * deliberately does NOT create a queue or submit, leaving that to the caller).
+ *
+ * wddmStageKernelGpuvm() performs steps 2-6 of recipeKernargDispatch over the
+ * already-bootloaded GPU (the caller runs wddmGfxBringUp first, which does the
+ * PSP autoload + MEC enable, so we re-assert MEC + re-init the GFXHUB GART that
+ * AUTOLOAD_RLC reset, load+parse fill_kernel_raw.co, stage code/kernarg/output
+ * in VRAM, build the 4-level GFXHUB page table, and enable GCVM_CONTEXT0). It
+ * does NOT touch the compute queue or the MES -- the caller creates the MES-
+ * backed lite:: queue and submits the PM4 from wddmBuildKernelDispatchPm4().
+ *
+ * The MMIO byte-offset convention + register set are identical to
+ * recipeKernargDispatch (it reuses the same static cqInitGfxForCompute /
+ * gfxhubGartEnable / buildComputeGpuvmMulti / rcpElfParse machinery).
+ * ====================================================================== */
+bool wddmStageKernelGpuvm(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                          const WddmComputeContext &ctx, const char *fwDir,
+                          WddmKernelStage &out, bool skipMecReassert)
+{
+    memset(&out, 0, sizeof(out));
+
+    printf("\n=== wddmStageKernelGpuvm (real-kernel GPUVM for the MES path) ===\n");
+
+    /* Load + parse the compiled kernel (same as recipeKernargDispatch). */
+    std::vector<uint8_t> co;
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s\\%s", fwDir, KERN_CO_FILE);
+        if (!loadFirmwareFile(path, co)) {
+            printf("  STAGE: ERROR cannot read kernel %s\n", path);
+            return false;
+        }
+    }
+    RcpElf elf;
+    if (!rcpElfParse(co, elf)) {
+        printf("  STAGE: ERROR failed to parse %s as AMDGPU ELF\n", KERN_CO_FILE);
+        return false;
+    }
+
+    const RcpElfSymbol *kSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        uint8_t type = s.st_info & 0xF;
+        uint8_t bind = s.st_info >> 4;
+        if (type == RCP_ELF_STT_AMDGPU_HSA_KERNEL ||
+            (type == RCP_ELF_STT_FUNC && bind == RCP_ELF_STB_GLOBAL)) {
+            kSym = &s;
+            break;
+        }
+    }
+    if (!kSym) {
+        printf("  STAGE: ERROR no kernel symbol in %s\n", KERN_CO_FILE);
+        return false;
+    }
+    char kdName[128];
+    snprintf(kdName, sizeof(kdName), "%s.kd", kSym->name);
+    const RcpElfSymbol *kdSym = nullptr;
+    for (const auto &s : elf.symbols) {
+        if (strcmp(s.name, kdName) == 0) { kdSym = &s; break; }
+    }
+    if (!kdSym) {
+        printf("  STAGE: ERROR no kernel descriptor %s\n", kdName);
+        return false;
+    }
+    const RcpElfSection *kdSec = nullptr;
+    for (const auto &s : elf.sections) {
+        if (s.sh_size && s.sh_addr <= kdSym->st_value &&
+            kdSym->st_value < s.sh_addr + s.sh_size) {
+            kdSec = &s;
+            break;
+        }
+    }
+    if (!kdSec) {
+        printf("  STAGE: ERROR kernel descriptor section not found\n");
+        return false;
+    }
+    RcpKernelDescriptor kd;
+    size_t kdOff = (size_t)kdSec->sh_offset + (size_t)(kdSym->st_value - kdSec->sh_addr);
+    if (!rcpKdFromBytes(co, kdOff, kd)) {
+        printf("  STAGE: ERROR short kernel descriptor\n");
+        return false;
+    }
+    printf("  STAGE: kernel='%s' RSRC1=0x%08X RSRC2=0x%08X RSRC3=0x%08X "
+           "kernarg=%u props=0x%X\n",
+           kSym->name, kd.compute_pgm_rsrc1, kd.compute_pgm_rsrc2,
+           kd.compute_pgm_rsrc3, kd.kernarg_size, kd.kernel_code_properties);
+
+    /* Assemble the loadable image by SECTION VADDR. */
+    uint64_t imgHi = 0;
+    for (const auto &s : elf.sections) {
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr) {
+            uint64_t hi = s.sh_addr + s.sh_size;
+            if (hi > imgHi) imgHi = hi;
+        }
+    }
+    if (imgHi == 0) {
+        printf("  STAGE: ERROR no allocatable sections\n");
+        return false;
+    }
+    uint64_t imgBytes = (imgHi + 0xFFF) & ~0xFFFull;
+    uint32_t codePages = (uint32_t)(imgBytes / 0x1000);
+    std::vector<uint8_t> image((size_t)imgBytes, 0);
+    for (const auto &s : elf.sections) {
+        if ((s.sh_flags & RCP_ELF_SHF_ALLOC) && s.sh_addr &&
+            s.sh_type != RCP_ELF_SHT_NOBITS) {
+            if ((size_t)(s.sh_offset + s.sh_size) > co.size()) continue;
+            memcpy(&image[(size_t)s.sh_addr], &co[(size_t)s.sh_offset],
+                   (size_t)s.sh_size);
+        }
+    }
+
+    /* CqState here is ONLY a register-access vehicle (gcBase0/gcBase1 + NBIF):
+     * the GFXHUB GART enable + GPUVM page-table writes are queue-independent.
+     * We never call cqInitComputeQueue on it. */
+    CqState cq;
+    memset(&cq, 0, sizeof(cq));
+    cq.gcBase0 = ipd.gcBase;
+    cq.gcBase1 = ipd.gcBase1;
+    cq.nbifBase2 = ctx.nbifBase2;
+    cq.hasNbif = ctx.hasNbif;
+
+    /* Re-assert MEC enable + RLC/SH_MEM/doorbell-range (same as
+     * recipeKernargDispatch). wddmGfxBringUp already did this once.
+     *
+     * skipMecReassert: in the meskern path the MES has ALREADY mapped the
+     * compute queue onto a MEC HQD slot (lite::CreateDirectQueue
+     * use_mes_queue=true ran before this stage). cqInitGfxForCompute pulse-
+     * resets all four MEC pipes (CP_MEC_RS64_CNTL PIPE0..3_RESET) and reloads
+     * the MEC program counters, which is NOT idempotent w.r.t. an already-
+     * mapped HQD: it would wipe the MES-mapped slot, and meskern never re-issues
+     * ADD_QUEUE to re-map it. So when skipMecReassert is set we leave the MEC
+     * pipes (and the MES-owned HQD) alone and only do the GFXHUB GART re-enable
+     * + page-table build + GCVM_CONTEXT0 enable below. The SH_MEM/RLC/TCP state
+     * cqInitGfxForCompute would re-write is already live from wddmGfxBringUp's
+     * own cqInitGfxForCompute and survives the GART reset. */
+    if (skipMecReassert) {
+        printf("  STAGE: skipMecReassert=1 -- MES owns the MEC HQD; NOT running "
+               "cqInitGfxForCompute (no MEC pipe pulse-reset)\n");
+    } else {
+        const char *gc = "12_0_1";
+        bool okP = false, okM = false, okC = false;
+        uint64_t pfp = cqUcodeStart(fwDir, gc, "pfp", 52, &okP);
+        uint64_t me = cqUcodeStart(fwDir, gc, "me", 52, &okM);
+        uint64_t mec = cqUcodeStart(fwDir, gc, "mec", 52, &okC);
+        bool haveUcode = okP && okM && okC;
+        if (haveUcode)
+            printf("  STAGE: ucode_start PFP=0x%llX ME=0x%llX MEC=0x%llX\n",
+                   (unsigned long long)pfp, (unsigned long long)me,
+                   (unsigned long long)mec);
+        if (!cqInitGfxForCompute(gpu, cq, pfp, me, mec, haveUcode)) {
+            printf("  STAGE: cqInitGfxForCompute failed\n");
+            return false;
+        }
+    }
+
+    /* GFXHUB GART re-enable (AUTOLOAD_RLC reset the GFXHUB contexts). */
+    void *gartCpu = nullptr, *dummyCpu = nullptr;
+    uint64_t gartBus = 0, dummyBus = 0;
+    void *gartHandle = nullptr, *dummyHandle = nullptr;
+    if (!gpu.allocDma(1 << 20, &gartCpu, &gartBus, &gartHandle)) {
+        printf("  STAGE: ERROR GART table DMA alloc failed\n");
+        return false;
+    }
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  STAGE: ERROR dummy page DMA alloc failed\n");
+        return false;
+    }
+    memset(gartCpu, 0, 1 << 20);
+    memset(dummyCpu, 0, 4096);
+
+    GfxhubParams gp;
+    memset(&gp, 0, sizeof(gp));
+    uint32_t fbBase = 0, fbTop = 0;
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_BASE, &fbBase);
+    mmhubRead(gpu, ipd, regMMMC_VM_FB_LOCATION_TOP, &fbTop);
+    gp.vramStart = (uint64_t)fbBase << 24;
+    gp.vramEnd = ((uint64_t)fbTop << 24) | 0xFFFFFF;
+    gp.gartStart = gp.vramEnd + 1;
+    gp.gartEnd = gp.gartStart + (512ull * 1024 * 1024) - 1;
+    gp.agpStart = gp.gartEnd + 1;
+    gp.agpEnd = gp.agpStart;
+    gp.gartTableBus = gartBus;
+    gp.dummyPageBus = dummyBus;
+    gfxhubGartEnable(gpu, cq, gp);
+
+    /* Stage code + kernarg + output in VRAM (FB-MC bump allocator). */
+    void *codeCpu = nullptr;
+    uint64_t codeGpu = 0, codeHandle = 0;
+    if (!rcpAllocVram(gpu, imgBytes, &codeCpu, &codeGpu, &codeHandle)) {
+        printf("  STAGE: ERROR code VRAM alloc failed\n");
+        return false;
+    }
+    memcpy(codeCpu, image.data(), (size_t)imgBytes);
+
+    void *kaCpu = nullptr;
+    uint64_t kaGpu = 0, kaHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &kaCpu, &kaGpu, &kaHandle)) {
+        printf("  STAGE: ERROR kernarg VRAM alloc failed\n");
+        return false;
+    }
+
+    void *outCpu = nullptr;
+    uint64_t outGpu = 0, outHandle = 0;
+    if (!rcpAllocVram(gpu, 4096, &outCpu, &outGpu, &outHandle)) {
+        printf("  STAGE: ERROR output VRAM alloc failed\n");
+        return false;
+    }
+
+    uint64_t codeVa = COMPUTE_VA_ROOT;
+    uint64_t kaVa = COMPUTE_VA_ROOT + (uint64_t)codePages * 0x1000;
+    uint64_t outVa = COMPUTE_VA_ROOT + (uint64_t)(codePages + 1) * 0x1000;
+    uint64_t codeEntryVa = codeVa +
+        ((uint64_t)kdSym->st_value + (uint64_t)kd.kernel_code_entry_byte_offset);
+
+    /* Fill the kernarg: [0:8] = output VA, [8:12] = u32 fill value. */
+    {
+        uint8_t *kb = (uint8_t *)kaCpu;
+        for (int b = 0; b < 8; b++)
+            kb[0 + b] = (uint8_t)((outVa >> (b * 8)) & 0xFF);
+        uint32_t val = KERN_FILL_VAL;
+        for (int b = 0; b < 4; b++)
+            kb[8 + b] = (uint8_t)((val >> (b * 8)) & 0xFF);
+    }
+
+    std::vector<GpuvmRegion> regions;
+    regions.reserve(codePages + 2);
+    for (uint32_t p = 0; p < codePages; p++)
+        regions.push_back({ codeVa + (uint64_t)p * 0x1000,
+                            codeGpu + (uint64_t)p * 0x1000 });
+    regions.push_back({ kaVa, kaGpu });
+    regions.push_back({ outVa, outGpu });
+
+    DispatchGpuvm pt;
+    memset(&pt, 0, sizeof(pt));
+    if (!buildComputeGpuvmMulti(gpu, cq, ctx.vramMcBase, regions.data(),
+                                (uint32_t)regions.size(), pt))
+        return false;
+
+    uint32_t c0 = gcReg(gpu, cq, regGCVM_CONTEXT0_CNTL, 0);
+    printf("  STAGE: GCVM_CONTEXT0_CNTL readback=0x%08X (enable=%u)\n",
+           c0, c0 & 1u);
+
+    /* kernarg_sgpr_index: slot 0 for fill_kernel (props=0x408). */
+    uint32_t slot = 0;
+    if (kd.kernel_code_properties & (1u << 0)) slot += 4;
+    if (kd.kernel_code_properties & (1u << 1)) slot += 2;
+    if (kd.kernel_code_properties & (1u << 2)) slot += 2;
+
+    /* Clear the fault status so the caller can read it after the dispatch. */
+    gpu.writeReg32((cq.gcBase0 + regGCVM_L2_PROTECTION_FAULT_STATUS) * 4, 0);
+    gpu.writeReg32((cq.gcBase0 + (regGCVM_L2_PROTECTION_FAULT_STATUS + 1)) * 4, 0);
+
+    out.codeEntryVa = codeEntryVa;
+    out.kaVa = kaVa;
+    out.outVa = outVa;
+    out.outCpu = outCpu;
+    out.rsrc1 = kd.compute_pgm_rsrc1;
+    out.rsrc2 = kd.compute_pgm_rsrc2;
+    out.rsrc3 = kd.compute_pgm_rsrc3;
+    out.sgprSlot = slot;
+    out.blockX = KERN_BLOCK_X;
+    out.fillN = KERN_FILL_N;
+    out.fillVal = KERN_FILL_VAL;
+    out.codePages = codePages;
+    out.gcBase0 = ipd.gcBase;
+    out.valid = true;
+
+    printf("  STAGE: code_entry=0x%llX ka_va=0x%llX out_va=0x%llX "
+           "code_pages=%u sgpr_slot=%u (GPUVM ready, queue NOT created)\n",
+           (unsigned long long)codeEntryVa, (unsigned long long)kaVa,
+           (unsigned long long)outVa, codePages, slot);
+    return true;
+}
+
+/* Build the dispatch PM4 dword vector for a staged kernel (the EXACT packet
+ * sequence recipeKernargDispatch builds: ACQUIRE_MEM full-invalidate +
+ * SET_SH_REG COMPUTE_PGM_LO/HI + RSRC1/2 + RSRC3 + TMPRING + RESTART +
+ * USER_DATA_<slot>=kernarg + RESOURCE_LIMITS + START/NUM_THREAD +
+ * DISPATCH_DIRECT(1,1,1, W32) + CS_PARTIAL_FLUSH + RELEASE_MEM(fenceGpu,1)).
+ * fenceGpu is the FB-MC address of the caller's 64-bit fence dword. The packet
+ * stream is queue-agnostic; the caller submits it via lite::SubmitDirectQueue
+ * (direct or MES-backed) -- the only queue-specific bits (ring wptr/doorbell)
+ * are handled inside lite::SubmitDirectQueue. */
+bool wddmBuildKernelDispatchPm4(const WddmKernelStage &stage, uint64_t fenceGpu,
+                                std::vector<uint32_t> &pm4)
+{
+    if (!stage.valid) return false;
+    pm4.clear();
+
+    uint64_t pgm = stage.codeEntryVa >> 8;
+    pm4AcquireMem(pm4);
+
+    uint32_t pgmLoHi[2] = { (uint32_t)(pgm & 0xFFFFFFFF),
+                            (uint32_t)((pgm >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(pm4, regCOMPUTE_PGM_LO, pgmLoHi, 2);
+
+    uint32_t rsrc12[2] = { stage.rsrc1, stage.rsrc2 };
+    pm4SetShReg(pm4, regCOMPUTE_PGM_RSRC1, rsrc12, 2);
+
+    uint32_t rsrc3 = stage.rsrc3;
+    pm4SetShReg(pm4, regCOMPUTE_PGM_RSRC3, &rsrc3, 1);
+
+    uint32_t tmpring = 0;
+    pm4SetShReg(pm4, regCOMPUTE_TMPRING_SIZE, &tmpring, 1);
+
+    uint32_t restart[3] = { 0, 0, 0 };
+    pm4SetShReg(pm4, regCOMPUTE_RESTART_X, restart, 3);
+
+    uint32_t userData[2] = { (uint32_t)(stage.kaVa & 0xFFFFFFFF),
+                             (uint32_t)((stage.kaVa >> 32) & 0xFFFFFFFF) };
+    pm4SetShReg(pm4, regCOMPUTE_USER_DATA_0 + stage.sgprSlot, userData, 2);
+
+    uint32_t resLimits = 0;
+    pm4SetShReg(pm4, regCOMPUTE_RESOURCE_LIMITS, &resLimits, 1);
+
+    uint32_t startBlock[8] = { 0, 0, 0, stage.blockX, 1, 1, 0, 0 };
+    pm4SetShReg(pm4, regCOMPUTE_START_X, startBlock, 8);
+
+    pm4DispatchDirect(pm4, 1, 1, 1, DISPATCH_INITIATOR_W32);
+    pm4EventWrite(pm4, CS_PARTIAL_FLUSH, EVENT_INDEX_CS_PARTIAL_FLUSH);
+    pm4ReleaseMemFence(pm4, fenceGpu, 1);
+    return true;
+}
+
+/* ======================================================================
  * Multi-workgroup compute dispatch (increment 3b) -- COV5 hidden args
  *
  * recipeKernargDispatch dispatched fill_kernel over a SINGLE workgroup, where

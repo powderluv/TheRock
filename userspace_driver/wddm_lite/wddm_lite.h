@@ -772,3 +772,68 @@ struct WddmIhState {
 
 bool wddmInitIh(WddmLite &gpu, const IpDiscoveryResult &ipd,
                 const WddmComputeContext &ctx, WddmIhState &ih);
+
+/* ======================================================================
+ * MES harness reuse surface (additive): stage the proven real-kernel GPUVM and
+ * build the dispatch PM4 so the "meskern" harness mode can route a REAL compute
+ * kernel through the lite:: MES-backed queue (instead of the direct-MMIO HQD
+ * that recipeKernargDispatch uses). recipeKernargDispatch itself is unchanged.
+ *
+ * Flow for the caller (meskern): wddmGfxBringUp() -> wddmStartMes() ->
+ * wddmStageKernelGpuvm() -> lite::CreateDirectQueue(use_mes_queue=true) ->
+ * wddmBuildKernelDispatchPm4() -> lite::SubmitDirectQueue() (+ the
+ * ROCR_WINDOWS_MES_MMIO_WPTR poke) -> poll the RELEASE_MEM fence -> verify
+ * out[0..fillN-1] == fillVal.
+ * ====================================================================== */
+
+/* Result of wddmStageKernelGpuvm(): the staged kernel's VAs + the dispatch
+ * parameters (RSRC1/2/3, kernarg SGPR slot, grid block size, expected output).
+ * outCpu is the CPU-mapped pointer to the output VRAM buffer for read-back. */
+struct WddmKernelStage {
+    uint64_t codeEntryVa;   /* COMPUTE_PGM source = code entry VA */
+    uint64_t kaVa;          /* kernarg base VA (USER_DATA_<sgprSlot>) */
+    uint64_t outVa;         /* output buffer VA */
+    void    *outCpu;        /* CPU pointer to the output buffer (read-back) */
+    uint32_t rsrc1;         /* KD compute_pgm_rsrc1 */
+    uint32_t rsrc2;         /* KD compute_pgm_rsrc2 */
+    uint32_t rsrc3;         /* KD compute_pgm_rsrc3 */
+    uint32_t sgprSlot;      /* USER_DATA slot index for the kernarg pointer */
+    uint32_t blockX;        /* threads per workgroup (COMPUTE_NUM_THREAD_X) */
+    uint32_t fillN;         /* number of output dwords to verify */
+    uint32_t fillVal;       /* expected output value (0xDEADBEEF) */
+    uint32_t codePages;     /* number of 4KB code pages staged */
+    uint32_t gcBase0;       /* GC base_idx0 (for the caller's fault-status read) */
+    bool     valid;
+};
+
+/* Stage the real-kernel GPUVM (steps 2-6 of recipeKernargDispatch) over the
+ * already-bootloaded GPU. Re-asserts MEC + re-inits the GFXHUB GART that
+ * AUTOLOAD_RLC reset, loads+parses fill_kernel_raw.co from fwDir, stages
+ * code/kernarg/output in VRAM, builds the GFXHUB page table, enables
+ * GCVM_CONTEXT0, and clears GCVM_L2_PROTECTION_FAULT_STATUS. It does NOT create
+ * a compute queue or submit -- the caller does that through lite::. Returns
+ * true and fills `out` on success. Must be called after wddmGfxBringUp().
+ * fwDir must contain fill_kernel_raw.co (e.g. Z:\winfw).
+ *
+ * skipMecReassert: when true, the stage does NOT run cqInitGfxForCompute (the
+ * MEC PFP/ME/MEC program-counter reload + the CP_MEC_RS64_CNTL PIPE0..3 pulse-
+ * reset + MEC re-enable). It only does the GFXHUB GART re-enable + page-table
+ * build + GCVM_CONTEXT0 enable + fault-status clear. Pass true from the meskern
+ * path where the MES has ALREADY mapped the compute queue onto a MEC HQD slot
+ * (lite::CreateDirectQueue use_mes_queue=true) BEFORE the stage runs: pulse-
+ * resetting the four MEC pipes there would wipe the MES-mapped HQD slot, and
+ * meskern never re-issues ADD_QUEUE to re-map it. The SH_MEM/RLC/TCP state
+ * cqInitGfxForCompute would re-assert is already live from wddmGfxBringUp's own
+ * cqInitGfxForCompute and persists across the GART reset, so skipping it is
+ * safe. Defaults to false so the proven direct-HQD callers are unchanged. */
+bool wddmStageKernelGpuvm(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                          const WddmComputeContext &ctx, const char *fwDir,
+                          WddmKernelStage &out, bool skipMecReassert = false);
+
+/* Build the dispatch PM4 dword vector for a staged kernel (the EXACT packet
+ * sequence recipeKernargDispatch builds, ending in RELEASE_MEM(fenceGpu,1)).
+ * fenceGpu is the FB-MC address of the caller's 64-bit fence dword. The stream
+ * is queue-agnostic; the caller submits it via lite::SubmitDirectQueue. Returns
+ * false if `stage` is not valid. */
+bool wddmBuildKernelDispatchPm4(const WddmKernelStage &stage, uint64_t fenceGpu,
+                                std::vector<uint32_t> &pm4);

@@ -558,32 +558,293 @@ int runDbProbe(const lite::DirectQueuePlatform &platform,
 }
 }  // namespace
 
+/* ------------------------------------------------------------------------- *
+ * mesmulti: MES multi-dispatch ceiling test (the #21 ~14-dispatch ceiling).
+ *
+ * Creates ONE MES-backed compute queue (CreateDirectQueue use_mes_queue=true),
+ * then submits N back-to-back NOP*4 + RELEASE_MEM(fence, seq) packets through
+ * lite::SubmitDirectQueue (each carries the ROCR_WINDOWS_MES_MMIO_WPTR poke
+ * inside SubmitDirectQueue's mes_backed branch), incrementing the fence value
+ * each submit and polling each fence to completion before the next submit.
+ *
+ * RING WRAP: each NOP*4+RELEASE_MEM block is exactly 16 dwords (4 * 2-dword NOP
+ * + 8-dword RELEASE_MEM). The MES-backed ring is kDirectComputeRingSize = 0x1000
+ * bytes = 1024 dwords, so it wraps every 1024/16 = 64 submits; 1024 submits is
+ * 16 full revolutions. We do NOT re-implement wrap handling here: the wrap is
+ * handled INSIDE lite::SubmitDirectQueue (it NOP-pads from the current offset to
+ * the ring end with a real PM4 TYPE-3 NOP, advances queue.wptr to the boundary,
+ * then writes the real block at offset 0 -- the #16 straddle fix). queue.wptr is
+ * the monotonic absolute wptr maintained by SubmitDirectQueue across calls, so
+ * back-to-back submits land contiguously and wrap correctly with no caller-side
+ * bookkeeping. We pass the SAME queue + a single shared fence buffer.
+ *
+ * Reports per stage: dispatches completed, where (if anywhere) it stalled, and
+ * the final rptr/wptr/fence. The max consecutive successes across all stages is
+ * the ceiling answer for the #21 blocker.
+ * ------------------------------------------------------------------------- */
+namespace {
+int runMesMulti(const lite::DirectQueuePlatform &platform,
+                lite::DirectQueueState &queue,
+                const lite::DirectQueueOptions &options, WddmLite &gpu,
+                const WddmIhState &ih) {
+  printf("\n=== mesmulti: MES multi-dispatch ceiling (NOP+fence x N) ===\n");
+  printf("queue qid=%u doorbell=0x%X mes_backed=%d ring=%u bytes (%u dwords)\n",
+         queue.queue_id, queue.doorbell_index, queue.mes_backed ? 1 : 0,
+         queue.ring_size_bytes, queue.ring_size_bytes / 4u);
+  printf("packet = NOP*4 + RELEASE_MEM = 16 dwords; ring wraps every %u "
+         "submits (handled inside lite::SubmitDirectQueue)\n",
+         (queue.ring_size_bytes / 4u) / 16u);
+
+  /* One shared 64-bit fence dword; each submit writes an incrementing value. */
+  void *fenceCpu = nullptr;
+  uint64_t fenceGpu = 0, fenceHandle = 0;
+  if (!wddmAllocVram(gpu, 4096, &fenceCpu, &fenceGpu, &fenceHandle)) {
+    printf("FAIL: fence buffer alloc\n");
+    return 1;
+  }
+  volatile uint64_t *fence = (volatile uint64_t *)fenceCpu;
+  *fence = 0;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  platform.FlushHdp();
+
+  const uint32_t stages[] = {16, 64, 256, 1024};
+  /* fenceSeq is monotonic across ALL stages (the fence dword is never reset, so
+   * RELEASE_MEM writes a strictly increasing value -- no ABA on the poll). */
+  uint64_t fenceSeq = 0;
+  uint64_t totalDone = 0;
+  uint64_t maxConsecutive = 0;
+  bool stalled = false;
+  uint64_t stallAt = 0;
+
+  for (uint32_t s = 0; s < sizeof(stages) / sizeof(stages[0]) && !stalled; s++) {
+    const uint32_t N = stages[s];
+    printf("\n--- stage: %u dispatches ---\n", N);
+    uint32_t doneThisStage = 0;
+    for (uint32_t i = 0; i < N; i++) {
+      fenceSeq += 1;
+      std::vector<uint32_t> pm4;
+      pm4Nop(pm4, 4);
+      pm4ReleaseMemFence(pm4, fenceGpu, fenceSeq);
+
+      hsa_status_t st = lite::SubmitDirectQueue(platform, queue, pm4.data(),
+                                                pm4.size(), options);
+      if (st != HSA_STATUS_SUCCESS) {
+        printf("  STALL: SubmitDirectQueue status=%u at dispatch %llu "
+               "(stage index %u)\n",
+               st, (unsigned long long)fenceSeq, i);
+        stalled = true;
+        stallAt = fenceSeq - 1;  /* last good one */
+        break;
+      }
+      /* Poll this submit's fence (>= seq tolerates a CP that has already raced
+       * ahead to a later value). 2s budget per dispatch. */
+      bool ok = false;
+      for (int t = 0; t < 2000; t++) {
+        if (*fence >= fenceSeq) { ok = true; break; }
+        ::Sleep(1);
+      }
+      if (!ok) {
+        uint32_t rptr = 0;
+        lite::ReadDirectQueueRptr(platform, queue, &rptr);
+        printf("  STALL: fence timeout at dispatch %llu (stage index %u); "
+               "fence=%llu expected>=%llu rptr=0x%X wptr=%llu\n",
+               (unsigned long long)fenceSeq, i, (unsigned long long)*fence,
+               (unsigned long long)fenceSeq, rptr,
+               (unsigned long long)queue.wptr);
+        stalled = true;
+        stallAt = fenceSeq - 1;
+        break;
+      }
+      doneThisStage++;
+      totalDone++;
+      if (totalDone > maxConsecutive) maxConsecutive = totalDone;
+    }
+    uint32_t rptr = 0;
+    lite::ReadDirectQueueRptr(platform, queue, &rptr);
+    printf("  stage %u: dispatches completed=%u/%u  final rptr=0x%X wptr=%llu "
+           "fence=%llu\n",
+           N, doneThisStage, N, rptr, (unsigned long long)queue.wptr,
+           (unsigned long long)*fence);
+    if (ih.configured)
+      dumpMesDiag(platform, queue, "mesmulti-stage", &ih);
+  }
+
+  printf("\n=== mesmulti summary ===\n");
+  printf("max consecutive successful dispatches: %llu\n",
+         (unsigned long long)maxConsecutive);
+  if (stalled)
+    printf("STALLED after %llu dispatches (next submit/fence at #%llu failed)\n",
+           (unsigned long long)stallAt, (unsigned long long)(stallAt + 1));
+  else
+    printf("NO STALL: all %llu dispatches (16+64+256+1024) completed -- no "
+           "multi-dispatch ceiling on the Windows MES path\n",
+           (unsigned long long)totalDone);
+  printf("LITE MES MULTI %s\n", stalled ? "FAIL (ceiling hit)"
+                                        : "PASS (no ceiling)");
+  return stalled ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ * meskern: a REAL compute kernel dispatched through the MES-backed queue.
+ *
+ * Reuses the PROVEN recipeKernargDispatch machinery via the wddm_lite helpers
+ * (wddmStageKernelGpuvm stages fill_kernel_raw.co + builds the GFXHUB page table
+ * + enables GCVM_CONTEXT0; wddmBuildKernelDispatchPm4 builds the dispatch PM4),
+ * but routes the DISPATCH through the lite:: MES-backed queue
+ * (lite::SubmitDirectQueue with the ROCR_WINDOWS_MES_MMIO_WPTR poke) instead of
+ * the direct-MMIO HQD. PASS iff the RELEASE_MEM fence signals AND the GPUVM
+ * fault status is 0 AND out[0..63] == 0xDEADBEEF.
+ *
+ * The GPUVM stage is done BEFORE the queue submit but the queue itself was
+ * already created by main (the MES mapped it once). The kernel dispatch is a
+ * single PM4 block (~69 dwords) submitted ONCE -- well inside the 1024-dword
+ * ring, so no wrap. The fence is the staged kernel's fence buffer.
+ * ------------------------------------------------------------------------- */
+int runMesKern(const lite::DirectQueuePlatform &platform,
+               lite::DirectQueueState &queue,
+               const lite::DirectQueueOptions &options, WddmLite &gpu,
+               const IpDiscoveryResult &ipd, const WddmComputeContext &ctx,
+               const char *fwDir, const WddmIhState &ih) {
+  printf("\n=== meskern: REAL kernel (fill_kernel) via the MES-backed queue "
+         "===\n");
+  printf("queue qid=%u doorbell=0x%X mes_backed=%d\n", queue.queue_id,
+         queue.doorbell_index, queue.mes_backed ? 1 : 0);
+
+  /* Stage the kernel GPUVM (code + kernarg + output + page table).
+   *
+   * skipMecReassert=true: main() already created the MES-backed queue
+   * (lite::CreateDirectQueue use_mes_queue=true), so the MES has mapped this
+   * compute queue onto a MEC HQD slot. Tell the stage NOT to pulse-reset the
+   * MEC pipes (cqInitGfxForCompute) -- that would wipe the MES-mapped HQD and
+   * meskern never re-issues ADD_QUEUE. The stage still does the GFXHUB GART
+   * re-enable + page-table build + GCVM_CONTEXT0 enable, which is what the
+   * real-kernel dispatch actually needs. */
+  WddmKernelStage stage;
+  if (!wddmStageKernelGpuvm(gpu, ipd, ctx, fwDir, stage,
+                            /*skipMecReassert=*/true)) {
+    printf("FAIL: wddmStageKernelGpuvm failed\n");
+    return 1;
+  }
+
+  /* Fence buffer (FB-MC addressable + CPU-mapped), separate from the queue. */
+  void *fenceCpu = nullptr;
+  uint64_t fenceGpu = 0, fenceHandle = 0;
+  if (!wddmAllocVram(gpu, 4096, &fenceCpu, &fenceGpu, &fenceHandle)) {
+    printf("FAIL: fence buffer alloc\n");
+    return 1;
+  }
+  volatile uint64_t *fence = (volatile uint64_t *)fenceCpu;
+  *fence = 0;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  platform.FlushHdp();
+
+  /* Build the dispatch PM4 (RELEASE_MEM writes value 1 to fenceGpu). */
+  std::vector<uint32_t> pm4;
+  if (!wddmBuildKernelDispatchPm4(stage, fenceGpu, pm4)) {
+    printf("FAIL: wddmBuildKernelDispatchPm4 failed\n");
+    return 1;
+  }
+  printf("  meskern: dispatch PM4 = %zu dwords; submitting via the MES-backed "
+         "queue\n", pm4.size());
+
+  hsa_status_t st = lite::SubmitDirectQueue(platform, queue, pm4.data(),
+                                            pm4.size(), options);
+  if (st != HSA_STATUS_SUCCESS) {
+    printf("FAIL: lite::SubmitDirectQueue status=%u\n", st);
+    if (ih.configured) dumpMesDiag(platform, queue, "meskern-submit-fail", &ih);
+    return 1;
+  }
+
+  /* Poll the fence (5s). */
+  bool ok = false;
+  for (int i = 0; i < 5000; i++) {
+    if (*fence == 1) { ok = true; break; }
+    ::Sleep(1);
+  }
+
+  /* HDP flush so the GPU's output writes are CPU-visible. */
+  platform.FlushHdp();
+
+  /* GPUVM fault status (GC base_idx0, regGCVM_L2_PROTECTION_FAULT_STATUS=0x15D0,
+   * the same register recipeKernargDispatch reads). */
+  uint32_t faultStatus = 0;
+  platform.ReadMmio32(stage.gcBase0, 0x15D0, &faultStatus);
+
+  uint32_t rptr = 0;
+  lite::ReadDirectQueueRptr(platform, queue, &rptr);
+
+  const volatile uint32_t *res = (const volatile uint32_t *)stage.outCpu;
+  uint32_t nbad = 0, firstBad = 0, firstBadVal = 0;
+  for (uint32_t i = 0; i < stage.fillN; i++) {
+    uint32_t v = res[i];
+    if (v != stage.fillVal) {
+      if (nbad == 0) { firstBad = i; firstBadVal = v; }
+      nbad++;
+    }
+  }
+
+  if (ih.configured)
+    dumpMesDiag(platform, queue, ok ? "meskern-PASS" : "meskern-FAIL", &ih);
+
+  printf("\nFAULT_STATUS=0x%08X FENCE value=%llu (expected 1) RPTR=0x%X\n",
+         faultStatus, (unsigned long long)*fence, rptr);
+  printf("out[0]=0x%08X out[1]=0x%08X expected=0x%08X bad=%u/%u\n", res[0],
+         res[1], stage.fillVal, nbad, stage.fillN);
+  if (nbad)
+    printf("  first mismatch at index %u: got 0x%08X\n", firstBad, firstBadVal);
+
+  bool pass = ok && (faultStatus == 0) && (nbad == 0);
+  printf("LITE MES KERN %s\n",
+         pass ? "PASS (fence signaled, no fault, output verified)"
+         : (!ok ? "FAIL (fence timeout)"
+            : (faultStatus ? "FAIL (GPUVM fault)" : "FAIL (output mismatch)")));
+  return pass ? 0 : 1;
+}
+}  // namespace
+
 int main(int argc, char *argv[]) {
   const char *fwDir = "Z:\\winfw";
   bool mesMode = false;
   bool dbProbeMode = false;
-  /* Args (order-independent): "mes" selects the MES queue path; "dbprobe"
-   * selects the doorbell-delivery isolation probe (direct HQD, MMIO baseline +
-   * doorbell-only); any other positional arg is the firmware dir. Default (no
-   * mode arg) = the proven direct HQD path, unchanged.
-   *   lite_direct_queue_test.exe mes Z:\\winfw
-   *   lite_direct_queue_test.exe dbprobe Z:\\winfw  */
+  bool mesMultiMode = false;
+  bool mesKernMode = false;
+  /* Args (order-independent): "mes" selects the single-NOP MES queue path;
+   * "mesmulti" runs the MES multi-dispatch ceiling test (N NOP+fence x
+   * 16/64/256/1024); "meskern" dispatches a REAL kernel through the MES-backed
+   * queue; "dbprobe" selects the doorbell-delivery isolation probe (direct HQD).
+   * Any other positional arg is the firmware dir. Default (no mode arg) = the
+   * proven direct HQD path, unchanged. mesmulti/meskern imply the MES bring-up.
+   *   lite_direct_queue_test.exe mes      Z:\\winfw
+   *   lite_direct_queue_test.exe mesmulti Z:\\winfw
+   *   lite_direct_queue_test.exe meskern  Z:\\winfw
+   *   lite_direct_queue_test.exe dbprobe  Z:\\winfw  */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "mes") == 0)
       mesMode = true;
+    else if (strcmp(argv[i], "mesmulti") == 0)
+      mesMultiMode = true;
+    else if (strcmp(argv[i], "meskern") == 0)
+      mesKernMode = true;
     else if (strcmp(argv[i], "dbprobe") == 0)
       dbProbeMode = true;
     else
       fwDir = argv[i];
   }
+  /* mesmulti/meskern both run over a MES-backed queue, so they share the MES
+   * bring-up (wddmStartMes + wddmInitIh + use_mes_queue) with the plain "mes"
+   * path. useMes drives the bring-up; the specific mode selects what runs after
+   * the queue is created. */
+  const bool useMes = mesMode || mesMultiMode || mesKernMode;
 
   printf("=== lite_direct_queue_test (ROCr lite:: NOP fence over wddm_lite) "
          "===\n");
   printf("Firmware dir: %s\n", fwDir);
   printf("Queue path  : %s\n",
-         dbProbeMode ? "DIRECT HQD (proven) [DBPROBE: doorbell-delivery probe]"
-         : mesMode    ? "MES (use_mes_queue=TRUE) [DIAGNOSTIC]"
-                      : "DIRECT HQD (proven)");
+         dbProbeMode  ? "DIRECT HQD (proven) [DBPROBE: doorbell-delivery probe]"
+         : mesMultiMode ? "MES (use_mes_queue=TRUE) [MESMULTI: ceiling test]"
+         : mesKernMode  ? "MES (use_mes_queue=TRUE) [MESKERN: real kernel]"
+         : mesMode      ? "MES (use_mes_queue=TRUE) [DIAGNOSTIC]"
+                        : "DIRECT HQD (proven)");
 
   WddmLite gpu;
   if (!gpu.open()) {
@@ -628,7 +889,7 @@ int main(int argc, char *argv[]) {
   WddmLiteDirectPlatform platform(gpu, ipd, ctx);
   WddmIhState ih;
   memset(&ih, 0, sizeof(ih));
-  if (mesMode) {
+  if (useMes) {
     bool mesUp = wddmStartMes(gpu, ipd, fwDir, ctx);
     printf("wddmStartMes -> %s\n",
            mesUp ? "MES pipes ACTIVE" : "MES NOT active (continuing for diag)");
@@ -636,7 +897,7 @@ int main(int argc, char *argv[]) {
     /* Increment 2: bring the IH ring up BEFORE the KIQ doorbell is rung (inside
      * lite::CreateDirectQueue -> EnsureMesScheduler), so we can observe whether
      * the doorbell generates an interrupt the IH ring captures. Additive +
-     * mesMode-only; the proven direct path never calls it. A false return is
+     * MES-only; the proven direct path never calls it. A false return is
      * reported but we CONTINUE (dumpMesDiag tolerates !ih.configured). */
     bool ihUp = wddmInitIh(gpu, ipd, ctx, ih);
     printf("wddmInitIh -> %s\n",
@@ -647,12 +908,12 @@ int main(int argc, char *argv[]) {
    * queue offset, and AllocateQueueMemory already returns vramMcBase+offset,
    * so the allocated path is self-consistent. */
   lite::DirectQueueOptions options;
-  options.use_mes_queue = mesMode;     /* DIAGNOSTIC: route through the MES KIQ */
+  options.use_mes_queue = useMes;      /* route through the MES KIQ */
   options.use_firmware_dequeue = true;
-  /* In MES mode force verbose tracing so EnsureMesScheduler/SubmitMesApiFrame
+  /* In MES modes force verbose tracing so EnsureMesScheduler/SubmitMesApiFrame
    * dump CP_MES_CNTL + KIQ ring + SET_HW_RESOURCES/ADD_QUEUE fence state. */
-  options.trace = mesMode || dbProbeMode || (getenv("LITE_TRACE") != nullptr);
-  options.trace_verbose = mesMode || (getenv("LITE_TRACE_VERBOSE") != nullptr);
+  options.trace = useMes || dbProbeMode || (getenv("LITE_TRACE") != nullptr);
+  options.trace_verbose = useMes || (getenv("LITE_TRACE_VERBOSE") != nullptr);
   options.trace_prefix = "lite_direct_queue_test";
 
   lite::DirectQueueState queue;
@@ -660,22 +921,40 @@ int main(int argc, char *argv[]) {
                                             ctx.vramMcBase, options);
   if (st != HSA_STATUS_SUCCESS) {
     printf("FAIL: lite::CreateDirectQueue status=%u\n", st);
-    /* In MES mode the failure is usually inside EnsureMesScheduler (KIQ never
+    /* In MES modes the failure is usually inside EnsureMesScheduler (KIQ never
      * activates / SET_HW_RESOURCES times out). Dump the MES engine state so the
      * stall is diagnosable even though the queue was never mapped. */
-    if (mesMode) dumpMesDiag(platform, queue, "create-failed", &ih);
+    if (useMes) dumpMesDiag(platform, queue, "create-failed", &ih);
     return 1;
   }
   printf("lite::CreateDirectQueue OK: qid=%u doorbell=0x%X ring_gpu=0x%llX\n",
          queue.queue_id, queue.doorbell_index,
          (unsigned long long)queue.ring_gpu);
-  if (mesMode) dumpMesDiag(platform, queue, "post-create", &ih);
+  if (useMes) dumpMesDiag(platform, queue, "post-create", &ih);
 
   /* dbprobe mode: run the doorbell-delivery isolation on this proven direct HQD
    * (MMIO baseline then doorbell-only), then tear down + exit. Never touches the
    * MES path. */
   if (dbProbeMode) {
     int rc = runDbProbe(platform, queue, options, gpu);
+    lite::DestroyDirectQueue(platform, queue, options);
+    gpu.close();
+    return rc;
+  }
+
+  /* mesmulti mode: MES multi-dispatch ceiling test (NOP+fence x 16/64/256/1024)
+   * over the MES-backed queue, then tear down + exit. */
+  if (mesMultiMode) {
+    int rc = runMesMulti(platform, queue, options, gpu, ih);
+    lite::DestroyDirectQueue(platform, queue, options);
+    gpu.close();
+    return rc;
+  }
+
+  /* meskern mode: dispatch a REAL kernel (fill_kernel) through the MES-backed
+   * queue, then tear down + exit. */
+  if (mesKernMode) {
+    int rc = runMesKern(platform, queue, options, gpu, ipd, ctx, fwDir, ih);
     lite::DestroyDirectQueue(platform, queue, options);
     gpu.close();
     return rc;
