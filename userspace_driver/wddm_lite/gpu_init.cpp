@@ -4960,12 +4960,41 @@ bool wddmEnsureDoorbellAperture(WddmLite &gpu, const IpDiscoveryResult &ipd)
     gpu.readReg32((nbifBase2 + regRCC_DOORBELL_APER_EN) * 4, &apEn);
     gpu.writeReg32((nbifBase2 + regRCC_DOORBELL_APER_EN) * 4,
                    apEn | BIF_DOORBELL_APER_EN__BIT);
+    /* GC doorbell self-ring S2A entries (GDC_S2A0_S2A_DOORBELL_ENTRY_0/3_CTRL).
+     * Without these, a host doorbell write reaches the BAR aperture but is NOT
+     * forwarded onto the on-die GC doorbell fabric, so the MES never sees the
+     * KIQ doorbell. amdgpu programs these in nbif_v6_3_1_gc_doorbell_init and
+     * the Linux lite:: transport does too. The direct MEC HQD works without
+     * them (it advances via the MMIO wptr/poll), but the MES KIQ only watches
+     * the doorbell -> required for MES KIQ servicing. */
+    gpu.writeReg32((nbifBase2 + 0x01cb) * 4, (1u << 0) | (3u << 1) | (3u << 28));
+    gpu.writeReg32((nbifBase2 + 0x01ce) * 4, (1u << 0) | (6u << 1) | (3u << 28));
     uint32_t fbEn = 0;
     gpu.readReg32((nbifBase2 + regBIF_FB_EN) * 4, &fbEn);
     gpu.writeReg32((nbifBase2 + regBIF_FB_EN) * 4,
                    fbEn | BIF_FB_EN__FB_READ_EN | BIF_FB_EN__FB_WRITE_EN);
-    printf("  wddmEnsureDoorbellAperture: doorbell aperture + framebuffer "
-           "enabled (NBIF base[2]=0x%04X)\n", nbifBase2);
+    /* Doorbell self-ring GPA aperture -- the ONE doorbell-routing register
+     * amdgpu programs (nbif_v6_3_1_enable_doorbell_selfring_aperture) that the
+     * lite:: path omits. Without it, a doorbell write lands in the BAR but is
+     * never routed back to the CP/MES doorbell monitor, so the MES never sees
+     * the KIQ doorbell (the direct MEC HQD does not need it). BASE must be the
+     * doorbell BAR address the GPU/NBIF sees -- under VM passthrough that is the
+     * guest-physical BAR2 base (info.Bars[2].PhysicalAddress). CNTL = EN|MODE. */
+    AMDGPU_ESCAPE_GET_INFO_DATA info = {};
+    unsigned long long dbBase = 0;
+    if (gpu.getInfo(&info)) dbBase = (unsigned long long)info.Bars[2].PhysicalAddress.QuadPart;
+    gpu.writeReg32((nbifBase2 + 0x00f4) * 4, (uint32_t)(dbBase & 0xFFFFFFFFull));
+    gpu.writeReg32((nbifBase2 + 0x00f3) * 4, (uint32_t)(dbBase >> 32));
+    gpu.writeReg32((nbifBase2 + 0x00f5) * 4, 0x3u);
+    uint32_t s2a0 = 0, s2a3 = 0, srC = 0, srL = 0, srH = 0;
+    gpu.readReg32((nbifBase2 + 0x01cb) * 4, &s2a0);
+    gpu.readReg32((nbifBase2 + 0x01ce) * 4, &s2a3);
+    gpu.readReg32((nbifBase2 + 0x00f5) * 4, &srC);
+    gpu.readReg32((nbifBase2 + 0x00f4) * 4, &srL);
+    gpu.readReg32((nbifBase2 + 0x00f3) * 4, &srH);
+    printf("  wddmEnsureDoorbellAperture: NBIF base[2]=0x%04X dbBAR=0x%llX "
+           "S2A0=0x%08X S2A3=0x%08X SELFRING cntl=0x%08X base=0x%08X%08X\n",
+           nbifBase2, dbBase, s2a0, s2a3, srC, srH, srL);
     return true;
 }
 
