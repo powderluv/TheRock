@@ -310,6 +310,22 @@ typedef struct _AMDGPU_ESCAPE_GET_PROCESS_APERTURES_DATA {
     ULONGLONG   GpuVmLimit;
 } AMDGPU_ESCAPE_GET_PROCESS_APERTURES_DATA;
 
+/* ENABLE_MSI: register the IH ring (allocated via ALLOC_DMA) with the kernel
+ * driver ISR. IhRingDmaHandle is the ALLOC_DMA handle (the driver treats it as
+ * the DmaAllocs[] index). Rptr/WptrRegOffset are MMIO byte offsets into the
+ * MMIO BAR (i.e. (ihBase + regIH_RB_RPTR/WPTR) * 4). Mirrors the driver's
+ * AMDGPU_ESCAPE_ENABLE_MSI_DATA (wddm_driver/amdgpu_wddm.h) byte-for-byte. */
+typedef struct _AMDGPU_ESCAPE_ENABLE_MSI_DATA {
+    AMDGPU_ESCAPE_HEADER Header;
+    PVOID       IhRingDmaHandle;
+    ULONG       IhRingSize;
+    ULONG       IhRptrRegOffset;
+    ULONG       IhWptrRegOffset;
+    BOOLEAN     Enabled;
+    UCHAR       Reserved[3];
+    ULONG       NumVectors;
+} AMDGPU_ESCAPE_ENABLE_MSI_DATA;
+
 /* ======================================================================
  * WddmLite - Userspace GPU access class
  * ====================================================================== */
@@ -334,6 +350,13 @@ public:
     bool readVram(uint64_t offset, uint64_t length, void *buffer);
     bool allocDma(uint64_t size, void **cpuAddr, uint64_t *busAddr, void **handle);
     bool freeDma(void *handle);
+
+    /* Register an IH ring (from allocDma) with the kernel ISR. ihHandle is the
+     * allocDma handle; rptr/wptrByteOffset are MMIO byte offsets. On success
+     * *enabled / *numVectors report the driver's MSI state. */
+    bool enableMsi(void *ihHandle, uint32_t ihRingSize,
+                   uint32_t rptrByteOffset, uint32_t wptrByteOffset,
+                   bool *enabled, uint32_t *numVectors);
 
     /* Compute escapes */
     bool allocMemory(uint64_t size, uint32_t flags, void **cpuAddr,
@@ -701,3 +724,51 @@ bool wddmEnsureDoorbellAperture(WddmLite &gpu, const IpDiscoveryResult &ipd);
  * the no-arg/direct harness path never calls it. */
 bool wddmStartMes(WddmLite &gpu, const IpDiscoveryResult &ipd,
                   const char *fwDir, const WddmComputeContext &ctx);
+
+/* ======================================================================
+ * MES-on-Windows increment 2: IH (interrupt handler) ring setup.
+ *
+ * wddmInitIh() ports python/.../windows/ih_init.py init_ih() into wddm_lite.
+ * It allocates the IH ring + a WPTR-writeback dword in SYSTEM memory (allocDma,
+ * GPU writes via PCIe bus address), resolves the IH/OSSSYS register base from
+ * IP discovery (ipd.ihBase), and programs the IH v7.0 registers so the GPU
+ * delivers 32-byte interrupt entries to the ring:
+ *   IH_RB_BASE/HI    = ring_bus_addr >> 8 / >> 40
+ *   IH_RB_CNTL       = MC_SPACE(bus) | RB_SIZE(log2(size/4)) | ENABLE_INTR
+ *                      | WPTR_OVERFLOW_CLEAR/ENABLE | WPTR_WRITEBACK_ENABLE
+ *                      | MC_SNOOP | RPTR_REARM   (mirrors ih_init.py _setup_ring)
+ *   IH_RB_WPTR_ADDR_LO/HI = wptr writeback bus addr
+ *   IH_RB_RPTR/WPTR  = 0
+ *   IH_DOORBELL_RPTR = 0 (no doorbell-driven RPTR; ring is WPTR-writeback)
+ * Then NBIO interrupt control (INTERRUPT_CNTL2 dummy page + INTERRUPT_CNTL
+ * dummy-read-override/non-snoop) and the ENABLE_MSI escape to hand the ring to
+ * the kernel ISR. The state lives in WddmIhState (fields filled on success).
+ *
+ * This is the DIAGNOSTIC MES KIQ-servicing probe: with the IH ring live before
+ * the KIQ doorbell is rung, dumpMesDiag can observe whether IH_RB_WPTR advances
+ * (doorbell -> interrupt -> IH path works) or stays 0 (no interrupt generated).
+ *
+ * Additive + only called on the harness "mes" path (after wddmStartMes, before
+ * lite::CreateDirectQueue). Returns true if the ring was programmed (ENABLE_MSI
+ * success is reported in WddmIhState.msiEnabled but NOT required for success,
+ * since the MES may consume the ring on-GPU without the host ISR). */
+struct WddmIhState {
+    uint32_t ihBase;        /* OSSSYS/IH register base (dword); ipd.ihBase */
+
+    void    *ringCpu;       /* IH ring CPU VA (system memory) */
+    uint64_t ringBus;       /* IH ring PCIe bus address */
+    void    *ringHandle;    /* allocDma handle */
+    uint32_t ringSize;      /* bytes (power of two) */
+
+    void    *wptrCpu;       /* WPTR-writeback CPU VA */
+    uint64_t wptrBus;       /* WPTR-writeback bus address */
+    void    *wptrHandle;    /* allocDma handle */
+
+    uint32_t rbCntl;        /* programmed IH_RB_CNTL value */
+    bool     msiEnabled;    /* ENABLE_MSI escape reported Enabled */
+    uint32_t numVectors;    /* ENABLE_MSI vector count */
+    bool     configured;    /* ring programmed (registers written) */
+};
+
+bool wddmInitIh(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                const WddmComputeContext &ctx, WddmIhState &ih);

@@ -315,6 +315,24 @@ bool WddmLite::freeDma(void *handle)
     return escape(&data, sizeof(data));
 }
 
+bool WddmLite::enableMsi(void *ihHandle, uint32_t ihRingSize,
+                         uint32_t rptrByteOffset, uint32_t wptrByteOffset,
+                         bool *enabled, uint32_t *numVectors)
+{
+    AMDGPU_ESCAPE_ENABLE_MSI_DATA data = {};
+    data.Header.Command = AMDGPU_ESCAPE_ENABLE_MSI;
+    data.Header.Size = sizeof(data);
+    data.IhRingDmaHandle = ihHandle;
+    data.IhRingSize = ihRingSize;
+    data.IhRptrRegOffset = rptrByteOffset;
+    data.IhWptrRegOffset = wptrByteOffset;
+
+    if (!escape(&data, sizeof(data))) return false;
+    if (enabled) *enabled = (data.Enabled != 0);
+    if (numVectors) *numVectors = data.NumVectors;
+    return true;
+}
+
 bool WddmLite::allocMemory(uint64_t size, uint32_t flags, void **cpuAddr,
                             uint64_t *gpuAddr, uint64_t *handle)
 {

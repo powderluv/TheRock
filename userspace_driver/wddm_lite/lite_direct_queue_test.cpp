@@ -200,6 +200,11 @@ constexpr uint32_t regCP_HQD_ACTIVE_D = 0x1FAB;
 constexpr uint32_t regCP_HQD_PQ_RPTR_D = 0x1FB3;
 constexpr uint32_t regCP_HQD_PQ_WPTR_LO_D = 0x1FDF;
 
+/* IH v7.0 register DWORD offsets relative to OSSSYS/IH base (ih_init.py). The
+ * IH base is NOT the GC base -- it is ipd.ihBase, carried via WddmIhState. */
+constexpr uint32_t regIH_RB_RPTR_D = 0x0081;
+constexpr uint32_t regIH_RB_WPTR_D = 0x0082;
+
 void mesSelectHqd(const lite::DirectQueuePlatform &p, uint32_t me, uint32_t pipe,
                   uint32_t hqd) {
   uint32_t v = ((pipe & 0x3) << 0) | ((me & 0x3) << 2) | ((hqd & 0x7) << 8);
@@ -210,7 +215,8 @@ void mesDeselectHqd(const lite::DirectQueuePlatform &p) {
 }
 
 void dumpMesDiag(const lite::DirectQueuePlatform &p,
-                 const lite::DirectQueueState &queue, const char *phase) {
+                 const lite::DirectQueueState &queue, const char *phase,
+                 const WddmIhState *ih = nullptr) {
   uint32_t mesCntl = 0, version = 0, sched = 0, hdr = 0, ip = 0;
   p.ReadMmio32(kGcB1, regCP_MES_CNTL_D, &mesCntl);
   p.ReadMmio32(kGcB1, regCP_MES_GP3_LO_D, &version);
@@ -242,6 +248,40 @@ void dumpMesDiag(const lite::DirectQueuePlatform &p,
          "vram_wptr=%llu vram_rptr=%llu\n",
          phase, queue.queue_id, queue.doorbell_index, queue.mes_backed ? 1 : 0,
          (unsigned long long)qWptr, (unsigned long long)qRptr);
+
+  /* IH ring state -- the KEY new signal for the KIQ-doorbell-servicing probe.
+   * IH_RB_WPTR (MMIO) is the hardware write pointer; the writeback dword is the
+   * GPU's snooped copy of it (MC_SNOOP + WPTR_WRITEBACK_ENABLE). If EITHER
+   * advances after the KIQ doorbell is rung, the doorbell -> interrupt -> IH
+   * path WORKS and the residual blocker is the MES consuming the ring. If both
+   * stay 0, the doorbell is not generating an interrupt (or the ring is
+   * misprogrammed / routing disabled). RPTR is the kernel ISR's drain pointer. */
+  if (ih != nullptr && ih->configured) {
+    uint32_t ihWptrMmio = 0, ihRptrMmio = 0;
+    p.ReadMmio32(ih->ihBase, regIH_RB_WPTR_D, &ihWptrMmio);
+    p.ReadMmio32(ih->ihBase, regIH_RB_RPTR_D, &ihRptrMmio);
+    uint32_t ihWptrWb =
+        ih->wptrCpu ? *(volatile uint32_t *)ih->wptrCpu : 0xFFFFFFFFu;
+    printf("  [MES %s] IH ring base=0x%04X IH_RB_CNTL=0x%08X msi_enabled=%d "
+           "IH_RB_WPTR(mmio)=0x%X wptr_writeback=0x%X IH_RB_RPTR(mmio)=0x%X\n",
+           phase, ih->ihBase, ih->rbCntl, ih->msiEnabled ? 1 : 0, ihWptrMmio,
+           ihWptrWb, ihRptrMmio);
+    /* Dump the first few 32-byte ring entries (8 dwords each). DW[0] decodes as
+     * client_id[7:0] / source_id[15:8] / ring_id[23:16] / vmid[27:24]. */
+    if (ih->ringCpu != nullptr) {
+      const uint32_t *ring = (const uint32_t *)ih->ringCpu;
+      for (uint32_t e = 0; e < 4; e++) {
+        const uint32_t *ent = ring + e * 8;
+        uint32_t dw0 = ent[0];
+        printf("    IH entry[%u] DW0=0x%08X (client=0x%02X src=0x%02X "
+               "ring=0x%02X vmid=%u) DW[1..3]=0x%08X 0x%08X 0x%08X\n",
+               e, dw0, dw0 & 0xFF, (dw0 >> 8) & 0xFF, (dw0 >> 16) & 0xFF,
+               (dw0 >> 24) & 0xF, ent[1], ent[2], ent[3]);
+      }
+    }
+  } else {
+    printf("  [MES %s] IH ring: not configured (no IH diagnostics)\n", phase);
+  }
 }
 }  // namespace
 
@@ -305,10 +345,21 @@ int main(int argc, char *argv[]) {
    * never calls it. A false return (pipes not ACTIVE) is reported but we
    * CONTINUE so EnsureMesScheduler's own diagnostics still print. */
   WddmLiteDirectPlatform platform(gpu, ipd, ctx);
+  WddmIhState ih;
+  memset(&ih, 0, sizeof(ih));
   if (mesMode) {
     bool mesUp = wddmStartMes(gpu, ipd, fwDir, ctx);
     printf("wddmStartMes -> %s\n",
            mesUp ? "MES pipes ACTIVE" : "MES NOT active (continuing for diag)");
+
+    /* Increment 2: bring the IH ring up BEFORE the KIQ doorbell is rung (inside
+     * lite::CreateDirectQueue -> EnsureMesScheduler), so we can observe whether
+     * the doorbell generates an interrupt the IH ring captures. Additive +
+     * mesMode-only; the proven direct path never calls it. A false return is
+     * reported but we CONTINUE (dumpMesDiag tolerates !ih.configured). */
+    bool ihUp = wddmInitIh(gpu, ipd, ctx, ih);
+    printf("wddmInitIh -> %s\n",
+           ihUp ? "IH ring live" : "IH ring NOT configured (continuing)");
   }
 
   /* lite:: direct queue. framebuffer_base = vramMcBase: lite:: adds it to the
@@ -331,13 +382,13 @@ int main(int argc, char *argv[]) {
     /* In MES mode the failure is usually inside EnsureMesScheduler (KIQ never
      * activates / SET_HW_RESOURCES times out). Dump the MES engine state so the
      * stall is diagnosable even though the queue was never mapped. */
-    if (mesMode) dumpMesDiag(platform, queue, "create-failed");
+    if (mesMode) dumpMesDiag(platform, queue, "create-failed", &ih);
     return 1;
   }
   printf("lite::CreateDirectQueue OK: qid=%u doorbell=0x%X ring_gpu=0x%llX\n",
          queue.queue_id, queue.doorbell_index,
          (unsigned long long)queue.ring_gpu);
-  if (mesMode) dumpMesDiag(platform, queue, "post-create");
+  if (mesMode) dumpMesDiag(platform, queue, "post-create", &ih);
 
   /* A separate fence buffer (FB-MC addressable + CPU mapped). */
   void *fenceCpu = nullptr;
@@ -371,7 +422,7 @@ int main(int argc, char *argv[]) {
   lite::ReadDirectQueueRptr(platform, queue, &rptr);
 
   if (mesMode) dumpMesDiag(platform, queue, ok ? "post-submit-PASS"
-                                               : "post-submit-FAIL");
+                                               : "post-submit-FAIL", &ih);
 
   printf("\nFENCE value=%llu (expected 1) RPTR=0x%X\n",
          (unsigned long long)*fence, rptr);

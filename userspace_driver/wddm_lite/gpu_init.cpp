@@ -5031,6 +5031,207 @@ bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
 }
 
 /* ======================================================================
+ * MES-on-Windows increment 2: IH (interrupt handler) ring setup.
+ *
+ * Faithful C++ port of python/.../windows/ih_init.py init_ih() (the proven IH
+ * v7.0 ring setup for Navi 48 / gfx1201). The IH ring + WPTR-writeback dword
+ * live in SYSTEM memory (allocDma -> PCIe bus address); the GPU writes 32-byte
+ * interrupt entries there and mirrors the hardware WPTR into the writeback
+ * dword (MC_SNOOP + WPTR_WRITEBACK_ENABLE). All IH MMIO uses
+ *     byte_offset = (ipd.ihBase + reg_dword) * 4   (BAR0, like mmhubRead/pspRead)
+ * ====================================================================== */
+
+/* IH v7.0 register DWORD offsets relative to OSSSYS base (osssys_7_0_0_offset.h,
+ * ih_init.py). */
+#define regIH_RB_CNTL          0x0080
+#define regIH_RB_RPTR          0x0081
+#define regIH_RB_WPTR          0x0082
+#define regIH_RB_BASE          0x0083
+#define regIH_RB_BASE_HI       0x0084
+#define regIH_RB_WPTR_ADDR_HI  0x0085
+#define regIH_RB_WPTR_ADDR_LO  0x0086
+#define regIH_DOORBELL_RPTR    0x0087
+#define regIH_CNTL             0x00A8
+#define regIH_INT_FLOOD_CNTL   0x00D5
+#define regIH_MSI_STORM_CTRL   0x00F1
+
+/* IH_RB_CNTL bit fields (ih_init.py). */
+#define IH_RB_CNTL__RB_SIZE__SHIFT       1
+#define IH_RB_CNTL__MC_SPACE__SHIFT      4
+#define IH_RB_CNTL__ENABLE_INTR          (1u << 0)
+#define IH_RB_CNTL__WPTR_OVERFLOW_ENABLE (1u << 8)
+#define IH_RB_CNTL__WPTR_WRITEBACK_ENABLE (1u << 12)
+#define IH_RB_CNTL__MC_SNOOP             (1u << 14)
+#define IH_RB_CNTL__RPTR_REARM           (1u << 15)
+#define IH_RB_CNTL__WPTR_OVERFLOW_CLEAR  (1u << 31)
+
+#define IH_MC_SPACE_BUS_ADDR  2   /* PCIe bus address (system memory ring) */
+
+/* NBIO interrupt-control registers (NBIF base_idx 2, nbio_init.py). */
+#define regINTERRUPT_CNTL      0x00F1
+#define regINTERRUPT_CNTL2     0x00F2
+#define IH_DUMMY_RD_OVERRIDE   0x00000001
+#define IH_REQ_NONSNOOP_EN     0x00000008
+
+#define IH_RING_SIZE_DEFAULT   (256 * 1024)   /* 256KB, 8192 entries */
+
+/* IH register access: byte_offset = (ihBase + reg) * 4, BAR0. */
+static uint32_t ihReg(WddmLite &gpu, const WddmIhState &ih, uint32_t reg)
+{
+    uint32_t v = 0;
+    gpu.readReg32((ih.ihBase + reg) * 4, &v);
+    return v;
+}
+
+static void ihWreg(WddmLite &gpu, const WddmIhState &ih, uint32_t reg,
+                   uint32_t val)
+{
+    gpu.writeReg32((ih.ihBase + reg) * 4, val);
+}
+
+bool wddmInitIh(WddmLite &gpu, const IpDiscoveryResult &ipd,
+                const WddmComputeContext &ctx, WddmIhState &ih)
+{
+    printf("\n=== wddmInitIh (DIAGNOSTIC IH ring for MES KIQ servicing) ===\n");
+
+    memset(&ih, 0, sizeof(ih));
+    ih.ihBase = ipd.ihBase;
+    ih.ringSize = IH_RING_SIZE_DEFAULT;
+
+    if (ih.ihBase == 0) {
+        printf("  wddmInitIh: IH/OSSSYS base is 0 (not enumerated); aborting\n");
+        return false;
+    }
+    printf("  wddmInitIh: IH base = 0x%04X\n", ih.ihBase);
+
+    /* Allocate the IH ring (system memory; GPU writes via PCIe bus addr). */
+    if (!gpu.allocDma(ih.ringSize, &ih.ringCpu, &ih.ringBus, &ih.ringHandle)) {
+        printf("  wddmInitIh: allocDma(ring %u KB) failed\n",
+               ih.ringSize / 1024);
+        return false;
+    }
+    memset(ih.ringCpu, 0, ih.ringSize);
+
+    /* Allocate the WPTR-writeback dword (one page). */
+    void *wptrCpu = nullptr;
+    if (!gpu.allocDma(4096, &wptrCpu, &ih.wptrBus, &ih.wptrHandle)) {
+        printf("  wddmInitIh: allocDma(wptr page) failed\n");
+        return false;
+    }
+    ih.wptrCpu = wptrCpu;
+    *(volatile uint32_t *)wptrCpu = 0;
+
+    /* Dummy page for NBIO interrupt coalescing (setup_interrupt_control). */
+    void *dummyCpu = nullptr; uint64_t dummyBus = 0; void *dummyHandle = nullptr;
+    if (!gpu.allocDma(4096, &dummyCpu, &dummyBus, &dummyHandle)) {
+        printf("  wddmInitIh: allocDma(dummy page) failed\n");
+        return false;
+    }
+
+    printf("  wddmInitIh: ring bus=0x%012llX wptr bus=0x%012llX dummy bus="
+           "0x%012llX\n",
+           (unsigned long long)ih.ringBus, (unsigned long long)ih.wptrBus,
+           (unsigned long long)dummyBus);
+
+    /* Disable interrupts during setup (ih_v7_0_toggle_interrupts(false)). */
+    {
+        uint32_t v = ihReg(gpu, ih, regIH_RB_CNTL);
+        v &= ~IH_RB_CNTL__ENABLE_INTR;
+        ihWreg(gpu, ih, regIH_RB_CNTL, v);
+    }
+
+    /* NBIO interrupt control (setup_interrupt_control): dummy page + flags.
+     * NBIF base_idx 2 (same base wddmEnsureDoorbellAperture uses). */
+    if (ctx.hasNbif && ctx.nbifBase2 != 0) {
+        gpu.writeReg32((ctx.nbifBase2 + regINTERRUPT_CNTL2) * 4,
+                       (uint32_t)(dummyBus >> 8));
+        uint32_t icntl = 0;
+        gpu.readReg32((ctx.nbifBase2 + regINTERRUPT_CNTL) * 4, &icntl);
+        icntl |= IH_DUMMY_RD_OVERRIDE | IH_REQ_NONSNOOP_EN;
+        gpu.writeReg32((ctx.nbifBase2 + regINTERRUPT_CNTL) * 4, icntl);
+        printf("  wddmInitIh: NBIO INTERRUPT_CNTL=0x%08X (dummy page set)\n",
+               icntl);
+    } else {
+        printf("  wddmInitIh: WARNING no NBIF base; skipping NBIO interrupt "
+               "control\n");
+    }
+
+    /* Program IH ring registers (_setup_ring). */
+    ihWreg(gpu, ih, regIH_RB_BASE, (uint32_t)((ih.ringBus >> 8) & 0xFFFFFFFF));
+    ihWreg(gpu, ih, regIH_RB_BASE_HI, (uint32_t)((ih.ringBus >> 40) & 0xFF));
+
+    uint32_t sizeLog2 = cqLog2(ih.ringSize / 4);   /* log2(entries dwords) */
+    uint32_t cntl = 0;
+    cntl |= IH_MC_SPACE_BUS_ADDR << IH_RB_CNTL__MC_SPACE__SHIFT;
+    cntl |= (sizeLog2 & 0x3F) << IH_RB_CNTL__RB_SIZE__SHIFT;
+    cntl |= IH_RB_CNTL__WPTR_OVERFLOW_CLEAR;
+    cntl |= IH_RB_CNTL__WPTR_OVERFLOW_ENABLE;
+    cntl |= IH_RB_CNTL__WPTR_WRITEBACK_ENABLE;
+    cntl |= IH_RB_CNTL__MC_SNOOP;
+    cntl |= IH_RB_CNTL__RPTR_REARM;
+    ihWreg(gpu, ih, regIH_RB_CNTL, cntl);
+    ih.rbCntl = cntl;
+
+    ihWreg(gpu, ih, regIH_RB_WPTR_ADDR_LO,
+           (uint32_t)(ih.wptrBus & 0xFFFFFFFF));
+    ihWreg(gpu, ih, regIH_RB_WPTR_ADDR_HI,
+           (uint32_t)((ih.wptrBus >> 32) & 0xFFFF));
+
+    ihWreg(gpu, ih, regIH_RB_RPTR, 0);
+    ihWreg(gpu, ih, regIH_RB_WPTR, 0);
+
+    /* No doorbell-driven RPTR: this ring is WPTR-writeback only. Clear any
+     * stale IH_DOORBELL_RPTR routing (deliverable's "clear doorbell-rptr").
+     * ih_init.py leaves IH_DOORBELL_RPTR untouched (it never enables doorbell
+     * mode); writing 0 is a safe no-op-equivalent that disables it. */
+    ihWreg(gpu, ih, regIH_DOORBELL_RPTR, 0);
+
+    /* Flood control + MSI storm control (ih_init.py). */
+    {
+        uint32_t v = ihReg(gpu, ih, regIH_INT_FLOOD_CNTL);
+        v |= (1u << 0);   /* FLOOD_CNTL_ENABLE */
+        ihWreg(gpu, ih, regIH_INT_FLOOD_CNTL, v);
+    }
+    ihWreg(gpu, ih, regIH_MSI_STORM_CTRL, 3);
+
+    /* Enable interrupts (ih_v7_0_toggle_interrupts(true)). */
+    {
+        uint32_t v = ihReg(gpu, ih, regIH_RB_CNTL);
+        v |= IH_RB_CNTL__ENABLE_INTR;
+        ihWreg(gpu, ih, regIH_RB_CNTL, v);
+        ih.rbCntl = v;
+    }
+
+    uint32_t rbCntlRb = ihReg(gpu, ih, regIH_RB_CNTL);
+    printf("  wddmInitIh: IH_RB_CNTL programmed=0x%08X readback=0x%08X "
+           "(size_log2=%u; live amdgpu ref=0x40330121)\n",
+           ih.rbCntl, rbCntlRb, sizeLog2);
+
+    /* Register the ring with the kernel ISR (ENABLE_MSI). The driver treats
+     * IhRingDmaHandle as the DmaAllocs[] index (== our allocDma handle) and
+     * needs the IH RPTR/WPTR MMIO BYTE offsets so its ISR can drain the ring.
+     * Not required for the on-GPU probe: even if this fails, the GPU still
+     * writes IH_RB_WPTR + the writeback dword, which dumpMesDiag reads. */
+    uint32_t rptrByteOff = (ih.ihBase + regIH_RB_RPTR) * 4;
+    uint32_t wptrByteOff = (ih.ihBase + regIH_RB_WPTR) * 4;
+    bool enabled = false; uint32_t vectors = 0;
+    if (gpu.enableMsi(ih.ringHandle, ih.ringSize, rptrByteOff, wptrByteOff,
+                      &enabled, &vectors)) {
+        ih.msiEnabled = enabled;
+        ih.numVectors = vectors;
+        printf("  wddmInitIh: ENABLE_MSI ok enabled=%d vectors=%u\n",
+               enabled ? 1 : 0, vectors);
+    } else {
+        printf("  wddmInitIh: ENABLE_MSI escape FAILED (continuing; the GPU "
+               "still updates IH_RB_WPTR for the on-GPU probe)\n");
+    }
+
+    ih.configured = true;
+    printf("  wddmInitIh: IH ring live (size=%u KB)\n", ih.ringSize / 1024);
+    return true;
+}
+
+/* ======================================================================
  * DIAGNOSTIC (MES-on-Windows): start the MES engine.
  *
  * recipeBootload loads the MES firmware (CP_MES 33 / MES_STACK 34 /
