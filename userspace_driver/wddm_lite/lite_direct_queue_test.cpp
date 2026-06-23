@@ -200,6 +200,11 @@ constexpr uint32_t regRLC_CP_SCHEDULERS_D = 0x098A;
 constexpr uint32_t regCP_HQD_ACTIVE_D = 0x1FAB;
 constexpr uint32_t regCP_HQD_PQ_RPTR_D = 0x1FB3;
 constexpr uint32_t regCP_HQD_PQ_WPTR_LO_D = 0x1FDF;
+/* WPTR_POLL workaround signals (ROCR_WINDOWS_MES_WPTR_POLL): the global
+ * poll-enable + the per-HQD poll address the MES KIQ pipe's CP polls. */
+constexpr uint32_t regCP_PQ_WPTR_POLL_CNTL_D = 0x1E23;
+constexpr uint32_t regCP_HQD_PQ_WPTR_POLL_ADDR_D = 0x1FB6;
+constexpr uint32_t regCP_HQD_PQ_WPTR_POLL_ADDR_HI_D = 0x1FB7;
 
 /* IH v7.0 register DWORD offsets relative to OSSSYS/IH base (ih_init.py). The
  * IH base is NOT the GC base -- it is ipd.ihBase, carried via WddmIhState. */
@@ -234,12 +239,22 @@ void dumpMesDiag(const lite::DirectQueuePlatform &p,
   /* KIQ HQD (me=3 pipe=1 hqd=0): is the KIQ ring active + fetching? */
   mesSelectHqd(p, 3, 1, 0);
   uint32_t kiqActive = 0, kiqRptr = 0, kiqWptr = 0;
+  uint32_t kiqPollCntl = 0, kiqPollAddr = 0, kiqPollAddrHi = 0;
   p.ReadMmio32(kGcB0, regCP_HQD_ACTIVE_D, &kiqActive);
   p.ReadMmio32(kGcB0, regCP_HQD_PQ_RPTR_D, &kiqRptr);
   p.ReadMmio32(kGcB0, regCP_HQD_PQ_WPTR_LO_D, &kiqWptr);
+  /* WPTR_POLL workaround: with ROCR_WINDOWS_MES_WPTR_POLL set, the lite::
+   * MES path programs CP_PQ_WPTR_POLL_CNTL=0x1 here (vs 0 by default) and
+   * the POLL_ADDR = the KIQ ring's in-memory wptr (layout.wptr_gpu). */
+  p.ReadMmio32(kGcB0, regCP_PQ_WPTR_POLL_CNTL_D, &kiqPollCntl);
+  p.ReadMmio32(kGcB0, regCP_HQD_PQ_WPTR_POLL_ADDR_D, &kiqPollAddr);
+  p.ReadMmio32(kGcB0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI_D, &kiqPollAddrHi);
   mesDeselectHqd(p);
   printf("  [MES %s] KIQ HQD(me3,pipe1,hqd0) ACTIVE=0x%X RPTR=0x%X WPTR=0x%X\n",
          phase, kiqActive, kiqRptr, kiqWptr);
+  printf("  [MES %s] KIQ WPTR_POLL_CNTL=0x%08X (1=enabled workaround) "
+         "POLL_ADDR=0x%08X:%08X (== ring in-mem wptr gpu addr)\n",
+         phase, kiqPollCntl, kiqPollAddrHi, kiqPollAddr);
 
   /* The MES-backed compute queue's HQD is NOT MMIO-owned (MES owns it), so on
    * the MES path read the VRAM rptr/wptr the queue tracks instead. */
