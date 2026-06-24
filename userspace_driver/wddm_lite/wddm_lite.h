@@ -21,6 +21,16 @@
  * and load the functions dynamically from gdi32.dll.
  */
 
+/*
+ * When d3dkmthk.h has already been included (e.g. in the ROCr build where
+ * amd_windows_lite_driver.cpp pulls it in before including wddm_lite.h),
+ * skip the hand-rolled definitions to avoid redefinition errors.
+ * _D3DKMTHK_H_ is the include guard used by the WDK d3dkmthk.h.
+ * The standalone harness (build_test.bat / build_lite_test.bat) does NOT
+ * include d3dkmthk.h, so the hand-rolled types remain available there.
+ */
+#ifndef _D3DKMTHK_H_
+
 typedef UINT D3DKMT_HANDLE;
 
 typedef struct _D3DKMT_ADAPTERINFO {
@@ -96,6 +106,8 @@ typedef struct _D3DKMT_ESCAPE {
     UINT          PrivateDriverDataSize;
     D3DKMT_HANDLE hContext;
 } D3DKMT_ESCAPE;
+
+#endif /* !_D3DKMTHK_H_ */
 
 /* NTSTATUS for userspace */
 #ifndef NTSTATUS
