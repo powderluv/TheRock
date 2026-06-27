@@ -1495,6 +1495,31 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
     g_vramMcBase = vramMcBase;
     g_vramCursor = 32ull * 1024 * 1024;
 
+    /* P0 repeatable bring-up: skip-if-already-bootloaded. A prior process in
+       this host power cycle may have already driven the PSP cold-boot autoload.
+       Re-issuing PSP LOAD_IP_FW / AUTOLOAD_RLC on live MEC/MES/RLC engines wedges
+       the PSP (no userspace reset escape exists to recover) -> forces a BMC
+       cold-cycle per run. The VRAM cursor above is already seeded (kept before
+       this guard, since every per-process wddmAllocVram depends on it); only the
+       one-time PSP block below is gated. Durable cross-process "already up"
+       signal = BOOTLOAD_STATUS == 0x8000003F (strict: all done-bits, not just
+       bit31) AND SOS sign-of-life C2PMSG_81 != 0 (so a half-POSTed GPU still
+       cold-boots). Dispatch uses the MEC HQD + doorbell, never the PSP ring, so
+       skipping the PSP re-do is safe; wddmGfxBringUp's per-process doorbell
+       aperture + MEC enable still run after this returns. */
+    {
+        uint32_t alreadyBoot = 0;
+        gpu.readReg32(RCP_BOOTLOAD_DWORD * 4, &alreadyBoot);
+        uint32_t alreadySol = rcpPspRead(gpu, ipd, RCP_C2PMSG_81);
+        if (alreadyBoot == RCP_BOOTLOAD_OK && alreadySol != 0) {
+            printf("  PSP[recipe]: already bootloaded (BOOTLOAD_STATUS=0x%08X, "
+                   "C2PMSG_81=0x%08X); skipping PSP ring/LOAD_TOC/LOAD_IP_FW/"
+                   "AUTOLOAD/SMU re-do (repeatable bring-up).\n",
+                   alreadyBoot, alreadySol);
+            return true;
+        }
+    }
+
     /* IP version strings the probe resolves (gc=12_0_1, sdma=12_0_1, mp1=14_0_3).
      * The probe passes GC="12_0_1" and SOS uses mp0 14_0_3. */
     const char *gc = "12_0_1";
