@@ -137,7 +137,13 @@ if(THEROCK_ENABLE_CORE_RUNTIME)
     list(APPEND _ROCR_CMAKE_ARGS
       "-DAMD_LIBELF_PATH=${_interop_libelf}"
       "-DLIBELF_FOUND=ON"
-      "-DUSE_AMD_LIBELF=yes")
+      "-DUSE_AMD_LIBELF=yes"
+      # wddm_lite source tree (WindowsLiteDriver / gpu_init / wddm_lite.cpp)
+      "-DWDDM_LITE_DIR=${THEROCK_SOURCE_DIR}/userspace_driver/wddm_lite"
+      # Static CRT (/MT) to match the prebuilt wkmi.lib and avoid LNK2038 at the
+      # amdhip64 link (clr statically links ROCr + wkmi).
+      "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+      "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
   else()
     list(APPEND _ROCR_RUNTIME_DEPS
       rocprofiler-register
@@ -234,6 +240,9 @@ if(THEROCK_ENABLE_HIP_RUNTIME)
       "-D__HIP_ENABLE_RTC=1"
       "-DROCR_DLL_LOAD=0"
       "-DCOMGR_DLL_NAME=${_comgr_dll_name}"
+      "-DWDDM_LITE_DIR=${THEROCK_SOURCE_DIR}/userspace_driver/wddm_lite"
+      "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+      "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"
     )
     # Same runtime deps as the Linux HSA path.
     list(APPEND HIP_CLR_RUNTIME_DEPS
@@ -390,7 +399,7 @@ endif(THEROCK_ENABLE_HIP_RUNTIME)
 # ocl-icd
 ################################################################################
 
-if(THEROCK_ENABLE_OCL_ICD)
+if(THEROCK_ENABLE_OCL_ICD AND NOT WIN32)
 
   therock_cmake_subproject_declare(ocl-icd
   USE_DIST_AMDGPU_TARGETS
@@ -421,7 +430,7 @@ if(THEROCK_ENABLE_OCL_ICD)
   )
 endif(THEROCK_ENABLE_OCL_ICD)
 
-if(THEROCK_ENABLE_OCL_RUNTIME)
+if(THEROCK_ENABLE_OCL_RUNTIME AND NOT WIN32)
 
   set(OCL_CLR_CMAKE_ARGS)
   set(OCL_CLR_RUNTIME_DEPS)

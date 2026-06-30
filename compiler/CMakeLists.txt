@@ -77,6 +77,9 @@ if(THEROCK_ENABLE_COMPILER)
       -DLLVM_ENABLE_ZLIB=FORCE_ON
       -DLLVM_ENABLE_Z3_SOLVER=OFF
       -DLLVM_ENABLE_LIBXML2=OFF
+      # DIA SDK (PDB debug reader) pulls atlbase.h (MSVC ATL), which is not
+      # installed in this build env and is not needed to build the toolchain.
+      -DLLVM_ENABLE_DIA_SDK=OFF
       -DCLANG_DEFAULT_LINKER=lld
       -DCLANG_DEFAULT_RTLIB=compiler-rt
       -DCLANG_DEFAULT_UNWINDLIB=libgcc
