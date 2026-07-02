@@ -714,6 +714,12 @@ bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
 bool wddmAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
                    uint64_t *gpuAddr, uint64_t *handle);
 
+/* Device-only VRAM: reserve an MC address ABOVE the CPU-visible BAR window
+ * (no MAP_VRAM, no CPU pointer, not zeroed). GPU-reachable via the FB-MC
+ * aperture; fallback when a CPU-mapped wddmAllocVram would exceed the BAR.
+ * gpuAddr = the FB-MC address (also serves as the opaque handle). */
+bool wddmAllocVramDeviceOnly(WddmLite &gpu, uint64_t size, uint64_t *gpuAddr);
+
 /* Re-run only the NBIO doorbell-aperture + framebuffer enable (the lite::
  * DirectQueuePlatform::EnsureDoorbellAperture analog). Safe to call repeatedly.
  * Returns false if the NBIF base could not be resolved. */

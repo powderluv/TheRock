@@ -884,6 +884,29 @@ static bool rcpSlice(const std::vector<uint8_t> &d, size_t off, size_t size,
  * allocation gets a unique FB-aperture MC address (g_vramMcBase + offset). */
 static uint64_t g_vramCursor = 0;
 static uint64_t g_vramMcBase = 0;
+static uint64_t g_vramDeviceCursor = 0;
+static uint64_t g_vramTotalBytes = 0;
+
+/* Device-only VRAM: reserve an MC address ABOVE the CPU-visible BAR window
+ * (g_vramDeviceCursor) with NO MAP_VRAM mapping, so it is not bounded by the
+ * ~256MB BAR2 aperture. Reachable by the GPU via the FB-MC aperture + compute
+ * page table; NOT CPU-visible and NOT zeroed here. Fallback for allocations
+ * too large for the BAR (e.g. hipBLASLt workspace). */
+static bool rcpAllocVramDeviceOnly(WddmLite &gpu, uint64_t size, uint64_t *gpuAddr)
+{
+    (void)gpu;
+    if (!gpuAddr || size == 0) return false;
+    size = (size + 4095) & ~4095ull;
+    uint64_t offset = g_vramDeviceCursor;
+    if (g_vramTotalBytes != 0 && offset + size > g_vramTotalBytes) {
+        printf("  PSP[recipe]: ERROR device-only VRAM exhausted (size=0x%llX)\n",
+               (unsigned long long)size);
+        return false;
+    }
+    g_vramDeviceCursor = offset + size;
+    *gpuAddr = g_vramMcBase + offset;
+    return true;
+}
 
 /* Allocate a PSP-visible VRAM buffer by bump-allocating over the VRAM BAR and
  * mapping it via MAP_VRAM (mirrors Python alloc_memory). The returned gpuAddr
@@ -901,10 +924,12 @@ static bool rcpAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
     if (!gpu.mapVram(offset, size, &addr, &mh)) {
         printf("  PSP[recipe]: ERROR VRAM alloc failed (size=0x%llX)\n",
                (unsigned long long)size);
+        g_vramCursor = offset;
         return false;
     }
     if (addr == nullptr) {
         printf("  PSP[recipe]: ERROR VRAM alloc not CPU mapped\n");
+        g_vramCursor = offset;
         return false;
     }
     memset(addr, 0, (size_t)size);
@@ -1494,6 +1519,7 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
      * _vram_cursor = 32 * 1024 * 1024 (reserve the low 32MB for scratch). */
     g_vramMcBase = vramMcBase;
     g_vramCursor = 32ull * 1024 * 1024;
+    g_vramDeviceCursor = 256ull * 1024 * 1024;  /* device-only region: above the CPU-visible BAR window */
 
     /* P0 repeatable bring-up: skip-if-already-bootloaded. A prior process in
        this host power cycle may have already driven the PSP cold-boot autoload.
@@ -5357,6 +5383,11 @@ bool wddmAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
     /* g_vramMcBase / g_vramCursor are seeded by recipeBootload (invoked from
      * wddmGfxBringUp), so callers must bring up the GPU first. */
     return rcpAllocVram(gpu, size, cpu, gpuAddr, handle);
+}
+
+bool wddmAllocVramDeviceOnly(WddmLite &gpu, uint64_t size, uint64_t *gpuAddr)
+{
+    return rcpAllocVramDeviceOnly(gpu, size, gpuAddr);
 }
 
 bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
