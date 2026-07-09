@@ -11,6 +11,9 @@
 #include "wddm_lite.h"
 #include <cstring>
 #include <cstdlib>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+#include <tlhelp32.h>
 
 /* ======================================================================
  * IP Discovery
@@ -886,6 +889,7 @@ static uint64_t g_vramCursor = 0;
 static uint64_t g_vramMcBase = 0;
 static uint64_t g_vramDeviceCursor = 0;
 static uint64_t g_vramTotalBytes = 0;
+static bool g_gpuBroughtUpOnce = false;  /* #63: set on first PSP bootload; a 2nd full bring-up (teardown ROCr Runtime re-acquire) must skip -> no firmware reload on a live GPU */
 
 /* Device-only VRAM: reserve an MC address ABOVE the CPU-visible BAR window
  * (g_vramDeviceCursor) with NO MAP_VRAM mapping, so it is not bounded by the
@@ -913,6 +917,108 @@ static bool rcpAllocVramDeviceOnly(WddmLite &gpu, uint64_t size, uint64_t *gpuAd
  * is an FB MC address (g_vramMcBase + offset), which the CP accesses directly
  * and which the page table encodes as offset = gpuAddr - g_vramMcBase. The
  * returned handle is the MAP_VRAM mapping handle. */
+/* #63 diagnostic: symbolized native backtrace at the teardown VRAM-alloc fail.
+ * Survives the VM drop (logs to stdout immediately) where the Python faulthandler
+ * is truncated. Prints module!symbol+off if the PDB resolves, else module+off. */
+static void rcpBacktrace(const char *tag) {
+    void *frames[48];
+    unsigned short n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    HANDLE proc = GetCurrentProcess();
+    static bool inited = false;
+    if (!inited) { SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                   SymInitialize(proc, nullptr, TRUE); inited = true; }
+    char sbuf[sizeof(SYMBOL_INFO) + 512];
+    SYMBOL_INFO *sym = reinterpret_cast<SYMBOL_INFO *>(sbuf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 511;
+    printf("  BACKTRACE[%s] frames=%u\n", tag, (unsigned)n);
+    for (unsigned short i = 0; i < n; i++) {
+        char modpath[MAX_PATH] = "?"; HMODULE mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(frames[i]), &mod);
+        const char *bn = "?";
+        if (mod) { GetModuleFileNameA(mod, modpath, MAX_PATH);
+                   const char *sl = strrchr(modpath, 92); bn = sl ? sl + 1 : modpath; }
+        DWORD64 disp = 0;
+        if (SymFromAddr(proc, reinterpret_cast<DWORD64>(frames[i]), &disp, sym))
+            printf("    #%2u %s!%s +0x%llx\n", (unsigned)i, bn, sym->Name,
+                   (unsigned long long)disp);
+        else {
+            unsigned long long off = mod ? (reinterpret_cast<unsigned long long>(frames[i]) -
+                                            reinterpret_cast<unsigned long long>(mod)) : 0ull;
+            printf("    #%2u %s+0x%llx (%p)\n", (unsigned)i, bn, off, frames[i]);
+        }
+    }
+    fflush(stdout);
+}
+
+/* #63: native all-thread stack dumper + periodic watchdog. faulthandler is dead
+ * during CPython finalization and the teardown deadlock emits no output, so a
+ * native thread (survives interpreter shutdown) periodically walks EVERY thread
+ * and writes symbolized frames to a native file (survives a VM drop via fflush). */
+static void dumpAllThreadStacks(const char *tag) {
+    FILE *f = fopen("C:\\smoke\\watchdog.log", "a");
+    if (!f) f = stderr;
+    HANDLE proc = GetCurrentProcess();
+    static bool inited = false;
+    if (!inited) { SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                   SymInitialize(proc, nullptr, TRUE); inited = true; }
+    fprintf(f, "\n=== WATCHDOG[%s] all-thread stacks ===\n", tag);
+    DWORD myPid = GetCurrentProcessId(), myTid = GetCurrentThreadId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te; te.dwSize = sizeof(te);
+        if (Thread32First(snap, &te)) do {
+            if (te.th32OwnerProcessID != myPid || te.th32ThreadID == myTid) continue;
+            HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                                   FALSE, te.th32ThreadID);
+            if (!th) continue;
+            SuspendThread(th);
+            CONTEXT ctx; memset(&ctx, 0, sizeof(ctx)); ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(th, &ctx)) {
+                STACKFRAME64 sf; memset(&sf, 0, sizeof(sf));
+                sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
+                sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+                sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+                fprintf(f, "-- thread %lu --\n", (unsigned long)te.th32ThreadID);
+                char sbuf[sizeof(SYMBOL_INFO) + 512];
+                SYMBOL_INFO *sym = (SYMBOL_INFO *)sbuf;
+                sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 511;
+                for (int i = 0; i < 30; i++) {
+                    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, th, &sf, &ctx, nullptr,
+                                     SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
+                    if (!sf.AddrPC.Offset) break;
+                    DWORD64 disp = 0; HMODULE mod = nullptr;
+                    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCSTR)sf.AddrPC.Offset, &mod);
+                    char mp[MAX_PATH] = "?"; const char *bn = "?";
+                    if (mod) { GetModuleFileNameA(mod, mp, MAX_PATH);
+                               const char *sl = strrchr(mp, 92); bn = sl ? sl + 1 : mp; }
+                    if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, sym))
+                        fprintf(f, "   %s!%s+0x%llx\n", bn, sym->Name, (unsigned long long)disp);
+                    else fprintf(f, "   %s+0x%llx\n", bn,
+                                 mod ? (unsigned long long)(sf.AddrPC.Offset - (DWORD64)mod) : 0ull);
+                }
+            }
+            ResumeThread(th); CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+        CloseHandle(snap);
+    }
+    fprintf(f, "=== WATCHDOG[%s] end ===\n", tag); fflush(f);
+    if (f != stderr) fclose(f);
+}
+static DWORD WINAPI watchdogThread(LPVOID) {
+    for (int t = 0; t < 12; t++) { Sleep(6000); char b[32];
+        _snprintf_s(b, sizeof(b), "t=%ds", (t + 1) * 6); dumpAllThreadStacks(b); }
+    return 0;
+}
+static void startWatchdogOnce() {
+    static bool started = false;
+    if (started) return; started = true;
+    CreateThread(nullptr, 0, watchdogThread, nullptr, 0, nullptr);
+}
+
 static bool rcpAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
                          uint64_t *gpuAddr, uint64_t *handle)
 {
@@ -924,6 +1030,7 @@ static bool rcpAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
     if (!gpu.mapVram(offset, size, &addr, &mh)) {
         printf("  PSP[recipe]: ERROR VRAM alloc failed (size=0x%llX)\n",
                (unsigned long long)size);
+        if (std::getenv("ROCR_LITE_BACKTRACE")) rcpBacktrace("rcpAllocVram-fail");
         g_vramCursor = offset;
         return false;
     }
@@ -932,7 +1039,12 @@ static bool rcpAllocVram(WddmLite &gpu, uint64_t size, void **cpu,
         g_vramCursor = offset;
         return false;
     }
-    memset(addr, 0, (size_t)size);
+    /* #63: the alloc-zeroing memset is CPU rep-stos over the PCIe BAR -- pathologically
+     * slow in the passthrough VM. A teardown code-object load sits in it and deadlocks
+     * interpreter shutdown. Skip it for POST-bring-up allocs (bring-up rings/MQD still
+     * zero) when the knob is set; the loader overwrites code, GEMM workspace is beta==0. */
+    if (!(g_gpuBroughtUpOnce && std::getenv("ROCR_LITE_SKIP_POST_BRINGUP_MEMSET")))
+        memset(addr, 0, (size_t)size);
     if (cpu) *cpu = addr;
     if (gpuAddr) *gpuAddr = g_vramMcBase + offset;
     if (handle) *handle = (uint64_t)mh;
@@ -962,7 +1074,12 @@ static bool rcpAllocVramAligned(WddmLite &gpu, uint64_t size, uint64_t alignment
         printf("  PSP[recipe]: ERROR aligned VRAM alloc not CPU mapped\n");
         return false;
     }
-    memset(addr, 0, (size_t)size);
+    /* #63: the alloc-zeroing memset is CPU rep-stos over the PCIe BAR -- pathologically
+     * slow in the passthrough VM. A teardown code-object load sits in it and deadlocks
+     * interpreter shutdown. Skip it for POST-bring-up allocs (bring-up rings/MQD still
+     * zero) when the knob is set; the loader overwrites code, GEMM workspace is beta==0. */
+    if (!(g_gpuBroughtUpOnce && std::getenv("ROCR_LITE_SKIP_POST_BRINGUP_MEMSET")))
+        memset(addr, 0, (size_t)size);
     if (cpu) *cpu = addr;
     if (gpuAddr) *gpuAddr = g_vramMcBase + offset;
     if (handle) *handle = (uint64_t)mh;
@@ -1509,6 +1626,7 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
                     const char *fwDir, uint64_t vramMcBase)
 {
     printf("\n=== recipeBootload (LITE_MES_RECIPE) ===\n");
+    if (std::getenv("ROCR_LITE_WATCHDOG")) startWatchdogOnce();
     printf("MP0=0x%04X MP1=0x%04X fwDir=%s vramMcBase=0x%llX\n",
            ipd.mp0Base, ipd.mp1Base, fwDir, (unsigned long long)vramMcBase);
 
@@ -1517,6 +1635,19 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
      * here), so every VRAM allocation in the bootload -> dispatch sequence gets
      * a unique FB MC address. Initial cursor mirrors Python device.py
      * _vram_cursor = 32 * 1024 * 1024 (reserve the low 32MB for scratch). */
+
+    /* #63: recipeBootload runs ONCE per process. The compute path calls it
+     * directly; teardown reaches it via wddmGfxBringUp. A 2nd call at
+     * interpreter teardown re-runs the cursor reset below, corrupting the VRAM
+     * bump allocator that hipBLASLt's device-only buffers still depend on -> the
+     * teardown re-allocs fail (D3DKMTEscape 0xC000000D) and the process wedges /
+     * VM-drops. Latch on first success and skip entirely, preserving cursors. */
+    if (g_gpuBroughtUpOnce) {
+        printf("  PSP[recipe]: SKIP re-bootload (already ran this process; "
+               "cursors preserved; #63 teardown guard)\n");
+        return true;
+    }
+
     g_vramMcBase = vramMcBase;
     g_vramCursor = 32ull * 1024 * 1024;
     g_vramDeviceCursor = 256ull * 1024 * 1024;  /* device-only region: above the CPU-visible BAR window */
@@ -1542,6 +1673,7 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
                    "C2PMSG_81=0x%08X); skipping PSP ring/LOAD_TOC/LOAD_IP_FW/"
                    "AUTOLOAD/SMU re-do (repeatable bring-up).\n",
                    alreadyBoot, alreadySol);
+            g_gpuBroughtUpOnce = true;
             return true;
         }
     }
@@ -1731,6 +1863,7 @@ bool recipeBootload(WddmLite &gpu, const IpDiscoveryResult &ipd,
     printf("BOOTLOAD %s (expected 0x%08X, bit31=%s)\n",
            pass ? "PASS" : "FAIL", RCP_BOOTLOAD_OK,
            (bootStatus & 0x80000000) ? "set" : "clear");
+    if (pass) g_gpuBroughtUpOnce = true;
     return pass;
 }
 
@@ -5395,10 +5528,27 @@ bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
                     WddmComputeContext &ctx)
 {
     memset(&ctx, 0, sizeof(ctx));
+    /* #63: wddmGfxBringUp runs ONLY at teardown re-init (compute uses recipeBootload
+     * directly), so a backtrace here names the teardown caller before the firmware
+     * reload wedges the VM. */
+    if (std::getenv("ROCR_LITE_BACKTRACE")) rcpBacktrace("wddmGfxBringUp-entry");
     ctx.gcBase0 = ipd.gcBase;
     ctx.gcBase1 = ipd.gcBase1;
     ctx.mmhubBase = ipd.mmhubBase;
     ctx.vramMcBase = vramMcBase;
+
+    /* #63: bring the GPU up ONCE per process. A 2nd full bring-up (the
+     * process re-inits at interpreter teardown) re-runs the PSP cold-boot
+     * recipe on an already-live GPU and wedges it (D3DKMTEscape 0xC000000D,
+     * VM drop). Latch on first success; the GPU is still up, so report success
+     * and fill the deterministic ctx fields the caller relies on. */
+    if (g_gpuBroughtUpOnce) {
+        ctx.hasNbif = cqResolveNbif(ipd, &ctx.nbifBase2);
+        ctx.mecEnabled = true;
+        printf("  wddmGfxBringUp: SKIP re-bringup (GPU already up this process; "
+               "#63 teardown re-init guard)\n");
+        return true;
+    }
 
     /* 1. PSP cold-boot autoload -> BOOTLOAD_COMPLETE. Also seeds the VRAM bump
      * allocator (g_vramMcBase = vramMcBase). */
@@ -5440,6 +5590,7 @@ bool wddmGfxBringUp(WddmLite &gpu, const IpDiscoveryResult &ipd,
     ctx.mecEnabled = (mecCntl == 0x3C000000);
     printf("  wddmGfxBringUp: CP_MEC_RS64_CNTL=0x%08X (expected 0x3C000000) "
            "mec=%s\n", mecCntl, ctx.mecEnabled ? "ENABLED" : "NOT-ENABLED");
+    g_gpuBroughtUpOnce = true;
     return true;
 }
 
@@ -5684,6 +5835,15 @@ bool wddmStartMes(WddmLite &gpu, const IpDiscoveryResult &ipd,
 {
     printf("\n=== wddmStartMes (DIAGNOSTIC MES engine release) ===\n");
 
+    /* #63: start MES ONCE per process; skip the teardown re-init re-start
+     * (re-releasing MES on a live engine also risks a wedge/VM-drop). */
+    static bool g_wddmMesStarted = false;
+    if (g_wddmMesStarted) {
+        printf("  wddmStartMes: SKIP re-start (MES already running this process; "
+               "#63 teardown re-init guard)\n");
+        return true;
+    }
+
     CqState cq;
     memset(&cq, 0, sizeof(cq));
     cq.gcBase0 = ctx.gcBase0;
@@ -5770,5 +5930,6 @@ bool wddmStartMes(WddmLite &gpu, const IpDiscoveryResult &ipd,
            "0x%08X->0x%08X  MES %s\n",
            hdr0, hdr1, ip0, ip1,
            mesAlive ? "RUNNING" : "NOT visibly executing");
+    if (pipesActive) g_wddmMesStarted = true;
     return pipesActive;
 }

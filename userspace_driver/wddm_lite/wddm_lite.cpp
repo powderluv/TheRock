@@ -175,9 +175,33 @@ void WddmLite::close()
     m_opened = false;
 }
 
+/* #63: during process teardown (DLL_PROCESS_DETACH) torch/HIP static destructors
+ * launch a GPU op whose D3DKMTEscape blocks in a NON-ALERTABLE kernel-mode wait on
+ * the dying driver -> the process hangs un-killably (os._exit/TerminateProcess/taskkill
+ * /F all fail). RtlDllShutdownInProgress() is TRUE only during that shutdown, so
+ * fast-fail every escape then: the GPU op errors cleanly and the process can exit. */
+static bool rcpShutdownInProgress()
+{
+    typedef BOOLEAN(NTAPI * PFN_RtlDllShutdownInProgress)(void);
+    static PFN_RtlDllShutdownInProgress rtl =
+        (PFN_RtlDllShutdownInProgress)GetProcAddress(
+            GetModuleHandleA("ntdll.dll"), "RtlDllShutdownInProgress");
+    if (rtl != nullptr && rtl() != FALSE) return true;
+    /* The wedge actually happens during PYTHON interpreter finalization
+     * (PyInterpreterState_Delete), which is BEFORE DLL_PROCESS_DETACH, so also
+     * fast-fail once Py_IsFinalizing() is set. GetModuleHandle is null (and this
+     * check skipped) in non-Python processes. */
+    typedef int(*PFN_PyIsFinalizing)(void);
+    static HMODULE pyh = GetModuleHandleA("python312.dll");
+    static PFN_PyIsFinalizing pyfin =
+        pyh ? (PFN_PyIsFinalizing)GetProcAddress(pyh, "Py_IsFinalizing") : nullptr;
+    return pyfin != nullptr && pyfin() != 0;
+}
+
 bool WddmLite::escape(void *data, uint32_t size)
 {
     if (!m_opened) return false;
+    if (rcpShutdownInProgress()) return false;  /* #63 teardown escape-guard */
 
     D3DKMT_ESCAPE esc = {};
     esc.hAdapter = m_adapter;
