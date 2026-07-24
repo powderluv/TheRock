@@ -35,6 +35,10 @@ if not SMOKE_FILE or not os.path.isfile(SMOKE_FILE):
     print(f"[tri_os_smoke] SMOKE_FILE not found: {SMOKE_FILE!r}", file=sys.stderr)
     sys.exit(2)
 
+# Run subprocesses from the smoke file's directory so pytest resolves the
+# collected (rootdir-relative) node IDs regardless of the launcher's CWD (e.g.
+# run-torch-egpu.sh cd's to /tmp, where the relative id is "file not found" -> rc=4).
+SMOKE_DIR = os.path.dirname(os.path.abspath(SMOKE_FILE)) or "."
 SELECT = os.environ.get("SMOKE_SELECT", "test_rocm_available or TestMatrixOperations")
 TIMEOUT = os.environ.get("SMOKE_TIMEOUT", "20")
 JUNIT = os.environ.get("SMOKE_JUNIT") or os.path.join(tempfile.gettempdir(), "tri_os_smoke_junit.xml")
@@ -107,7 +111,7 @@ def run_isolated():
     collect = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q",
          "-p", "no:cacheprovider", "-k", SELECT, SMOKE_FILE],
-        capture_output=True, text=True)
+        capture_output=True, text=True, cwd=SMOKE_DIR)
     ids = [ln.strip() for ln in collect.stdout.splitlines()
            if "::" in ln and not ln.startswith(("=", "warning", "ERROR", "no tests"))]
     if not ids:
@@ -126,7 +130,7 @@ def run_isolated():
             r = subprocess.run(
                 [sys.executable, "-u", "-m", "pytest", "-q", "-p", "no:cacheprovider",
                  f"--junitxml={px}", tid],
-                timeout=per_timeout, capture_output=True, text=True)
+                timeout=per_timeout, capture_output=True, text=True, cwd=SMOKE_DIR)
             rc = r.returncode
         except subprocess.TimeoutExpired:
             rc = -999
