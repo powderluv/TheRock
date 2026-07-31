@@ -23,10 +23,21 @@ elseif(APPLE)
   set(LLVM_LINK_LLVM_DYLIB ON)
   set(LLVM_ENABLE_LIBCXX ON)
   # Keep the Darwin bring-up compiler focused on HIP/COMGR code-object
-  # generation. Flang, OpenMP offload, and amdgcn target runtimes currently
-  # assume Linux HSA/KFD packaging and are not needed for gfx1201 kernels.
+  # generation: skip the Flang, OpenMP offload, and amdgcn target runtimes
+  # (they assume Linux HSA/KFD packaging and are not needed for gfx1201
+  # kernels). compiler-rt IS required, though -- clang's HIP host link
+  # (--hip-link) pulls in libclang_rt.osx.a, so the host builtins must build.
   set(LLVM_ENABLE_PROJECTS "clang;lld;clang-tools-extra" CACHE STRING "Enable LLVM projects" FORCE)
-  set(LLVM_ENABLE_RUNTIMES "" CACHE STRING "Enabled runtimes" FORCE)
+  set(LLVM_ENABLE_RUNTIMES "compiler-rt" CACHE STRING "Enabled runtimes" FORCE)
+  # compiler-rt's builtins build adds -Werror=format-nonliteral, under which
+  # clang 23 promotes -Wmissing-format-attribute to an error (eprintf.c) on
+  # Darwin. Disable -Werror generally AND the specific warning for the macOS
+  # runtimes/builtins build (BUILTINS_/RUNTIMES_ forward into the sub-builds).
+  set(COMPILER_RT_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  set(RUNTIMES_COMPILER_RT_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  set(BUILTINS_COMPILER_RT_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  set(BUILTINS_CMAKE_C_FLAGS "-Wno-missing-format-attribute" CACHE STRING "" FORCE)
+  set(RUNTIMES_CMAKE_C_FLAGS "-Wno-missing-format-attribute" CACHE STRING "" FORCE)
 else()
   set(LLVM_BUILD_LLVM_DYLIB ON)
   set(LLVM_LINK_LLVM_DYLIB ON)

@@ -33,6 +33,15 @@ class LUID(ctypes.Structure):
     ]
 
 
+# D3DKMT_HANDLE is a 32-bit UINT on ALL platforms (it is NOT a pointer-sized
+# HANDLE). Defining handle fields as wintypes.HANDLE (8 bytes on x64) mis-lays-out
+# every D3DKMT struct — wrong array stride for D3DKMT_ADAPTERINFO and misaligned
+# fields in D3DKMT_ESCAPE — which corrupts handles and makes escapes fail with
+# STATUS_INVALID_PARAMETER (0xC000000D). Use a 32-bit handle type for D3DKMT_HANDLE
+# fields specifically (real NT HANDLEs, e.g. event handles, stay wintypes.HANDLE).
+D3DKMT_HANDLE = ctypes.c_uint32
+
+
 # --- D3DKMTEnumAdapters3 ---
 
 class D3DKMT_ENUMADAPTERS3(ctypes.Structure):
@@ -43,9 +52,16 @@ class D3DKMT_ENUMADAPTERS3(ctypes.Structure):
     ]
 
 
+class D3DKMT_ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [
+        ("NumAdapters", ctypes.c_uint),
+        ("pAdapters", ctypes.c_void_p),  # D3DKMT_ADAPTERINFO*
+    ]
+
+
 class D3DKMT_ADAPTERINFO(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", wintypes.HANDLE),
+        ("hAdapter", D3DKMT_HANDLE),
         ("AdapterLuid", LUID),
         ("NumOfSources", ctypes.c_uint),
         ("bPrecisePresentRegionsPreferred", wintypes.BOOL),
@@ -57,7 +73,7 @@ class D3DKMT_ADAPTERINFO(ctypes.Structure):
 class D3DKMT_OPENADAPTERFROMLUID(ctypes.Structure):
     _fields_ = [
         ("AdapterLuid", LUID),
-        ("hAdapter", wintypes.HANDLE),
+        ("hAdapter", D3DKMT_HANDLE),
     ]
 
 
@@ -65,7 +81,7 @@ class D3DKMT_OPENADAPTERFROMLUID(ctypes.Structure):
 
 class D3DKMT_CLOSEADAPTER(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", wintypes.HANDLE),
+        ("hAdapter", D3DKMT_HANDLE),
     ]
 
 
@@ -75,13 +91,13 @@ D3DKMT_ESCAPE_DRIVERPRIVATE = 0
 
 class D3DKMT_ESCAPE(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", wintypes.HANDLE),
-        ("hDevice", wintypes.HANDLE),
+        ("hAdapter", D3DKMT_HANDLE),
+        ("hDevice", D3DKMT_HANDLE),
         ("Type", ctypes.c_uint),
         ("Flags", ctypes.c_uint),
         ("pPrivateDriverData", ctypes.c_void_p),
         ("PrivateDriverDataSize", ctypes.c_uint),
-        ("hContext", wintypes.HANDLE),
+        ("hContext", D3DKMT_HANDLE),
     ]
 
 
@@ -89,20 +105,20 @@ class D3DKMT_ESCAPE(ctypes.Structure):
 
 class D3DKMT_CREATEDEVICE(ctypes.Structure):
     _fields_ = [
-        ("hAdapter", wintypes.HANDLE),
+        ("hAdapter", D3DKMT_HANDLE),
         ("pCommandBuffer", ctypes.c_void_p),
         ("CommandBufferSize", ctypes.c_uint),
         ("pAllocationList", ctypes.c_void_p),
         ("AllocationListSize", ctypes.c_uint),
         ("pPatchLocationList", ctypes.c_void_p),
         ("PatchLocationListSize", ctypes.c_uint),
-        ("hDevice", wintypes.HANDLE),
+        ("hDevice", D3DKMT_HANDLE),
     ]
 
 
 class D3DKMT_DESTROYDEVICE(ctypes.Structure):
     _fields_ = [
-        ("hDevice", wintypes.HANDLE),
+        ("hDevice", D3DKMT_HANDLE),
     ]
 
 
@@ -125,6 +141,7 @@ class D3DKMT_QUERYADAPTERINFO(ctypes.Structure):
 
 # D3DKMTEnumAdapters3 may not exist on older Windows — check at call time
 _D3DKMTEnumAdapters3 = getattr(gdi32, "D3DKMTEnumAdapters3", None)
+_D3DKMTEnumAdapters2 = getattr(gdi32, "D3DKMTEnumAdapters2", None)
 _D3DKMTOpenAdapterFromLuid = gdi32.D3DKMTOpenAdapterFromLuid
 _D3DKMTCloseAdapter = gdi32.D3DKMTCloseAdapter
 _D3DKMTEscape = gdi32.D3DKMTEscape
@@ -194,6 +211,14 @@ class EscapeGetInfoData(ctypes.Structure):
         ("Bars", BarInfo * 6),
         ("VramSizeBytes", ctypes.c_uint64),
         ("VisibleVramSizeBytes", ctypes.c_uint64),
+        # These trailing fields must be present so the buffer size matches the
+        # kernel's AMDGPU_ESCAPE_GET_INFO_DATA; the KMD's GET_INFO handler
+        # rejects an undersized buffer with STATUS_INVALID_PARAMETER (0xC000000D),
+        # which otherwise makes discovery report "no AMD GPU devices found".
+        ("MmioBarIndex", ctypes.c_uint32),
+        ("VramBarIndex", ctypes.c_uint32),
+        ("Headless", ctypes.c_uint8),
+        ("Reserved2", ctypes.c_uint8 * 3),
     ]
 
 
@@ -306,47 +331,50 @@ class DriverInterface:
         self._adapter_luid: LUID | None = None
 
     def enumerate_adapters(self) -> list[D3DKMT_ADAPTERINFO]:
-        """Enumerate all WDDM display adapters.
+        """Enumerate all WDDM adapters via D3DKMTEnumAdapters2.
 
-        Returns list of adapter info structs. Our MCDM device will
-        appear as a ComputeAccelerator with NumOfSources=0.
+        EnumAdapters2 returns D3DKMT_ADAPTERINFO entries whose hAdapter is
+        already open and directly usable for D3DKMTEscape — no
+        OpenAdapterFromLuid needed. EnumAdapters3 proved flaky on the gfx1201
+        VFIO VM (returned only 1-2 adapters with LUIDs that
+        D3DKMTOpenAdapterFromLuid rejected with STATUS_INVALID_PARAMETER);
+        EnumAdapters2 reliably returns every adapter (matches the validated
+        C escape probe). Our amdgpu_wddm device is identified later by
+        ESCAPE_GET_INFO returning AMD's vendor ID.
         """
-        if _D3DKMTEnumAdapters3 is None:
+        if _D3DKMTEnumAdapters2 is None:
             raise RuntimeError(
-                "D3DKMTEnumAdapters3 not available — requires Windows 10 1903+"
+                "D3DKMTEnumAdapters2 not available — requires Windows 8+"
             )
 
-        # First call: get count
-        args = D3DKMT_ENUMADAPTERS3()
-        args.Filter = 0  # No filter — get all adapters
+        # First call: pAdapters=NULL -> NumAdapters returns the count.
+        args = D3DKMT_ENUMADAPTERS2()
         args.NumAdapters = 0
         args.pAdapters = None
-
-        status = _D3DKMTEnumAdapters3(ctypes.byref(args))
-        _check_ntstatus(status, "D3DKMTEnumAdapters3 (count)")
+        status = _D3DKMTEnumAdapters2(ctypes.byref(args))
+        _check_ntstatus(status, "D3DKMTEnumAdapters2 (count)")
 
         if args.NumAdapters == 0:
             return []
 
-        # Second call: get adapter info
+        # Second call: fill the array (EnumAdapters2 opens each hAdapter).
         adapter_array = (D3DKMT_ADAPTERINFO * args.NumAdapters)()
         args.pAdapters = ctypes.cast(adapter_array, ctypes.c_void_p)
-
-        status = _D3DKMTEnumAdapters3(ctypes.byref(args))
-        _check_ntstatus(status, "D3DKMTEnumAdapters3 (list)")
+        status = _D3DKMTEnumAdapters2(ctypes.byref(args))
+        _check_ntstatus(status, "D3DKMTEnumAdapters2 (list)")
 
         return list(adapter_array[:args.NumAdapters])
 
-    def open_adapter(self, luid: LUID) -> None:
-        """Open an adapter by its LUID."""
-        args = D3DKMT_OPENADAPTERFROMLUID()
-        args.AdapterLuid = luid
+    def open_adapter(self, adapter: D3DKMT_ADAPTERINFO) -> None:
+        """Bind to an adapter enumerated by enumerate_adapters().
 
-        status = _D3DKMTOpenAdapterFromLuid(ctypes.byref(args))
-        _check_ntstatus(status, "D3DKMTOpenAdapterFromLuid")
-
-        self._adapter_handle = args.hAdapter
-        self._adapter_luid = luid
+        EnumAdapters2 already opened ``adapter.hAdapter``; use it directly for
+        escapes (the validated path). This replaces OpenAdapterFromLuid, which
+        failed (STATUS_INVALID_PARAMETER) on this VM. close() releases it via
+        D3DKMTCloseAdapter.
+        """
+        self._adapter_handle = adapter.hAdapter
+        self._adapter_luid = adapter.AdapterLuid
 
     def create_device(self) -> None:
         """Create a D3DKMT device on the opened adapter.
@@ -394,12 +422,16 @@ class DriverInterface:
 
         args = D3DKMT_ESCAPE()
         args.hAdapter = self._adapter_handle
-        args.hDevice = self._device_handle
+        # hDevice/hContext are 32-bit D3DKMT_HANDLE fields now (not pointers),
+        # so they must be 0 rather than None when unset. Adapter-level escapes
+        # (GET_INFO/READ_REG32/...) work with hDevice=0 — no device needed,
+        # matching the validated C escape probe.
+        args.hDevice = self._device_handle or 0
         args.Type = D3DKMT_ESCAPE_DRIVERPRIVATE
         args.Flags = 0
         args.pPrivateDriverData = ctypes.addressof(command_buffer)
         args.PrivateDriverDataSize = ctypes.sizeof(command_buffer)
-        args.hContext = None
+        args.hContext = 0
 
         status = _D3DKMTEscape(ctypes.byref(args))
         _check_ntstatus(status, "D3DKMTEscape")

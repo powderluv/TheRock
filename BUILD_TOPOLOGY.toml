@@ -688,7 +688,7 @@ artifact_group = "profiler-core"
 type = "target-neutral"
 artifact_deps = ["core-runtime"]
 feature_group = "PROFILER"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 [artifacts.rocprofiler-sdk]
 artifact_group = "profiler-core"
@@ -696,14 +696,14 @@ type = "target-neutral"
 artifact_deps = ["core-runtime", "base", "aqlprofile", "elfio"]  # rocprofiler-register is in base
 feature_name = "ROCPROFV3"
 feature_group = "PROFILER"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 [artifacts.rocprofiler-compute]
 artifact_group = "profiler-core"
 type = "target-neutral"
 artifact_deps = ["rocprofiler-sdk", "openmpi"]
 feature_group = "PROFILER"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 [artifacts.rocprofiler-systems]
 artifact_group = "profiler-apps"
@@ -711,14 +711,14 @@ type = "target-neutral"
 artifact_deps = ["amd-llvm", "core-hip", "rocprofiler-sdk", "core-amdsmi", "spdlog", "openmpi"]
 feature_name = "ROCPROFSYS"
 feature_group = "PROFILER"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 [artifacts.rocprofiler-systems-examples]
 artifact_group = "profiler-apps"
 type = "target-neutral"
 artifact_deps = ["rocprofiler-systems"]
 feature_group = "PROFILER"
-disable_platforms = ["windows"]
+disable_platforms = ["windows", "darwin"]
 
 # --- Data Center Tools ---
 
