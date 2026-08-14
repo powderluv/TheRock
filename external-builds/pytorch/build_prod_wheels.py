@@ -1105,7 +1105,7 @@ def do_build_pytorch(
     remove_dir_if_exists(pytorch_dir / "dist")
     if args.clean:
         remove_dir_if_exists(pytorch_dir / "build")
-    run_command([sys.executable, "setup.py", "bdist_wheel"], cwd=pytorch_dir, env=env)
+    run_command([sys.executable, "-m", "build", "--wheel", "--no-isolation"], cwd=pytorch_dir, env=env)
     built_wheel = find_built_wheel(pytorch_dir / "dist", "torch")
     print(f"Found built wheel: {built_wheel}")
     copy_to_output(args, built_wheel)
