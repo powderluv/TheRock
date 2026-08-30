@@ -301,7 +301,23 @@ DriverEntry(
     DriverInitData.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2 = NULL;
     DriverInitData.DxgkDdiPowerRuntimeSetDeviceHandle    = NULL;
     DriverInitData.DxgkDdiSetStablePowerState            = AmdGpuSetStablePowerState;
-    DriverInitData.DxgkDdiSetVirtualMachineData          = AmdGpuSetVirtualMachineData;
+    /*
+     * DO NOT register DxgkDdiSetVirtualMachineData. It is a GPU-virtualization
+     * (GPU-PV host) DDI; exposing it makes dxgkrnl classify this adapter as
+     * participating in GPU virtualization and route PnP-registry-key-name
+     * population through the DXG_GUEST_VIRTUALGPU_VMBUS path
+     * (DXGADAPTER::CopyRegistryKeys -> VmBusSendGetRegistryKeys). Under VFIO/KVM
+     * passthrough there is no virtualization host on the other end, so the
+     * keyType-2 PnP key-name UNICODE_STRING at [DXGADAPTER+0x40]+0x210 is never
+     * written; dxgmms2!VIDMM_GLOBAL::ReadPhysicalAdapterConfiguration then reads
+     * that uninitialized string (Length/Buffer = pool poison) and AVs (0x7E)
+     * during VidMm adapter init. A passthrough/compute (MCDM) guest must not
+     * expose this DDI. The dxgkrnl id=494 "DxgkDdiSetVirtualMachineData is
+     * required" trace that led us to add it is non-fatal verbose output, not a
+     * hard adapter-start requirement (the fatal INVALID_PARAMETER was the
+     * SchedulingCaps.MultiEngineAware fix, unrelated to this DDI).
+     */
+    DriverInitData.DxgkDdiSetVirtualMachineData          = NULL;
     DriverInitData.DxgkDdiBeginExclusiveAccess           = AmdGpuBeginExclusiveAccess;
     DriverInitData.DxgkDdiEndExclusiveAccess             = AmdGpuEndExclusiveAccess;
     DriverInitData.DxgkDdiSetVideoProtectedRegion        = NULL;

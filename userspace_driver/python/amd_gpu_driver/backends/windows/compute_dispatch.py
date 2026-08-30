@@ -309,6 +309,31 @@ def _build_noop_kernel_image() -> tuple[bytes, int, int, int]:
 # GPU bring-up sequence
 # ============================================================================
 
+def _read_discovery_via_vram_bar(
+    dev: WindowsDevice, vram_size: int, read_size: int = 65536
+) -> bytes:
+    """Read the IP discovery table from the top of VRAM via the VRAM BAR.
+
+    The table lives at (vram_size - 64KB) in VRAM. read_discovery_table_via_mmio
+    feeds that VRAM byte-offset to SMN index/data, which cannot address VRAM
+    data (returns 0). When the full VRAM BAR is exposed (ReBAR on; e.g. the
+    32GB BAR0 on shark-a), map the region directly and read it. BAR0 = VRAM
+    (VramBarIndex=0 per GET_INFO).
+    """
+    base = vram_size - read_size
+    mapped_va, handle = dev.driver.map_bar(0, base, read_size)
+    data = ctypes.string_at(mapped_va, read_size)
+    try:
+        dev.driver.unmap_bar(handle)
+    except RuntimeError:
+        # unmap_bar currently fails STATUS_INVALID_PARAMETER (the KMD's
+        # UNMAP_BAR needs both MappingHandle and MappedAddress, but the Python
+        # helper only passes the handle). The read already succeeded; leak the
+        # 64KB mapping rather than abort discovery. TODO: fix unmap_bar.
+        pass
+    return data
+
+
 def full_gpu_bringup(
     device_index: int = 0,
     fw_dir: str | Path = ".",
@@ -341,12 +366,12 @@ def full_gpu_bringup(
 
     # --- 2. IP discovery ---
     print("\n[2/8] Running IP discovery...")
-    raw_table = read_discovery_table_via_mmio(
-        dev.read_reg_indirect, dev.vram_size)
+    raw_table = _read_discovery_via_vram_bar(dev, dev.vram_size)
     ip_result = parse_ip_discovery(raw_table)
     print(f"  Found {len(ip_result.ip_blocks)} IP blocks")
     for block in ip_result.ip_blocks:
-        print(f"    {block.hw_id.name}: "
+        hw = getattr(block.hw_id, "name", None) or f"hw_id={int(block.hw_id)}"
+        print(f"    {hw}: "
               f"v{block.major}.{block.minor}.{block.revision}")
 
     # --- 3. NBIO init ---

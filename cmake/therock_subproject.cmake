@@ -1836,6 +1836,18 @@ function(_therock_cmake_subproject_setup_toolchain
     string(APPEND _toolchain_contents "set(HIP_HIPCC_EXECUTABLE \"@_hip_dist_dir@/bin/hipcc\" CACHE FILEPATH \"\" FORCE)\n")
     string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \" --hip-path=@_hip_dist_dir@\")\n")
     string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \" --hip-device-lib-path=@_amd_llvm_device_lib_path@\")\n")
+    if(APPLE)
+      # macOS/libc++ workaround: HIP's host_defines.h defines __noinline__ as an
+      # empty object-like macro for host (non-__HIP__) compiles. The Apple SDK
+      # libc++ <__config> then evaluates `__has_attribute(__noinline__)`, which
+      # expands the empty macro and invokes the builtin with no argument ("too
+      # few arguments provided to function-like macro invocation"). Defining
+      # __CUDA_LIBDEVICE__ routes libc++ to its CUDA/HIP-safe _LIBCPP_NOINLINE
+      # path (llvm-project#73838) so it never evaluates that __has_attribute.
+      # Only libc++'s own noinline workaround keys off this macro; no ROCm code
+      # reads it. Scoped to the amd-hip toolchain so amd-llvm/clr are untouched.
+      string(APPEND _toolchain_contents "string(APPEND CMAKE_CXX_FLAGS_INIT \" -D__CUDA_LIBDEVICE__=1\")\n")
+    endif()
     string(APPEND _toolchain_contents "string(APPEND CMAKE_HIP_FLAGS_INIT \" --hip-path=@_hip_dist_dir@\")\n")
     string(APPEND _toolchain_contents "string(APPEND CMAKE_HIP_FLAGS_INIT \" --hip-device-lib-path=@_amd_llvm_device_lib_path@\")\n")
     string(APPEND _toolchain_contents "set(CMAKE_HIP_FLAGS \"\${CMAKE_HIP_FLAGS_INIT}\" CACHE STRING \"From super-project\" FORCE)\n")
