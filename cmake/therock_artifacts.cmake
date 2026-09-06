@@ -17,6 +17,10 @@
 # All artifact slices of a distribution should be non-overlapping, populating
 # some subset of the install directory tree.
 #
+# DIST_BUNDLE_NAME optionally names a device bundle without using the AMD target
+# selector. Its filename-safe value is incompatible with TARGET_NEUTRAL and the
+# AMD kpack splitter. Existing callers retain AMD bundle behavior.
+#
 # This will produce the following convenience targets:
 # - artifact-${slice_name} : Populate the build/artifacts/{qualified_name}
 #   directory. Added as a dependency of the `therock-artifacts` target.
@@ -26,7 +30,7 @@
 function(therock_provide_artifact slice_name)
   cmake_parse_arguments(PARSE_ARGV 1 ARG
     "TARGET_NEUTRAL"
-    "DESCRIPTOR;DISTRIBUTION"
+    "DESCRIPTOR;DISTRIBUTION;DIST_BUNDLE_NAME"
     "COMPONENTS;SUBPROJECT_DEPS"
   )
 
@@ -35,6 +39,25 @@ function(therock_provide_artifact slice_name)
       "Artifact slice name '${slice_name}' must start with a letter "
       "and may only contain alphanumeric characters and dashes"
     )
+  endif()
+
+  # An explicit bundle describes device artifacts outside the AMD target model.
+  # It is a filename field, not a compiler target or an AMD kpack split request.
+  # CMake before CMP0174 drops explicitly empty single-value arguments.
+  if("DIST_BUNDLE_NAME" IN_LIST ARGN AND NOT DEFINED ARG_DIST_BUNDLE_NAME)
+    message(FATAL_ERROR "DIST_BUNDLE_NAME requires a nonempty value")
+  endif()
+  if(DEFINED ARG_DIST_BUNDLE_NAME)
+    if(ARG_TARGET_NEUTRAL)
+      message(FATAL_ERROR "DIST_BUNDLE_NAME cannot be combined with TARGET_NEUTRAL")
+    endif()
+    if(NOT ARG_DIST_BUNDLE_NAME MATCHES "^[A-Za-z0-9][A-Za-z0-9-]*$")
+      message(FATAL_ERROR "DIST_BUNDLE_NAME must contain only alphanumeric characters and dashes")
+    endif()
+    if(THEROCK_FLAG_KPACK_SPLIT_ARTIFACTS)
+      message(FATAL_ERROR
+        "DIST_BUNDLE_NAME cannot use the AMD-only KPACK_SPLIT_ARTIFACTS pipeline")
+    endif()
   endif()
 
   # Fail-fast: Check if artifact is defined in topology
@@ -140,6 +163,8 @@ function(therock_provide_artifact slice_name)
   # Determine top-level name.
   if(ARG_TARGET_NEUTRAL)
     set(_bundle_suffix "_generic")
+  elseif(DEFINED ARG_DIST_BUNDLE_NAME)
+    set(_bundle_suffix "_${ARG_DIST_BUNDLE_NAME}")
   else()
     set(_bundle_suffix "_${THEROCK_AMDGPU_DIST_BUNDLE_NAME}")
   endif()
@@ -152,6 +177,9 @@ function(therock_provide_artifact slice_name)
   # Compute fingerprint of dependencies.
   # TODO: Potentially prime content with some environment/machine state.
   set(_fprint_content "ARTIFACT=${slice_name}" "DESCRIPTOR=${_descriptor_fprint}")
+  if(DEFINED ARG_DIST_BUNDLE_NAME)
+    list(APPEND _fprint_content "DIST_BUNDLE_NAME=${ARG_DIST_BUNDLE_NAME}")
+  endif()
   set(_fprint_is_valid TRUE)
   foreach(_subproject_dep ${ARG_SUBPROJECT_DEPS})
     get_target_property(_subproject_fprint "${_subproject_dep}" THEROCK_FPRINT)

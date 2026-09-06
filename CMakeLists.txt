@@ -12,6 +12,21 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+set(THEROCK_BUILD_PROFILE "rocm" CACHE STRING "Build profile: rocm or multi-vendor-hip")
+set_property(CACHE THEROCK_BUILD_PROFILE PROPERTY STRINGS rocm multi-vendor-hip)
+if(NOT THEROCK_BUILD_PROFILE MATCHES "^(rocm|multi-vendor-hip)$")
+  message(FATAL_ERROR "THEROCK_BUILD_PROFILE must be rocm or multi-vendor-hip")
+endif()
+# Keep experimental artifacts independent of THEROCK_ENABLE_ALL.
+set(THEROCK_ENABLE_MULTI_VENDOR_HIP OFF)
+if(THEROCK_BUILD_PROFILE STREQUAL "multi-vendor-hip")
+  set(THEROCK_ENABLE_MULTI_VENDOR_HIP ON)
+  # The current kpack splitter interprets payloads as AMD code objects. This
+  # profile packages backend binaries directly until typed payloads are supported.
+  set(THEROCK_FLAG_KPACK_SPLIT_ARTIFACTS OFF CACHE BOOL
+    "Split target-specific artifacts into generic and arch-specific components")
+endif()
+
 project(THEROCK)
 
 cmake_policy(SET CMP0135 NEW)
@@ -211,6 +226,19 @@ option(THEROCK_MINIMAL_DEBUG_INFO "Enables compiler-specific flags for minimal d
 option(THEROCK_COMPILER_RT_DEBUG "Enables compiler-rt debug build" OFF)
 option(THEROCK_QUIET_INSTALL "Enable quiet install logging (install logs only go to the logfile)" ON)
 option(THEROCK_USE_SAFE_DEPENDENCY_PROVIDER "Enable the safe dependency provider, performing strict package checks" ON)
+
+################################################################################
+# Experimental backend SDK/validation profile. It uses the normal subproject and
+# artifact machinery, but selects its own dependency graph and target namespace.
+################################################################################
+if(THEROCK_BUILD_PROFILE STREQUAL "multi-vendor-hip")
+  set(STAGING_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/staging_install")
+  set(CMAKE_INSTALL_LIBDIR "lib")
+  include("${CMAKE_CURRENT_BINARY_DIR}/cmake/therock_topology.cmake")
+  add_subdirectory(experimental/multi-vendor)
+  include(therock_finalize)
+  return()
+endif()
 
 ################################################################################
 # Feature selection
@@ -546,10 +574,4 @@ endif()
 ################################################################################
 # Finalization
 ################################################################################
-therock_subproject_merge_compile_commands()
-
-# Write artifact→subprojects manifest for Python scripts to use
-therock_write_subproject_manifest()
-
-include(therock_emit_consumer_graph)
-therock_emit_consumer_graph("${CMAKE_BINARY_DIR}/therock_consumer_graph.json")
+include(therock_finalize)

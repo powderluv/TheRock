@@ -913,3 +913,31 @@ type = "target-neutral"
 artifact_deps = []
 feature_group = "EMULATION"
 disable_platforms = ["windows"]
+
+# Experimental backend-aware HIP SDK and validation profile. The stage selects
+# sources; configure explicitly with THEROCK_BUILD_PROFILE=multi-vendor-hip.
+[build_stages.multi-vendor-hip]
+description = "Experimental multi-vendor HIP SDK and device validation"
+artifact_groups = ["multi-vendor-hip"]
+type = "generic"
+
+[artifact_groups.multi-vendor-hip]
+description = "Backend-specific HIP SDK and isolated target validation"
+type = "generic"
+source_sets = ["rocm-systems"]
+
+[artifacts.hip-nvidia-sdk]
+artifact_group = "multi-vendor-hip"
+type = "target-neutral"
+feature_group = "MULTI_VENDOR_HIP"
+source_paths = ["clr", "hip", "hipother"]
+
+[artifacts.multi-vendor-validation]
+artifact_group = "multi-vendor-hip"
+type = "target-specific"
+feature_group = "MULTI_VENDOR_HIP"
+
+[artifacts.multi-vendor-modules]
+artifact_group = "multi-vendor-hip"
+type = "target-specific"
+feature_group = "MULTI_VENDOR_HIP"

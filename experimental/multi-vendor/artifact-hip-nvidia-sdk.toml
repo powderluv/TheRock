@@ -1,0 +1,4 @@
+# The header adapter and its CMake package are backend-host artifacts.
+# No CUDA driver, toolkit, or AMD runtime binaries are redistributed.
+[components.dev."experimental/multi-vendor/hip-nvidia-sdk/stage"]
+include = ["**"]
