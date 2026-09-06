@@ -1,5 +1,9 @@
 # Experimental multi-vendor HIP builds
 
+See the [multi-vendor architecture](multi-vendor-architecture.md) for the design,
+implementation boundaries, alternatives, and proposed next steps. This page is
+the build and validation runbook.
+
 The `multi-vendor-hip` build profile uses TheRock's subproject, artifact, and
 consumer graph infrastructure for backend-specific HIP SDK consumers. It is an
 opt-in first step toward multi-vendor ROCm builds. The default `rocm` profile

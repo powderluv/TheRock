@@ -13,6 +13,8 @@
 - [Dependencies](dependencies.md)
 - [Development Guide](development_guide.md)
 - [Installing Artifacts](installing_artifacts.md)
+- [Multi-vendor architecture](multi-vendor-architecture.md) - Experimental design and implementation status
+- [Multi-vendor build and validation](multi-vendor-hip.md)
 - [Sanitizers](sanitizers.md)
 
 ### Testing
