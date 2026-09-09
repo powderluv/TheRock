@@ -344,7 +344,7 @@ See the [client guide](multi-vendor-client.md) for the API and validation scope.
 
 ### Separate legacy C++ kpack repair
 
-The [C++ loader change](../../rocm-systems/shared/kpack/runtime/src/loader.cpp)
+The [C++ loader change](https://github.com/powderluv/rocm-systems/blob/a5dd53d3be5ced72d3e1f521c2067d341aadece3/shared/kpack/runtime/src/loader.cpp)
 fixes an independent AMD runtime issue: a pack advertising a compatible
 architecture could previously be selected before checking whether it contained
 the requested module/code-object index.
