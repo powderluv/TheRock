@@ -30,6 +30,18 @@ from .module_contract import (
     validation_contract,
 )
 
+from .sgemm_contract import (
+    SGEMM_ABI,
+    SGEMM_VERSION,
+    SGEMM_CAPABILITY,
+    SGEMM_MAX_DIMENSION,
+    SGEMM_MAX_CAPACITY,
+    SgemmProviderInfo,
+    parse_sgemm_provider_json,
+    sgemm_contract_sha256,
+    sgemm_provider_for_vendor,
+)
+
 _HEADER = struct.Struct("<4sHHII")
 _MAGIC = b"TRMS"
 _VERSION = 1
@@ -42,6 +54,7 @@ _MAX_COUNT = 65539
 _HELLO, _OPEN, _ALLOC, _FREE, _LOAD, _UNLOAD, _WRITE, _READ, _LAUNCH, _SYNC, _CLOSE = (
     range(1, 12)
 )
+_SGEMM_PROVIDER, _SGEMM = 12, 13
 
 
 class ModuleServiceError(RuntimeError):
@@ -186,6 +199,7 @@ class NativeModuleSession:
         self._owner = _Owner()
         self._handles: dict[int, Buffer | Module] = {}
         self._last_handle = 0
+        self._sgemm_provider: SgemmProviderInfo | None = None
         self._next_request = 1
         self._stderr = bytearray()
         # Acquire the transport resource before starting a worker, so a failed
@@ -567,6 +581,101 @@ class NativeModuleSession:
                 + struct.pack("<I", count),
             )
         )
+
+    def sgemm_provider(self) -> SgemmProviderInfo:
+        """Negotiate and cache the target's optional loaded BLAS provider.
+
+        Default vector sessions do not initialize a BLAS provider. An invalid
+        descriptor is a fatal protocol error; absent compiled support is local.
+        """
+        self._ensure_live()
+        if SGEMM_CAPABILITY not in self.description.capabilities:
+            raise ValueError("Runner does not advertise " + SGEMM_CAPABILITY)
+        if self._sgemm_provider is not None:
+            return self._sgemm_provider
+        provider = sgemm_provider_for_vendor(self.target.vendor)
+        request = (
+            _string(provider)
+            + _string(SGEMM_ABI)
+            + struct.pack("<I", SGEMM_VERSION)
+            + _string(sgemm_contract_sha256())
+        )
+        result = self._request(_SGEMM_PROVIDER, request)
+        try:
+            info = parse_sgemm_provider_json(
+                _decode_string(result), vendor=self.target.vendor
+            )
+        except ValueError as exc:
+            self._terminate()
+            raise ModuleServiceProtocolError(
+                f"Invalid SGEMM provider response: {exc}", self.stderr_tail
+            ) from exc
+        self._sgemm_provider = info
+        return info
+
+    def sgemm(
+        self,
+        a: Buffer,
+        b: Buffer,
+        c: Buffer,
+        *,
+        m: int,
+        n: int,
+        k: int,
+        lda: int,
+        ldb: int,
+        ldc: int,
+        a_offset: int = 0,
+        b_offset: int = 0,
+        c_offset: int = 0,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+    ) -> None:
+        """Queue bounded column-major NN FP32 C = alpha*A*B + beta*C.
+
+        Offsets and leading dimensions count float elements. READ/SYNC supplies
+        completion. The output buffer must differ from both input buffers.
+        """
+        numbers = tuple(self._handle(buffer, Buffer) for buffer in (a, b, c))
+        if c is a or c is b:
+            raise ValueError("SGEMM output must not alias either input buffer")
+        for name, value in (("m", m), ("n", n), ("k", k)):
+            _integer(value, "SGEMM " + name, minimum=1, maximum=SGEMM_MAX_DIMENSION)
+        for buffer, offset, rows, columns, leading, name in (
+            (a, a_offset, m, k, lda, "A"),
+            (b, b_offset, k, n, ldb, "B"),
+            (c, c_offset, m, n, ldc, "C"),
+        ):
+            _integer(offset, f"SGEMM {name} offset", maximum=buffer.capacity)
+            _integer(
+                leading,
+                f"SGEMM {name} leading dimension",
+                minimum=rows,
+                maximum=SGEMM_MAX_CAPACITY,
+            )
+            span = (columns - 1) * leading + rows
+            if offset + span > buffer.capacity:
+                raise ValueError(f"SGEMM {name} matrix exceeds buffer capacity")
+        scalars = b""
+        for name, value in (("alpha", alpha), ("beta", beta)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"SGEMM {name} must be finite float32")
+            try:
+                if not math.isfinite(value):
+                    raise ValueError(f"SGEMM {name} must be finite float32")
+                scalars += struct.pack("<f", value)
+            except (OverflowError, struct.error) as exc:
+                raise ValueError(f"SGEMM {name} must fit float32") from exc
+        # All local ownership, dimensions, ranges and scalar checks precede
+        # lazy provider initialization, including the first SGEMM request.
+        self.sgemm_provider()
+        payload = (
+            struct.pack(
+                "<QQQ9I", *numbers, a_offset, b_offset, c_offset, m, n, k, lda, ldb, ldc
+            )
+            + scalars
+        )
+        self._empty(self._request(_SGEMM, payload))
 
     def synchronize(self) -> None:
         self._empty(self._request(_SYNC))

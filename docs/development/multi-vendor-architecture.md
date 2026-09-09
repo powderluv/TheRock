@@ -3,12 +3,12 @@
 **Status: experimental implementation and proposed expansion.** This document
 describes the initial implementation validated on Shark-a on 6 September 2026,
 the subsequent input, launch-contract, discovery, event, session, pipeline, service,
-and installed consumer work, and
+installed consumer, selective distribution, and bounded math-provider work, and
 decisions needed to extend it.
 The hardware validation record below remains tied to its stated checkpoint.
 Operational commands belong in the [getting-started guide](multi-vendor-getting-started.md),
 [build runbook](multi-vendor-hip.md), [selective-distribution guide](multi-vendor-distributions.md),
-and [imported-input guide](multi-vendor-inputs.md).
+[SGEMM provider guide](multi-vendor-sgemm.md), and [imported-input guide](multi-vendor-inputs.md).
 
 ## Decision and scope
 
@@ -17,7 +17,7 @@ artifact infrastructure with explicit GPU backend identities. Vendor compilers
 and runtime interfaces remain separate,
 while sharing source selection, dependency tracking, staging, packaging, and
 validation. Retain HIP source portability as one consumer of that infrastructure
-and add native module consumers as another.
+and add native module consumers and explicit math providers alongside it.
 
 The implemented `multi-vendor-hip` profile demonstrates this approach with AMD,
 NVIDIA, and Intel payloads in the same build and distribution. It does **not**
@@ -93,6 +93,8 @@ flowchart TD
     Sdks["Imported compiler and runtime SDKs"] --> Hip
     Sdks --> Native["Per-target native module builds"]
     Profile --> Native
+    Sdks --> Blas["Optional rocBLAS / cuBLAS provider bindings"]
+    Blas --> Native
     Hip --> HipDist["HIP validation distribution"]
     Native --> Stages["Target-specific child stages"]
     Stages --> Assemble["Shared pack assembler"]
@@ -139,7 +141,7 @@ hardware qualification. Generated target-selection metadata deliberately records
 subgroup operations, atomics, memory models, supported module versions, and
 library coverage independently of processor spelling.
 
-## Two implementation paths
+## Source, module, and library paths
 
 ### HIP source adapters
 
@@ -165,7 +167,8 @@ loading from device compilation. AMD and NVIDIA compile equivalent kernels from
 `kernels.cpp`; Intel uses `kernels.cl`. AMD emits HSACO (AMD code objects) and loads through HIP
 module APIs. NVIDIA emits cubin (compiled CUDA) and PTX (NVIDIA virtual ISA)
 and loads through the CUDA Driver API;
-its host runner links `libcuda`, without HIP or `cudart`.
+its default host runner links `libcuda`, without HIP or `cudart`. The opt-in
+SGEMM worker also links cuBLAS and needs its external runtime dependencies.
 
 Intel's ordinary C++ host links the Level Zero loader. Clang emits SPIR64 LLVM
 bitcode from OpenCL C 1.2; a matching LLVM-to-SPIR-V translator emits SPIR-V 1.0,
@@ -180,9 +183,45 @@ kernel execution, and readback. Finite synchronization precedes checking and
 cleanup; unknown completion terminates the validator without freeing resources
 that may still be in use.
 
-All runners currently implement only the fixture ABI
+All packed modules currently implement the fixture ABI
 `(x, y, output, alpha, count)`, with SAXPY and ReLU references. This is a
 deliberately small execution contract, not a general application launch ABI.
+
+### Native math providers
+
+The opt-in [SGEMM provider](multi-vendor-sgemm.md) adds FP32, column-major,
+non-transposed `C = alpha * A * B + beta * C` through rocBLAS on AMD and
+cuBLAS on NVIDIA. It reuses each persistent worker's existing primary context,
+stream, and opaque buffers. The Python facade supplies dimensions, leading
+dimensions, element offsets, and finite FP32 scalars; both client and worker
+validate bounds and output aliasing before a library call. Dimensions are bounded
+to 1..256 in this first contract.
+
+This library operation has its own versioned contract and capability negotiation;
+the vector ABI, pack catalogs, and runner registry schema remain unchanged.
+Provider negotiation reports the loaded library version. It initializes one
+provider handle lazily, binds the worker stream and host scalar mode, and selects
+explicit FP32 math/atomics settings. SGEMM submission is queued; reads,
+synchronization, and teardown drain the stream. Kernels and library calls can
+therefore exchange device-resident buffers within a worker. Multiple vendors
+still use separate workers and explicit host transfers.
+
+`THEROCK_ENABLE_MULTI_VENDOR_SGEMM` defaults to `OFF`. Enabling it changes AMD
+and NVIDIA runner capabilities and links their selected SDK's BLAS library;
+Intel retains its native Level Zero module path and advertises no SGEMM provider.
+An explicit Intel child-provider request fails configuration. The default module
+worker retains its previous dependencies and description. Distributions and exact
+target exports carry the matching bundled Python client and worker descriptions;
+older host clients that reject unknown capabilities need the updated runtime.
+The SDK libraries, transitive libraries, provider kernel data, and GPU drivers
+remain external. This increment neither packages their complete runtime closure
+nor provides a common vendor BLAS binary ABI.
+
+The completed-stage description gate also checks an SGEMM option toggle before
+direct installation: a newly configured provider capability cannot label an older
+worker. Whole-SDK content locks already cover provider files under imported SDK
+roots. Complete runtime provenance and reusable artifact keys remain separate
+acceptance gates.
 
 ## Multi-pack and multi-architecture selection
 
@@ -471,10 +510,13 @@ and contract compatibility when executing an exported payload.
    ownership, general argument layouts, and an agreed shared-library ABI.
    Unsupported operations must fail explicitly. Define any fallback policy
    separately from exact identity.
-1. **Add math providers incrementally.** Start with a bounded BLAS operation,
-   then expand to FFT, sparse, solver, and DNN coverage. Map vendor libraries or
-   portable kernels through explicit provider contracts, testing numerical
-   tolerances and synchronization. A matching function name is insufficient.
+1. **Expand math providers incrementally.** The bounded native rocBLAS/cuBLAS
+   SGEMM operation establishes the first explicit provider contract. Integrate an
+   Intel provider and qualify it on B70, then consider transpose/layout coverage,
+   further BLAS operations, FFT, sparse, solver, and DNN support. Map vendor
+   libraries or portable kernels through explicit provider contracts, testing
+   numerical tolerances and synchronization. A matching function name is
+   insufficient.
 1. **Integrate production consumers.** Connect catalog selection to an agreed
    runtime plugin interface, qualify real applications, and add per-backend CI.
    Performance, package size, startup/JIT cost, and operational stability become
@@ -533,3 +575,13 @@ consumers per profile. Five copied-source exports preserve exact payload counts
 for AMD, NVIDIA, their pair, NVIDIA multi-architecture, and Intel-only selections.
 Intel and SM90 execution remain deferred; source-independent export is packaging
 evidence. See the [selective-distribution guide](multi-vendor-distributions.md).
+
+The bounded SGEMM checkpoint passed **394 focused regression tests without skips**,
+**32 enabled native CTests**, and **33 default combined HIP/native CTests**.
+rocBLAS on R9700 and cuBLAS on RTX PRO 6000 passed matrix bounds/scalar cases,
+unchanged input and guard checks, packed-kernel/library stream composition, and
+a paired host-transfer/worker-lifetime test. A relocated selected AMD/NVIDIA
+distribution passed SGEMM and retained its verified inventory. Intel and SM90
+remain compile-only targets; no Intel math provider is implemented. See the
+[provider guide](multi-vendor-sgemm.md) for the contract, loaded library versions,
+commands, and limits.

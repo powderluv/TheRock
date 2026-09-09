@@ -97,6 +97,44 @@ public:
       throw std::runtime_error("Injected CPU failure after enqueue");
     }
   }
+#if defined(THEROCK_MODULE_ENABLE_SGEMM)
+  std::string sgemm_info() {
+    audit("SGEMM_INFO");
+    using namespace therock::module_contract;
+    return std::string(
+               "{\"schema_version\":1,\"kind\":\"blas-provider\","
+               "\"scope\":\"loaded-provider\",\"vendor\":\"nvidia\","
+               "\"provider\":\"cublas\",\"library_version\":\"cpu-fixture\","
+               "\"abi\":\"") +
+           kSgemmAbi + "\",\"version\":" + std::to_string(kSgemmVersion) +
+           ",\"contract_sha256\":\"" + kSgemmContractSha256 +
+           "\",\"capabilities\":[\"blas-provider-cublas-v1\","
+           "\"blas-sgemm-f32-nn-v1\"]}";
+  }
+  void sgemm(Buffer &a, Buffer &b, Buffer &c,
+             const therock::module_service::SgemmRequest &request) {
+    audit("SGEMM");
+    work_.push_back([&a, &b, &c, request] {
+      audit("EXECUTE_SGEMM");
+      for (uint32_t column = 0; column < request.n; ++column) {
+        for (uint32_t row = 0; row < request.m; ++row) {
+          float sum = 0.0f;
+          for (uint32_t inner = 0; inner < request.k; ++inner) {
+            sum += a.values[request.a_offset + inner * request.lda + row] *
+                   b.values[request.b_offset + column * request.ldb + inner];
+          }
+          auto &value = c.values[request.c_offset + column * request.ldc + row];
+          value = request.alpha * sum +
+                  (request.beta == 0.0f ? 0.0f : request.beta * value);
+        }
+      }
+    });
+    ++pending_work;
+    if (request.alpha == 13.0f) {
+      throw std::runtime_error("Injected CPU SGEMM failure after enqueue");
+    }
+  }
+#endif
   void synchronize() noexcept {
     audit("SYNCHRONIZE");
     for (auto &operation : work_) {

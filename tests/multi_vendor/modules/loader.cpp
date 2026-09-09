@@ -7,6 +7,14 @@
 #include <hip/hip_runtime_api.h>
 #endif
 
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+#if defined(THEROCK_MODULE_NVIDIA)
+#include <cublas_v2.h>
+#else
+#include <rocblas/rocblas.h>
+#endif
+#endif
+
 #include "device_inventory.h"
 #include "module_service_protocol.h"
 #include "module_session_options.h"
@@ -949,6 +957,7 @@ void run(const Options &options) {
 
 } // namespace
 
+#include "module_service_blas.h"
 #include "module_service_hip_cuda.h"
 
 int main(int argc, char **argv) {

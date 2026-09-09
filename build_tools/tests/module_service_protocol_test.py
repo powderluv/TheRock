@@ -263,7 +263,7 @@ class ModuleServiceProtocolTest(unittest.TestCase):
             (frame(1, 0), 2, "sequence"),
             (frame(1, 2), 2, "sequence"),
             (frame(0, 1), 2, "opcode"),
-            (frame(12, 1), 2, "opcode"),
+            (frame(14, 1), 2, "opcode"),
             (struct.pack("<4I", MAGIC, 1 | (1 << 16), 1, 1024 * 1024 + 1), 2, "1 MiB"),
             (b"TRMSx", 2, "Truncated"),
             (struct.pack("<4I", MAGIC, 1 | (1 << 16), 1, 8) + b"xx", 2, "Truncated"),

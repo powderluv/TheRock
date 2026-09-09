@@ -30,6 +30,12 @@ struct Config {
   std::string device_uuid;
 };
 
+struct SgemmRequest {
+  uint32_t a_offset, b_offset, c_offset;
+  uint32_t m, n, k, lda, ldb, ldc;
+  float alpha, beta;
+};
+
 struct CommandError : std::runtime_error {
   CommandError(uint32_t code, const std::string &message)
       : std::runtime_error(message), status(code) {}
@@ -189,7 +195,7 @@ inline bool read_frame(Frame &frame, uint32_t expected_id) {
   require(frame.id == expected_id && frame.id != 0,
           "Invalid service request sequence", 2);
   require(length <= kMaxFrame, "Service frame exceeds 1 MiB", 2);
-  require(frame.opcode >= 1 && frame.opcode <= 11, "Unknown service opcode", 2);
+  require(frame.opcode >= 1 && frame.opcode <= 13, "Unknown service opcode", 2);
   frame.payload.resize(length);
   read_exact(STDIN_FILENO, frame.payload.data(), length);
   return true;
@@ -361,6 +367,61 @@ public:
     } else if (frame.opcode == 10) {
       reader.end();
       backend_->synchronize();
+    } else if (frame.opcode == 12) {
+      if constexpr (module_contract::kSgemmEnabled) {
+        require(!sgemm_negotiated_, "SGEMM provider was already negotiated", 4);
+        const std::string provider = reader.string();
+        const std::string abi = reader.string();
+        const uint32_t version = reader.u32();
+        const std::string hash = reader.string();
+        reader.end();
+        require(provider == module_contract::kSgemmProvider &&
+                    abi == module_contract::kSgemmAbi &&
+                    version == module_contract::kSgemmVersion &&
+                    hash == module_contract::kSgemmContractSha256,
+                "Unsupported SGEMM provider contract", 5);
+        put_string(result, backend_->sgemm_info());
+        sgemm_negotiated_ = true;
+      } else {
+        throw CommandError(5, "SGEMM provider is not enabled in this worker");
+      }
+    } else if (frame.opcode == 13) {
+      if constexpr (module_contract::kSgemmEnabled) {
+        require(sgemm_negotiated_, "SGEMM provider negotiation is required", 4);
+        const uint64_t a = reader.u64(), b = reader.u64(), c = reader.u64();
+        const SgemmRequest request{reader.u32(), reader.u32(), reader.u32(),
+                                   reader.u32(), reader.u32(), reader.u32(),
+                                   reader.u32(), reader.u32(), reader.u32(),
+                                   reader.f32(), reader.f32()};
+        reader.end();
+        auto &ba = buffer(a);
+        auto &bb = buffer(b);
+        auto &bc = buffer(c);
+        require(c != a && c != b, "SGEMM output must not alias an input");
+        require(request.m >= 1 && request.m <= 256 && request.n >= 1 &&
+                    request.n <= 256 && request.k >= 1 && request.k <= 256,
+                "SGEMM dimensions must be in 1..256");
+        require(std::isfinite(request.alpha) && std::isfinite(request.beta),
+                "SGEMM scalars must be finite float32 values");
+        require(request.lda >= request.m && request.ldb >= request.k &&
+                    request.ldc >= request.m && request.lda <= kMaxCapacity &&
+                    request.ldb <= kMaxCapacity && request.ldc <= kMaxCapacity,
+                "Invalid SGEMM leading dimensions");
+        const auto span = [](uint32_t offset, uint32_t rows, uint32_t columns,
+                             uint32_t stride) {
+          return uint64_t(offset) + uint64_t(columns - 1) * stride + rows;
+        };
+        require(span(request.a_offset, request.m, request.k, request.lda) <=
+                        ba.capacity &&
+                    span(request.b_offset, request.k, request.n, request.ldb) <=
+                        bb.capacity &&
+                    span(request.c_offset, request.m, request.n, request.ldc) <=
+                        bc.capacity,
+                "SGEMM matrix exceeds buffer capacity");
+        backend_->sgemm(*ba.object, *bb.object, *bc.object, request);
+      } else {
+        throw CommandError(5, "SGEMM provider is not enabled in this worker");
+      }
     }
     require(Backend::cleanup_ok(), "Native resource cleanup failed", 3);
     return result;
@@ -385,6 +446,7 @@ private:
     return *found->second;
   }
   bool hello_ = false;
+  bool sgemm_negotiated_ = false;
   uint64_t next_handle_ = 1;
   std::unique_ptr<Backend> backend_;
   std::unordered_map<uint64_t, BufferEntry> buffers_;

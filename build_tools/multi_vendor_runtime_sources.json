@@ -46,6 +46,11 @@
       "root": "tools"
     },
     {
+      "destination": "share/therock/python/_therock_utils/sgemm_contract.py",
+      "path": "_therock_utils/sgemm_contract.py",
+      "root": "tools"
+    },
+    {
       "destination": "share/therock/python/licenses/TheRock-LICENSE",
       "path": "LICENSE",
       "root": "repository"
@@ -78,6 +83,11 @@
     {
       "destination": "share/therock/python/therock_multi_vendor/__init__.py",
       "path": "therock_multi_vendor/__init__.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/therock_multi_vendor/sgemm_example.py",
+      "path": "therock_multi_vendor/sgemm_example.py",
       "root": "tools"
     }
   ],

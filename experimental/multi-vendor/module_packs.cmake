@@ -27,7 +27,11 @@ set(_module_descriptor "")
 foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
   set(_vendor "${THEROCK_MULTI_VENDOR_${_key}_VENDOR}")
   set(_sdk_args)
-  set(_native_sources kernels.cpp loader.cpp module_service_hip_cuda.h)
+  set(_native_sources kernels.cpp loader.cpp module_service_hip_cuda.h module_service_blas.h)
+  set(_enable_sgemm OFF)
+  if(THEROCK_ENABLE_MULTI_VENDOR_SGEMM AND _vendor MATCHES "^(amd|nvidia)$")
+    set(_enable_sgemm ON)
+  endif()
   if(_vendor STREQUAL "amd")
     set(_sdk "${THEROCK_MULTI_VENDOR_AMD_ROOT}")
     set(_compiler_target "${THEROCK_MULTI_VENDOR_${_key}_COMPILER_TARGET}")
@@ -59,12 +63,14 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
     EXTRA_DEPENDS "${_therock_input_report}" "${_therock_input_guard}"
       "${THEROCK_SOURCE_DIR}/build_tools/configure_module_contract.py"
       "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/module_contract.py"
+      "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/sgemm_contract.py"
     NO_INSTALL_RPATH
     FPRINT_SOURCE_HASH
     CMAKE_ARGS
       "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
       "-DTHEROCK_MODULE_TOOLS_DIR=${THEROCK_SOURCE_DIR}/build_tools"
       "-DTHEROCK_MODULE_BACKEND=${_vendor}"
+      "-DTHEROCK_MODULE_ENABLE_SGEMM=${_enable_sgemm}"
       "-DTHEROCK_MODULE_TARGET=${_compiler_target}"
       "-DTHEROCK_MODULE_SDK_ROOT=${_sdk}"
       "-DTHEROCK_MODULE_COMPILER=${_compiler}"
@@ -86,7 +92,8 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
     "${THEROCK_SOURCE_DIR}/tests/multi_vendor/modules/module_service_protocol.h"
     "${THEROCK_SOURCE_DIR}/tests/multi_vendor/modules/device_inventory.h"
     "${THEROCK_SOURCE_DIR}/build_tools/configure_module_contract.py"
-    "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/module_contract.py")
+    "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/module_contract.py"
+    "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/sgemm_contract.py")
   therock_cmake_subproject_activate("${_native_project}")
   _therock_multi_vendor_register_inputs("${_native_project}")
   list(APPEND _native_projects "${_native_project}")
@@ -255,6 +262,22 @@ foreach(_key IN LISTS _native_keys)
       FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
       RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
+  if(THEROCK_ENABLE_MULTI_VENDOR_SGEMM AND _vendor MATCHES "^(amd|nvidia)$")
+    set(_sgemm_format hsaco)
+    if(_vendor STREQUAL "nvidia")
+      set(_sgemm_format mixed)
+    endif()
+    set(_test "sgemm-client-${_key}")
+    add_test(NAME "${_test}"
+      COMMAND "${Python3_EXECUTABLE}" -I
+        "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_example.py"
+        --dist-root "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_key}_ID}"
+        --format "${_sgemm_format}" --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+    set_tests_properties("${_test}" PROPERTIES
+      LABELS "multi-vendor;sgemm;module-client;gpu;${_vendor}"
+      FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+      RUN_SERIAL TRUE TIMEOUT 180)
+  endif()
   foreach(_module saxpy relu)
     foreach(_format IN LISTS _formats)
       set(_test "packed-module-${_key}-${_module}-${_format}")
@@ -288,6 +311,21 @@ foreach(_amd_key IN LISTS _native_keys)
   foreach(_nvidia_key IN LISTS _native_keys)
     if(NOT THEROCK_MULTI_VENDOR_${_nvidia_key}_VENDOR STREQUAL "nvidia")
       continue()
+    endif()
+    if(THEROCK_ENABLE_MULTI_VENDOR_SGEMM)
+      set(_test "sgemm-client-pair-${_amd_key}-${_nvidia_key}")
+      add_test(NAME "${_test}"
+        COMMAND "${Python3_EXECUTABLE}" -I
+          "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_example.py"
+          --dist-root "${_module_dist}"
+          --target "${THEROCK_MULTI_VENDOR_${_amd_key}_ID}" --format hsaco
+          --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}"
+          --peer-target "${THEROCK_MULTI_VENDOR_${_nvidia_key}_ID}" --peer-format mixed
+          --peer-device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+      set_tests_properties("${_test}" PROPERTIES
+        LABELS "multi-vendor;sgemm;module-client;multi-vendor-client;gpu;amd;nvidia"
+        FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+        RUN_SERIAL TRUE TIMEOUT 180)
     endif()
     set(_test "packed-client-pair-${_amd_key}-${_nvidia_key}")
     add_test(NAME "${_test}"

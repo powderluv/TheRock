@@ -13,10 +13,23 @@ from typing import cast
 
 from _therock_utils.gpu_targets import Vendor
 from _therock_utils.module_contract import RunnerDescription, runner_description
+from _therock_utils.sgemm_contract import (
+    SGEMM_ABI,
+    SGEMM_VERSION,
+    SGEMM_CAPABILITY,
+    sgemm_contract_record,
+    sgemm_contract_sha256,
+    sgemm_provider_for_vendor,
+)
 
 
 def render_header(description: RunnerDescription) -> str:
     contract = description.contract
+    enabled = SGEMM_CAPABILITY in description.capabilities
+    provider = sgemm_provider_for_vendor(description.vendor) if enabled else ""
+    sgemm_json = json.dumps(
+        sgemm_contract_record(), sort_keys=True, separators=(",", ":")
+    )
     # JSON string escaping is valid for these ASCII C++ string constants. No
     # caller-provided C++ fragments or raw-string delimiters enter the header.
     description_json = json.dumps(
@@ -34,6 +47,12 @@ def render_header(description: RunnerDescription) -> str:
             f"inline constexpr unsigned kGroupSize = {contract.launch.block[0]};",
             f"inline constexpr unsigned kPointerBits = {contract.pointer_bits};",
             f"inline constexpr char kRunnerDescription[] = {json.dumps(description_json)};",
+            f"inline constexpr bool kSgemmEnabled = {str(enabled).lower()};",
+            f"inline constexpr char kSgemmProvider[] = {json.dumps(provider)};",
+            f"inline constexpr char kSgemmAbi[] = {json.dumps(SGEMM_ABI)};",
+            f"inline constexpr unsigned kSgemmVersion = {SGEMM_VERSION};",
+            f"inline constexpr char kSgemmContractSha256[] = {json.dumps(sgemm_contract_sha256())};",
+            f"inline constexpr char kSgemmContractJson[] = {json.dumps(sgemm_json)};",
             "}  // namespace therock::module_contract",
             "",
         )
@@ -41,10 +60,14 @@ def render_header(description: RunnerDescription) -> str:
 
 
 def configure_contract(
-    vendor: Vendor, header_path: Path, description_path: Path
+    vendor: Vendor,
+    header_path: Path,
+    description_path: Path,
+    *,
+    enable_sgemm: bool = False,
 ) -> None:
     """Generate stable files; replacements are atomic per file, not as a pair."""
-    description = runner_description(vendor)
+    description = runner_description(vendor, enable_sgemm=enable_sgemm)
     if header_path.resolve() == description_path.resolve():
         raise ValueError("Header and description outputs must be distinct")
     documents = (
@@ -86,9 +109,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--vendor", choices=("amd", "nvidia", "intel"), required=True)
     parser.add_argument("--header", type=Path, required=True)
     parser.add_argument("--description", type=Path, required=True)
+    parser.add_argument("--enable-sgemm", action="store_true")
     args = parser.parse_args(argv)
     try:
-        configure_contract(cast(Vendor, args.vendor), args.header, args.description)
+        configure_contract(
+            cast(Vendor, args.vendor),
+            args.header,
+            args.description,
+            enable_sgemm=args.enable_sgemm,
+        )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     return 0

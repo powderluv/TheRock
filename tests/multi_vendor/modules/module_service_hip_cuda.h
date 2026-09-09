@@ -33,6 +33,11 @@ private:
   // Stream destruction drains before releasing the selected device scope.
   Device device_;
   Stream stream_;
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+  // This owner is released before the stream/context; State drains before it
+  // releases any caller buffers, modules, or library workspace.
+  ServiceBlas blas_{stream_.value};
+#endif
 
   static Options device_options(const therock::module_service::Config &config) {
     if (config.device_id != 0) {
@@ -195,6 +200,31 @@ public:
                                     arguments, nullptr));
 #endif
   }
+
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+  std::string sgemm_info() { return blas_.info(); }
+
+  void sgemm(Buffer &a, Buffer &b, Buffer &c,
+             const therock::module_service::SgemmRequest &request) {
+    // All matrix spans and casts have already been checked by the common
+    // protocol. Convert connection-owned offsets to native addresses only here.
+#if defined(THEROCK_MODULE_NVIDIA)
+    const auto a_pointer = reinterpret_cast<const float *>(
+        static_cast<uintptr_t>(pointer_at(a, request.a_offset)));
+    const auto b_pointer = reinterpret_cast<const float *>(
+        static_cast<uintptr_t>(pointer_at(b, request.b_offset)));
+    auto c_pointer = reinterpret_cast<float *>(
+        static_cast<uintptr_t>(pointer_at(c, request.c_offset)));
+#else
+    const auto a_pointer =
+        static_cast<const float *>(pointer_at(a, request.a_offset));
+    const auto b_pointer =
+        static_cast<const float *>(pointer_at(b, request.b_offset));
+    auto c_pointer = static_cast<float *>(pointer_at(c, request.c_offset));
+#endif
+    blas_.sgemm(a_pointer, b_pointer, c_pointer, request);
+  }
+#endif
 
   void synchronize() noexcept {
 #if defined(THEROCK_MODULE_NVIDIA)

@@ -208,6 +208,7 @@ class PackedModuleSessionTest(unittest.TestCase):
             "ModuleServiceProtocolError",
             "ModuleServiceTimeoutError",
             "ModuleServiceRemoteError",
+            "SgemmProviderInfo",
         }
         self.assertEqual(set(therock_multi_vendor.__all__), expected)
         self.assertTrue(

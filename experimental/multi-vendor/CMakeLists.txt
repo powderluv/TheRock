@@ -5,6 +5,9 @@ if(Python3_VERSION VERSION_LESS 3.10)
   message(FATAL_ERROR "The multi-vendor-hip profile requires Python 3.10 or newer")
 endif()
 
+option(THEROCK_ENABLE_MULTI_VENDOR_SGEMM
+  "Enable experimental rocBLAS/cuBLAS FP32 SGEMM in native module workers" OFF)
+
 set(THEROCK_MULTI_VENDOR_TARGETS "" CACHE STRING
   "Canonical vendor:backend:processor target IDs, separated by semicolons")
 set(THEROCK_MULTI_VENDOR_AMD_ROOT "/opt/rocm" CACHE PATH "Installed AMD ROCm SDK prefix")

@@ -9,7 +9,9 @@ alive in one application and explicitly transfer results through host memory.
 Start with the two-target build below on Shark-a. The four-target build also
 compiles Intel B70 and NVIDIA SM90 payloads; execution on those GPUs remains
 unvalidated. This is an experimental fixed-vector module interface, not a full
-ROCm runtime or a general replacement for HIP/library APIs. See the
+ROCm runtime or a general replacement for HIP/library APIs. The optional
+[SGEMM provider](multi-vendor-sgemm.md) extends the worker with bounded native
+rocBLAS/cuBLAS calls and includes separate build and validation commands. See the
 [architecture](multi-vendor-architecture.md) for the design, alternatives to the
 HIP wrapper, multi-pack/multi-architecture layout, and remaining acceptance gates.
 

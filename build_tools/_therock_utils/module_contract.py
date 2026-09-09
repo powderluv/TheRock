@@ -16,6 +16,12 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 from .gpu_targets import Backend, GpuTarget, PayloadType, Vendor
+from .sgemm_contract import (
+    SGEMM_CAPABILITY,
+    SGEMM_PROVIDER_CAPABILITIES,
+    sgemm_capabilities,
+    validate_sgemm_capabilities,
+)
 
 ArgumentKind = Literal["device-pointer", "scalar"]
 ValueType = Literal["f32", "f64", "u32", "u64", "i32", "i64"]
@@ -54,6 +60,11 @@ _ADAPTER_CAPABILITIES = (
     "multi-module-session",
     "device-module-pipeline",
     "persistent-module-service",
+)
+_SUPPORTED_ADAPTER_CAPABILITIES = (
+    *_ADAPTER_CAPABILITIES,
+    SGEMM_CAPABILITY,
+    *SGEMM_PROVIDER_CAPABILITIES,
 )
 _ENTRY_POINTS = ("therock_module_relu", "therock_module_saxpy")
 
@@ -446,15 +457,22 @@ class RunnerDescription:
         }
 
 
-def runner_description(vendor: Vendor) -> RunnerDescription:
+def runner_description(
+    vendor: Vendor, *, enable_sgemm: bool = False
+) -> RunnerDescription:
     if vendor not in _BACKENDS:
         raise ValueError(f"Unknown runner vendor: {vendor!r}")
+    if type(enable_sgemm) is not bool:
+        raise ValueError("enable_sgemm must be a bool")
+    capabilities = _ADAPTER_CAPABILITIES + (
+        sgemm_capabilities(vendor) if enable_sgemm else ()
+    )
     return RunnerDescription(
         vendor,
         _BACKENDS[vendor],
         _FORMATS[vendor],
         _ENTRY_POINTS,
-        _ADAPTER_CAPABILITIES,
+        capabilities,
         validation_contract(),
     )
 
@@ -541,15 +559,17 @@ def require_runner_compatibility(
         raise ValueError("Runner advertises unsupported validation entry points")
     if not set(contract.required_capabilities) <= set(
         description.capabilities
-    ) or not set(description.capabilities) <= set(_ADAPTER_CAPABILITIES):
+    ) or not set(description.capabilities) <= set(_SUPPORTED_ADAPTER_CAPABILITIES):
         raise ValueError("Runner capabilities are unsupported or insufficient")
+    validate_sgemm_capabilities(description.vendor, description.capabilities)
 
 
 def validate_required_capabilities(values: Iterable[str]) -> tuple[str, ...]:
     """Validate explicit adapter requirements separately from the kernel ABI."""
     requested = tuple(values)
     if not all(
-        isinstance(value, str) and value in _ADAPTER_CAPABILITIES for value in requested
+        isinstance(value, str) and value in _SUPPORTED_ADAPTER_CAPABILITIES
+        for value in requested
     ):
         raise ValueError("Unknown required adapter capability")
     if len(set(requested)) != len(requested):

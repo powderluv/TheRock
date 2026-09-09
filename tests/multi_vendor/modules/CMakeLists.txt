@@ -9,6 +9,11 @@ therock_multi_vendor_initialize_inputs()
 
 set(THEROCK_MODULE_BACKEND "" CACHE STRING "Native module backend: amd, nvidia, or intel")
 set_property(CACHE THEROCK_MODULE_BACKEND PROPERTY STRINGS amd nvidia intel)
+option(THEROCK_MODULE_ENABLE_SGEMM
+  "Enable the selected AMD/NVIDIA SDK SGEMM provider in the native worker" OFF)
+if(THEROCK_MODULE_ENABLE_SGEMM AND NOT THEROCK_MODULE_BACKEND MATCHES "^(amd|nvidia)$")
+  message(FATAL_ERROR "THEROCK_MODULE_ENABLE_SGEMM supports only AMD and NVIDIA; Intel has no SGEMM provider")
+endif()
 set(THEROCK_MODULE_TARGET "" CACHE STRING "Compiler architecture or Intel product identity, e.g. gfx1201, 120, xe2-b70")
 set(THEROCK_MODULE_SDK_ROOT "" CACHE PATH "Installed ROCm, CUDA, or Level Zero SDK prefix")
 set(THEROCK_MODULE_COMPILER "" CACHE FILEPATH "Device compiler: clang++ for AMD, nvcc for NVIDIA, clang for Intel SPIR-V")
@@ -30,13 +35,18 @@ set(THEROCK_MODULE_TOOLS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../build_tools" CA
   "TheRock build tools directory for launch contract generation")
 set(_contract_generator "${THEROCK_MODULE_TOOLS_DIR}/configure_module_contract.py")
 set(_contract_model "${THEROCK_MODULE_TOOLS_DIR}/_therock_utils/module_contract.py")
+set(_sgemm_model "${THEROCK_MODULE_TOOLS_DIR}/_therock_utils/sgemm_contract.py")
+set(_contract_provider_args)
+if(THEROCK_MODULE_ENABLE_SGEMM)
+  list(APPEND _contract_provider_args --enable-sgemm)
+endif()
 set(_contract_header "${CMAKE_CURRENT_BINARY_DIR}/module_contract_data.h")
 set(_contract_config_description "${CMAKE_CURRENT_BINARY_DIR}/runner-contract-config.json")
 set(_contract_description "${CMAKE_CURRENT_BINARY_DIR}/runner-contract.json")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  "${_contract_generator}" "${_contract_model}" "${_contract_header}" "${_contract_config_description}")
+  "${_contract_generator}" "${_contract_model}" "${_sgemm_model}" "${_contract_header}" "${_contract_config_description}")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${_contract_generator}"
-  --vendor "${THEROCK_MODULE_BACKEND}"
+  --vendor "${THEROCK_MODULE_BACKEND}" ${_contract_provider_args}
   --header "${_contract_header}" --description "${_contract_config_description}"
   COMMAND_ERROR_IS_FATAL ANY)
 file(READ "${_contract_config_description}" _contract_json)
@@ -49,7 +59,7 @@ set(_contract_args --launch-abi "${_contract_abi}" --launch-abi-version "${_cont
 # Imported SDK paths can change between configurations. Internal discoveries
 # must follow the selected prefix rather than a prior find_* cache entry.
 foreach(_discovered _hip_include _hip_runtime _level_zero_include _level_zero_loader
-    _compiler _spirv_translator _spirv_validator)
+    _compiler _spirv_translator _spirv_validator _blas_include _blas_library)
   unset(${_discovered} CACHE)
   unset(${_discovered})
 endforeach()
@@ -135,6 +145,40 @@ elseif(THEROCK_MODULE_BACKEND STREQUAL "intel")
   set(_identity_args --expect-device-id "${THEROCK_MODULE_INTEL_DEVICE_ID}")
 else()
   message(FATAL_ERROR "THEROCK_MODULE_BACKEND must be amd, nvidia, or intel")
+endif()
+
+# Provider discovery is constrained to the selected imported SDK. Never use
+# CUDA stub directories as a runtime path or resolve a BLAS library globally.
+if(THEROCK_MODULE_ENABLE_SGEMM)
+  if(THEROCK_MODULE_BACKEND STREQUAL "amd")
+    set(_blas_header rocblas/rocblas.h)
+    set(_blas_name rocblas)
+    set(_blas_include_paths "${THEROCK_MODULE_SDK_ROOT}/include")
+    set(_blas_library_paths "${THEROCK_MODULE_SDK_ROOT}/lib" "${THEROCK_MODULE_SDK_ROOT}/lib64")
+  else()
+    set(_blas_header cublas_v2.h)
+    set(_blas_name cublas)
+    set(_blas_include_paths "${THEROCK_MODULE_SDK_ROOT}/include" "${CUDAToolkit_TARGET_DIR}/include")
+    set(_blas_library_paths "${THEROCK_MODULE_SDK_ROOT}/lib64" "${THEROCK_MODULE_SDK_ROOT}/lib"
+      "${CUDAToolkit_TARGET_DIR}/lib")
+  endif()
+  find_path(_blas_include "${_blas_header}" PATHS ${_blas_include_paths}
+    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_blas_library "${_blas_name}" PATHS ${_blas_library_paths}
+    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  file(REAL_PATH "${THEROCK_MODULE_SDK_ROOT}" _sdk_real)
+  foreach(_blas_input "${_blas_include}/${_blas_header}" "${_blas_library}")
+    file(REAL_PATH "${_blas_input}" _blas_real)
+    cmake_path(IS_PREFIX _sdk_real "${_blas_real}" NORMALIZE _inside_sdk)
+    if(NOT _inside_sdk OR _blas_real MATCHES "/stubs/")
+      message(FATAL_ERROR "SGEMM provider input must resolve inside the selected SDK, outside stub directories: ${_blas_input}")
+    endif()
+  endforeach()
+  target_include_directories(therock_module_validation PRIVATE "${_blas_include}")
+  target_compile_definitions(therock_module_validation PRIVATE THEROCK_MODULE_ENABLE_SGEMM=1)
+  target_link_libraries(therock_module_validation PRIVATE "${_blas_library}")
+  get_filename_component(_blas_library_dir "${_blas_library}" DIRECTORY)
+  set_property(TARGET therock_module_validation APPEND PROPERTY INSTALL_RPATH "${_blas_library_dir}")
 endif()
 
 if(THEROCK_MODULE_COMPILER)

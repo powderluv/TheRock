@@ -33,6 +33,7 @@ from _therock_utils.module_service import (
     ModuleServiceRemoteError,
     NativeModuleSession as _NativeModuleSession,
 )
+from _therock_utils.sgemm_contract import SgemmProviderInfo
 from _therock_utils.runner_registry import (
     load_registry,
     resolve_registry_path,
@@ -49,6 +50,7 @@ __all__ = [
     "ModuleServiceProtocolError",
     "ModuleServiceTimeoutError",
     "ModuleServiceRemoteError",
+    "SgemmProviderInfo",
 ]
 
 
@@ -186,6 +188,44 @@ class PackedModuleSession:
         count: int,
     ) -> None:
         self._native.launch(module, x, y, output, alpha, count)
+
+    def sgemm_provider(self) -> SgemmProviderInfo:
+        return self._native.sgemm_provider()
+
+    def sgemm(
+        self,
+        a: Buffer,
+        b: Buffer,
+        c: Buffer,
+        *,
+        m: int,
+        n: int,
+        k: int,
+        lda: int,
+        ldb: int,
+        ldc: int,
+        a_offset: int = 0,
+        b_offset: int = 0,
+        c_offset: int = 0,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+    ) -> None:
+        self._native.sgemm(
+            a,
+            b,
+            c,
+            m=m,
+            n=n,
+            k=k,
+            lda=lda,
+            ldb=ldb,
+            ldc=ldc,
+            a_offset=a_offset,
+            b_offset=b_offset,
+            c_offset=c_offset,
+            alpha=alpha,
+            beta=beta,
+        )
 
     def synchronize(self) -> None:
         self._native.synchronize()

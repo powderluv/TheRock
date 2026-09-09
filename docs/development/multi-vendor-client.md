@@ -162,3 +162,14 @@ checks still pass; they do not qualify execution of this client on the B70.
 The next interfaces still need agreed semantics: general kernel argument layouts,
 public context/queue/event ownership, library providers, and a shared-library ABI.
 See the [architecture roadmap](multi-vendor-architecture.md#roadmap-and-acceptance-gates).
+
+## Optional SGEMM provider
+
+Enable `THEROCK_ENABLE_MULTI_VENDOR_SGEMM=ON` when building native modules to
+add bounded rocBLAS/cuBLAS SGEMM to AMD/NVIDIA sessions. The existing module
+requests remain required. `session.sgemm_provider()` negotiates the separate
+operation contract and reports the loaded library version; `session.sgemm(...)`
+queues matrix multiplication using the same buffers and stream as packed kernels.
+See the [provider guide](multi-vendor-sgemm.md) for dimensions, strides, offsets,
+scalar/alias restrictions, external dependencies, and a runnable example.
+Intel and default builds reject SGEMM locally without closing the kernel session.
