@@ -100,7 +100,7 @@ cmake --build build/multi-vendor-inputs-hip --target therock-dist --parallel 8
 ctest --test-dir build/multi-vendor-inputs-hip --output-on-failure
 ```
 
-The recorded combined profile passed **30 CTests**, covering the HIP wrapper
+The selective-export checkpoint passed **33 combined-profile CTests**, covering the HIP wrapper
 baseline, native loading, and installed consumers. The default `rocm` profile
 remains separate. To build for one installed SDK, select only its target and omit
 the unused SDK root. Other hardware needs its own supported target and validation;
@@ -179,6 +179,29 @@ install `share/therock/python/requirements.txt` from that copied directory and
 run its example with `-I`. The SDK/runtime and driver dependencies still apply;
 the installed example does not import checkout source paths.
 
+## Export selected targets from the built distribution
+
+Use the [selective-distribution guide](multi-vendor-distributions.md) to create
+AMD-only, NVIDIA-only, or combined delivery directories from the same build.
+Exports keep the installed client and selected payloads; vendor runtimes and
+drivers remain external requirements. The destination must be new:
+
+```sh
+mkdir -p build/target-exports
+PYTHONPATH="$PWD/rocm-systems/shared/kpack/python" \
+  .venv/bin/python -B build_tools/export_multi_vendor_distribution.py export \
+  --source-dist build/multi-vendor-inputs-hip/dist/multi-vendor-modules \
+  --output-dir build/target-exports/paired \
+  --target amd:hip:gfx1201 --target nvidia:cuda:sm_120
+PYTHONPATH="$PWD/rocm-systems/shared/kpack/python" \
+  .venv/bin/python -B build_tools/export_multi_vendor_distribution.py verify \
+  --dist-root build/target-exports/paired
+```
+
+Run the same installed example with the exported directory as `--dist-root`.
+Whole-target export retains all registered modules and formats for each selection.
+It needs no GPU and preserves the source build receipts without rewriting them.
+
 ## Add Intel native Level Zero and an additional NVIDIA architecture
 
 This path compiles and packages Intel SPIR-V and SM90 payloads while retaining
@@ -233,7 +256,7 @@ cmake --build build/multi-vendor-contracts --target therock-dist --parallel 8
 ctest --test-dir build/multi-vendor-contracts -E 'intel|sm90' --output-on-failure
 ```
 
-The recorded native profile passed **26 CTests** with that hardware filter. The
+The selective-export checkpoint passed **29 native-profile CTests** with that hardware filter. The
 build validates both Intel SPIR-V modules offline; SM90 payload architecture checks
 also passed. Neither result establishes execution on those absent cards.
 
@@ -285,11 +308,12 @@ THEROCK_NATIVE_MODULE_BUILD_ROOT="$PWD/build/multi-vendor-contracts/experimental
     build_tools/tests/packed_module_session_test.py \
     build_tools/tests/runner_query_test.py \
     build_tools/tests/packed_session_client_test.py \
-    build_tools/tests/stage_multi_vendor_runtime_test.py
+    build_tools/tests/stage_multi_vendor_runtime_test.py \
+    build_tools/tests/export_multi_vendor_distribution_test.py
 ```
 
-The installed-client checkpoint recorded **345 focused tests passed, no skips**,
-plus **26 native** and **30 combined HIP/native CTests**. Those profiles overlap;
+The selective-export checkpoint recorded **362 focused tests passed, no skips**,
+plus **29 native** and **33 combined HIP/native CTests**. Those profiles overlap;
 they are not an additive unique-test total. The installed paired consumer also
 passed from a relocated distribution and unrelated working directory. Earlier
 independent child runs recorded 110 C++ kpack tests and 38 Python kpack tests.
@@ -310,3 +334,4 @@ and newly captured test logs are the reproducibility inputs for another machine.
 - [Device discovery and dispatch](multi-vendor-dispatch.md)
 - [Events](multi-vendor-events.md), [sessions](multi-vendor-sessions.md), and [device pipelines](multi-vendor-pipelines.md)
 - [Persistent native service](multi-vendor-service.md) and [installed Python client](multi-vendor-client.md)
+- [Selective target distributions](multi-vendor-distributions.md)

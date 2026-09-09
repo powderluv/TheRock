@@ -6,8 +6,9 @@ the subsequent input, launch-contract, discovery, event, session, pipeline, serv
 and installed consumer work, and
 decisions needed to extend it.
 The hardware validation record below remains tied to its stated checkpoint.
-Operational commands belong in the [build runbook](multi-vendor-hip.md) and
-[imported-input guide](multi-vendor-inputs.md).
+Operational commands belong in the [getting-started guide](multi-vendor-getting-started.md),
+[build runbook](multi-vendor-hip.md), [selective-distribution guide](multi-vendor-distributions.md),
+and [imported-input guide](multi-vendor-inputs.md).
 
 ## Decision and scope
 
@@ -97,6 +98,8 @@ flowchart TD
     Stages --> Assemble["Shared pack assembler"]
     Python["Selected Python runtime sources"] --> Assemble
     Assemble --> ModuleDist["Native runners, module packs, and Python client"]
+    ModuleDist --> Export["Verified exact-target export"]
+    Export --> Profiles["Selected runners, repacked payloads, shared client, derivation manifest"]
 ```
 
 Child stages isolate binaries under target slugs. Registered kernel sources
@@ -425,6 +428,23 @@ support independent composition and updates, at the cost of catalog management
 and explicit duplicate policy. No size/performance superiority is claimed
 without measurements.
 
+## Selective delivery from a shared build
+
+[Exact-target export](multi-vendor-distributions.md) derives smaller distributions
+from a completed multi-target build. It retains each selected target's runners,
+all registered logical modules and formats, and the shared installed Python client.
+Selected payloads are verified and repacked, so omitted targets have neither
+runner files nor device bytes in the result. The exporter requires no GPU or
+access to the SDKs that originally built the distribution.
+
+Original build receipts and provenance remain unchanged. A separate derivation
+manifest records source identities, the selected targets, and the exact exported
+file inventory. This adds selective delivery without treating repackaging as a
+new build or enabling artifact-cache reuse. Exports use new destination directories;
+incremental install/uninstall ownership and complete runtime dependency closure
+remain future work. The installed client still verifies exact device identities
+and contract compatibility when executing an exported payload.
+
 ## Roadmap and acceptance gates
 
 1. **Qualify Intel hardware.** Install a B70-capable compute driver, confirm the
@@ -505,3 +525,11 @@ unqualified. See the [getting-started guide](multi-vendor-getting-started.md) fo
 clone, dependency, build, application, and validation commands. Build outputs and
 machine-local evidence are not included in the source repository; record both
 repository revisions and external SDK versions when reproducing the work.
+
+The selective-export checkpoint adds 17 CPU export tests to the focused suite
+(**362 passed, no skips**). Its native and combined profiles pass **29** and
+**33 CTests**, respectively, including three relocated selected-distribution
+consumers per profile. Five copied-source exports preserve exact payload counts
+for AMD, NVIDIA, their pair, NVIDIA multi-architecture, and Intel-only selections.
+Intel and SM90 execution remain deferred; source-independent export is packaging
+evidence. See the [selective-distribution guide](multi-vendor-distributions.md).

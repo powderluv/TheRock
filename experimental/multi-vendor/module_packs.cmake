@@ -305,3 +305,61 @@ foreach(_amd_key IN LISTS _native_keys)
       RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
 endforeach()
+
+# Exercise selective delivery from the same complete build. Each case repacks
+# only its exact targets, relocates the export, and runs the installed consumer
+# from an unrelated working directory. Exporting never queries vendor runtimes.
+foreach(_key IN LISTS _native_keys)
+  set(_vendor "${THEROCK_MULTI_VENDOR_${_key}_VENDOR}")
+  if(_vendor STREQUAL "amd")
+    set(_format hsaco)
+  elseif(_vendor STREQUAL "nvidia")
+    set(_format mixed)
+  else()
+    set(_format spirv)
+  endif()
+  set(_identity_args)
+  if(_vendor STREQUAL "intel" AND THEROCK_MULTI_VENDOR_INTEL_DEVICE_ID)
+    list(APPEND _identity_args --expect-device-id "${THEROCK_MULTI_VENDOR_INTEL_DEVICE_ID}")
+  endif()
+  set(_test "exported-client-${_key}")
+  add_test(NAME "${_test}"
+    COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${_kpack_python}"
+      "${Python3_EXECUTABLE}" -B
+      "${THEROCK_SOURCE_DIR}/tests/multi_vendor/modules/exported_session_client.py"
+      --source-dist "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_key}_ID}"
+      -- --target "${THEROCK_MULTI_VENDOR_${_key}_ID}" --format "${_format}"
+      --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}" ${_identity_args}
+  )
+  set_tests_properties("${_test}" PROPERTIES
+    LABELS "multi-vendor;selective-export;module-client;gpu;${_vendor}"
+    FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+    RUN_SERIAL TRUE TIMEOUT 180)
+endforeach()
+foreach(_amd_key IN LISTS _native_keys)
+  if(NOT THEROCK_MULTI_VENDOR_${_amd_key}_VENDOR STREQUAL "amd")
+    continue()
+  endif()
+  foreach(_nvidia_key IN LISTS _native_keys)
+    if(NOT THEROCK_MULTI_VENDOR_${_nvidia_key}_VENDOR STREQUAL "nvidia")
+      continue()
+    endif()
+    set(_test "exported-client-pair-${_amd_key}-${_nvidia_key}")
+    add_test(NAME "${_test}"
+      COMMAND "${CMAKE_COMMAND}" -E env "PYTHONPATH=${_kpack_python}"
+        "${Python3_EXECUTABLE}" -B
+        "${THEROCK_SOURCE_DIR}/tests/multi_vendor/modules/exported_session_client.py"
+        --source-dist "${_module_dist}"
+        --target "${THEROCK_MULTI_VENDOR_${_amd_key}_ID}"
+        --target "${THEROCK_MULTI_VENDOR_${_nvidia_key}_ID}"
+        -- --target "${THEROCK_MULTI_VENDOR_${_amd_key}_ID}" --format hsaco
+        --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}"
+        --peer-target "${THEROCK_MULTI_VENDOR_${_nvidia_key}_ID}" --peer-format mixed
+        --peer-device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}"
+    )
+    set_tests_properties("${_test}" PROPERTIES
+      LABELS "multi-vendor;selective-export;module-client;gpu;amd;nvidia"
+      FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+      RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
+endforeach()
