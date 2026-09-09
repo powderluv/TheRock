@@ -34,8 +34,10 @@ if(THEROCK_MULTI_VENDOR_HIP_ROOT AND NOT DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
     "HIP compiler runtime SDK prefix")
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/input_guard.cmake")
 project(therock_multi_vendor_validation LANGUAGES HIP)
 include(CTest)
+therock_multi_vendor_initialize_inputs()
 
 set(THEROCK_MULTI_VENDOR_INSTALL_SUBDIR "" CACHE STRING
   "Target slug appended to bin/ so independently compiled backends can coexist")
@@ -53,6 +55,7 @@ set(THEROCK_MULTI_VENDOR_EXPECT_DEVICE_NAME "" CACHE STRING
   "Required case-insensitive substring of the runtime device name")
 
 add_executable(therock_multi_vendor_validation validation.hip)
+therock_multi_vendor_guard_consumer(therock_multi_vendor_validation)
 set_target_properties(therock_multi_vendor_validation PROPERTIES
   HIP_STANDARD 17
   HIP_STANDARD_REQUIRED YES
@@ -91,6 +94,7 @@ if(BUILD_TESTING)
   foreach(_case core streams reduction)
     set(_test "multi-vendor-${THEROCK_MULTI_VENDOR_BACKEND}-${_case}")
     add_test(NAME "${_test}" COMMAND therock_multi_vendor_validation --case "${_case}" ${_test_args})
+    therock_multi_vendor_guard_test("${_test}")
     set_tests_properties("${_test}" PROPERTIES
       LABELS "multi-vendor;gpu;${THEROCK_MULTI_VENDOR_BACKEND}"
       TIMEOUT 180
@@ -104,5 +108,14 @@ if(BUILD_TESTING)
   endforeach()
 endif()
 
+therock_multi_vendor_prepare_install(
+  RECEIPT "${CMAKE_CURRENT_BINARY_DIR}/input-build-receipt.json"
+  FILES
+  "bin/${THEROCK_MULTI_VENDOR_INSTALL_SUBDIR}/therock_multi_vendor_validation${CMAKE_EXECUTABLE_SUFFIX}"
+  "bin/${THEROCK_MULTI_VENDOR_INSTALL_SUBDIR}/input-build-receipt.json")
 install(TARGETS therock_multi_vendor_validation
   RUNTIME DESTINATION "bin/${THEROCK_MULTI_VENDOR_INSTALL_SUBDIR}")
+
+therock_multi_vendor_record_inputs(therock_validation_input_receipt
+  DEPENDS therock_multi_vendor_validation
+  INSTALL_DESTINATION "bin/${THEROCK_MULTI_VENDOR_INSTALL_SUBDIR}")

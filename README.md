@@ -374,3 +374,5 @@ for more details about testing.
 - [Build Artifacts](docs/development/artifacts.md): Documentation about the outputs of the build system.
 - [Releases Page](RELEASES.md): Documentation for how to leverage our build artifacts.
 - [Supported GPUs](SUPPORTED_GPUS.md): Current support status and prioritized roadmap for each AMD GPU architecture.
+- [Experimental Multi-vendor Getting Started](docs/development/multi-vendor-getting-started.md): Clone the fork, build and run on Radeon/NVIDIA, and prepare the native Intel Level Zero path.
+- [Experimental Multi-vendor Architecture](docs/development/multi-vendor-architecture.md): Shared build and pack infrastructure, native validation paths, the [persistent module service](docs/development/multi-vendor-service.md), and the [installed Python client](docs/development/multi-vendor-client.md).

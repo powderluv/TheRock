@@ -107,7 +107,54 @@ class MultiVendorPackCliTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         catalog = json.loads((self.root / "variants/catalog.json").read_text())
+        self.assertEqual(catalog["schema_version"], 1)
+        self.assertTrue(
+            all("contract" not in entry for entry in catalog["packs"][0]["entries"])
+        )
         self.assertEqual(len(catalog["packs"][0]["entries"]), 3)
+
+    def test_validation_contract_flag_creates_schema_two_and_remains_extractable(self):
+        source = self.root / "contract.payload"
+        source.write_bytes(b"synthetic contracted payload")
+        output = self.root / "contracted"
+        result = self._run(
+            "create",
+            "--validation-contract",
+            "--output-dir",
+            output,
+            "--pack-id",
+            "contracted",
+            "--entry",
+            "validation/saxpy",
+            _TARGET,
+            "cubin",
+            "therock_module_saxpy",
+            source,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        catalog = json.loads((output / "catalog.json").read_text())
+        self.assertEqual(catalog["schema_version"], 2)
+        entry = catalog["packs"][0]["entries"][0]
+        self.assertEqual(entry["contract"]["version"], 1)
+        self.assertEqual(entry["contract"]["pointer_bits"], 64)
+        extracted = self.root / "contracted.bin"
+        result = self._run(
+            "extract",
+            "--catalog",
+            output / "catalog.json",
+            "--module",
+            "validation/saxpy",
+            "--target",
+            _TARGET,
+            "--format",
+            "cubin",
+            "--entry-point",
+            "therock_module_saxpy",
+            "--output",
+            extracted,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(extracted.read_bytes(), source.read_bytes())
 
     def test_invalid_create_leaves_output_absent(self):
         source = self.root / "source.payload"

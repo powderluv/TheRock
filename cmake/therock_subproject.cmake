@@ -265,6 +265,10 @@ endfunction()
 # CMAKE_INCLUDES: Additional CMake files to include at the top level.
 # BUILD_DEPS: Projects which must build and provide their packages prior to this
 #   one.
+# BUILD_GUARDS: Existing custom targets that must complete before configure,
+#   build, and stage commands, including prebuilt mode. These are ordering
+#   dependencies, not invalidation stamps; callers must separately declare
+#   files whose changes require rebuilding. Guards are not transitive.
 # RUNTIME_DEPS: Projects which must build prior to this one and whose install
 #   files must be distributed with this project's artifacts in order to
 #   function.
@@ -363,11 +367,17 @@ function(therock_cmake_subproject_declare target_name)
     PARSE_ARGV 1 ARG
     "ACTIVATE;USE_DIST_AMDGPU_TARGETS;USE_TEST_AMDGPU_TARGETS;DISABLE_AMDGPU_TARGETS;EXCLUDE_FROM_ALL;BACKGROUND_BUILD;NO_MERGE_COMPILE_COMMANDS;OUTPUT_ON_FAILURE;NO_INSTALL_RPATH;FPRINT_SOURCE_HASH"
     "EXTERNAL_SOURCE_DIR;BINARY_DIR;DIR_PREFIX;INSTALL_DESTINATION;COMPILER_TOOLCHAIN;INTERFACE_PROGRAM_DIRS;CMAKE_LISTS_RELPATH;INTERFACE_PKG_CONFIG_DIRS;INSTALL_RPATH_EXECUTABLE_DIR;INSTALL_RPATH_LIBRARY_DIR;LOGICAL_TARGET_NAME;FPRINT_SOURCE_DIR"
-    "BUILD_DEPS;RUNTIME_DEPS;CMAKE_ARGS;CMAKE_INCLUDES;INTERFACE_INCLUDE_DIRS;INTERFACE_LINK_DIRS;IGNORE_PACKAGES;EXTRA_DEPENDS;INSTALL_RPATH_DIRS;INTERFACE_INSTALL_RPATH_DIRS;DEFAULT_GPU_TARGETS;FPRINT_FILE_GLOBS;INSTALL_OPTIONAL_COMPONENTS"
+    "BUILD_DEPS;BUILD_GUARDS;RUNTIME_DEPS;CMAKE_ARGS;CMAKE_INCLUDES;INTERFACE_INCLUDE_DIRS;INTERFACE_LINK_DIRS;IGNORE_PACKAGES;EXTRA_DEPENDS;INSTALL_RPATH_DIRS;INTERFACE_INSTALL_RPATH_DIRS;DEFAULT_GPU_TARGETS;FPRINT_FILE_GLOBS;INSTALL_OPTIONAL_COMPONENTS"
   )
   if(TARGET "${target_name}")
     message(FATAL_ERROR "Cannot declare subproject '${target_name}': a target with that name already exists")
   endif()
+  foreach(_guard IN LISTS ARG_BUILD_GUARDS)
+    if(NOT TARGET "${_guard}")
+      message(FATAL_ERROR
+        "BUILD_GUARDS target '${_guard}' must exist before declaring subproject '${target_name}'")
+    endif()
+  endforeach()
   if(NOT ARG_LOGICAL_TARGET_NAME)
     set(ARG_LOGICAL_TARGET_NAME "${target_name}")
   endif()
@@ -533,6 +543,7 @@ function(therock_cmake_subproject_declare target_name)
     THEROCK_CMAKE_INCLUDES "${ARG_CMAKE_INCLUDES}"
     # Non-transitive build deps.
     THEROCK_BUILD_DEPS "${ARG_BUILD_DEPS}"
+    THEROCK_BUILD_GUARDS "${ARG_BUILD_GUARDS}"
     # Transitive runtime deps.
     THEROCK_RUNTIME_DEPS "${_transitive_runtime_deps}"
     # Include dirs that this project compiles with.
@@ -640,6 +651,7 @@ function(therock_cmake_subproject_activate target_name)
   # Get properties.
   get_target_property(_binary_dir "${target_name}" THEROCK_BINARY_DIR)
   get_target_property(_build_deps "${target_name}" THEROCK_BUILD_DEPS)
+  get_target_property(_build_guards "${target_name}" THEROCK_BUILD_GUARDS)
   get_target_property(_build_pool "${target_name}" THEROCK_BUILD_POOL)
   get_target_property(_compiler_toolchain "${target_name}" THEROCK_COMPILER_TOOLCHAIN)
   get_target_property(_transitive_configure_depend_files "${target_name}" THEROCK_INTERFACE_CONFIGURE_DEPEND_FILES)
@@ -960,12 +972,12 @@ function(therock_cmake_subproject_activate target_name)
     add_custom_command(
       OUTPUT "${_configure_stamp_file}"
       COMMAND "${CMAKE_COMMAND}" -E touch "${_configure_stamp_file}"
-      DEPENDS "${_prebuilt_file}"
+      DEPENDS "${_prebuilt_file}" ${_build_guards}
     )
     add_custom_command(
       OUTPUT "${_build_stamp_file}"
       COMMAND "${CMAKE_COMMAND}" -E touch "${_build_stamp_file}"
-      DEPENDS "${_prebuilt_file}"
+      DEPENDS "${_prebuilt_file}" ${_build_guards}
     )
     add_custom_command(
       OUTPUT "${_stage_stamp_file}"
@@ -976,6 +988,7 @@ function(therock_cmake_subproject_activate target_name)
         "${_prebuilt_file}"
         "${_fileset_tool}"
         ${_runtime_dep_stamps}
+        ${_build_guards}
     )
   else()
     # Not pre-built: normal configure/build/stage install.
@@ -1059,6 +1072,7 @@ function(therock_cmake_subproject_activate target_name)
         "${_global_post_include}"
         "${ROCM_BUILD_FLAGS_STATE_FILE}"
         ${_extra_depends}
+        ${_build_guards}
         ${_dep_provider_file}
         ${_configure_dep_stamps}
         ${_pre_hook_path}
@@ -1100,6 +1114,7 @@ function(therock_cmake_subproject_activate target_name)
       DEPENDS
         "${_configure_stamp_file}"
         ${_sources}
+        ${_build_guards}
     )
     add_custom_target(
       "${target_name}+build"
@@ -1163,6 +1178,7 @@ function(therock_cmake_subproject_activate target_name)
       DEPENDS
         "${_build_stamp_file}"
         "${_fileset_tool}"
+        ${_build_guards}
     )
   endif()  # Split between pre-built and build mode
   add_custom_target(

@@ -13,7 +13,8 @@ consumer and is not a dependency of this project.
 
 ## Build inputs
 
-CMake 3.25 or newer is required.
+CMake 3.25 or newer and Python 3.10 or newer are required. The Python contract generator
+produces a header and JSON description from the same logical ABI model.
 
 | Variable                          | Meaning                                                                                                                                             |
 | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -96,17 +97,33 @@ Payloads install under `share/therock/modules/<slug>/`. Each backend's loader
 installs as `bin/<slug>/therock_module_validation`. For example:
 
 ```sh
+therock_contract_sha256="$(therock_module_validation --describe-contract | \
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["contract_sha256"])')"
 therock_module_validation --payload /path/to/relu.cubin \
-  --symbol therock_module_relu --device 0 --expect-arch sm_120
+  --symbol therock_module_relu --device 0 --expect-arch sm_120 \
+  --launch-abi therock.validation.f32-vector --launch-abi-version 1 \
+  --launch-contract-sha256 "$therock_contract_sha256" --payload-format cubin
 ```
 
 For the Intel Level Zero loader:
 
 ```sh
+therock_contract_sha256="$(therock_module_validation --describe-contract | \
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["contract_sha256"])')"
 therock_module_validation --payload /path/to/relu.spirv \
   --symbol therock_module_relu --device 0 \
-  --expect-arch spirv --expect-device-id 0xe223
+  --expect-arch spirv --expect-device-id 0xe223 \
+  --launch-abi therock.validation.f32-vector --launch-abi-version 1 \
+  --launch-contract-sha256 "$therock_contract_sha256" --payload-format spirv
 ```
+
+`--describe-contract` is an exclusive mode with no payload read or GPU API calls.
+It reports compiled adapter support, including the logical argument/ownership
+contract. All payload launches require the four contract/format flags shown above;
+CTest supplies them automatically. See the
+[module-contract guide](../../../docs/development/multi-vendor-module-contracts.md).
+The hash matches declared metadata; it cannot prove arbitrary payloads implement
+the ABI.
 
 `--expect-arch spirv` identifies the payload contract; it does not identify an
 Intel GPU architecture. The Intel loader enumerates only root GPU devices with
@@ -125,12 +142,11 @@ ABI `(const float *x, const float *y, float *output, float alpha, unsigned count
 SAXPY computes `alpha*x+y`; the activation variant computes
 `max(0, alpha*x+y-0.125)`.
 
-Each hardware run checks sizes 1, 127, 128, 129, 4099, and 65539 over three rounds,
-including 17 output guard elements. AMD/NVIDIA copies and launches use one
-explicit nonblocking stream. Intel uses Level Zero host/device allocations and
-an asynchronous command queue with command-list barriers between input copies,
-the kernel launch, and readback. Queue completion precedes CPU result checks and
-allocation cleanup. Every allocation, copy, module operation, launch,
+The built-in fixture runs check sizes 1, 127, 128, 129, 4099, and 65539 over three rounds,
+including 17 output guard elements. Upload, compute, and readback use three
+queues with explicit event dependencies. Completion precedes CPU result checks
+and resource reuse. Sessions retain all loaded modules and reuse one
+maximum-sized set of buffers, queues, and events across sizes and requests. Every allocation, copy, module operation, launch,
 synchronization, and cleanup operation is checked. The sources do not assume a
 warp or wave width.
 
@@ -149,4 +165,70 @@ attributes. These suffixes remain in the device compilation target.
 
 Installed AMD and Intel loaders retain runpaths to their imported SDK libraries.
 Vendor drivers and SDK runtimes remain external dependencies. Rebuild in a clean
-directory when an SDK or compiler installation changes in place.
+directory when an SDK or compiler installation changes in place, or follow the
+[explicit input-lock update workflow](../../../docs/development/multi-vendor-inputs.md)
+for a profile-managed build.
+
+## Structured device discovery
+
+Each native executable accepts `--list-devices` alone. This initializes the driver
+and returns a strict JSON device inventory without explicitly creating execution
+resources. `--describe-contract` remains offline. The profile packages runner
+identities in `share/therock/packs/runners.json`; its packed-module CTests use the
+[unified dispatcher](../../../docs/development/multi-vendor-dispatch.md) to select
+an exact target and verify discovered identity before launching.
+
+Inventory schema 2 includes `device_uuid`, encoded as 32 lowercase hex digits
+from the driver's raw UUID bytes. Native `--expect-device-uuid` validates syntax
+before driver access and checks identity before explicitly creating execution
+resources. The unified dispatcher always passes the observed UUID, including
+when the caller selects an ordinal. Its `--device-uuid` selector is mutually
+exclusive with `--device`; UUID matching still requires the exact target.
+
+The fixtures now use three queues with explicit upload, compute, and readback
+events. Compiled descriptions advertise `cross-queue-events`; packed-module
+CTest requires that capability through the dispatcher. The logical kernel
+contract remains unchanged. See the [event validation guide](../../../docs/development/multi-vendor-events.md)
+for lifetime, timeout, and qualification details.
+
+## Multi-module sessions
+
+The native `--module FORMAT SYMBOL PATH` option can be repeated to run loaded
+modules in one session. It requires global launch-contract and device flags and
+is mutually exclusive with the legacy payload/symbol/format flags. The unified
+`run-batch` dispatcher obtains these payloads from verified packs and requires
+`multi-module-session` plus `cross-queue-events`. See the
+[session guide](../../../docs/development/multi-vendor-sessions.md).
+
+Native `--pipeline` adds device-resident composition to module mode. Stages may
+repeat, take their input from the preceding output, and alternate two scratch
+buffers. Readback and validation follow the final stage. The verified dispatcher
+exposes this through `run-pipeline`; see the
+[pipeline guide](../../../docs/development/multi-vendor-pipelines.md).
+
+## Persistent service
+
+Native `--serve` is an exclusive mode with framed binary RPC v1 on stdin/stdout
+and diagnostics on stderr. One device context and queue serve caller-managed
+requests for module/buffer handles, offset transfers, launches, synchronization,
+release, and unload. AMD/NVIDIA may acknowledge queued launches; Intel completes
+each operation before replying. Handles stay owned by the worker until a drain
+precedes destruction.
+
+The verified `run-service` dispatcher exercises one to three stages and requires
+`persistent-module-service`. Its Python fixture supplies data and alpha values
+rather than invoking the native three-queue fixture loop. The direct
+`NativeModuleSession` client supports serialized calls with 32 live modules and
+64 live buffers under the same fixed vector ABI. See the
+[service guide](../../../docs/development/multi-vendor-service.md) for exact
+HELLO/OPEN checks, opaque-handle ownership, timeouts, and qualification limits.
+
+## Installed Python consumer
+
+`packed_session_client.py` exercises the public `therock_multi_vendor` API from
+its installed distribution with isolated Python imports. Single-device cases
+reuse preloaded SAXPY/ReLU handles and caller-owned data; the paired AMD/NVIDIA
+case keeps both native workers alive, passes intermediate values through host
+memory, rejects foreign handles, and checks that closing one leaves the other
+usable. The pack child installs the script under `share/therock/examples`.
+See the [client guide](../../../docs/development/multi-vendor-client.md).

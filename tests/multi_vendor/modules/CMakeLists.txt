@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.25)
+include("${CMAKE_CURRENT_LIST_DIR}/../input_guard.cmake")
 project(therock_native_module_validation LANGUAGES CXX)
 include(CTest)
+therock_multi_vendor_initialize_inputs()
 
 set(THEROCK_MODULE_BACKEND "" CACHE STRING "Native module backend: amd, nvidia, or intel")
 set_property(CACHE THEROCK_MODULE_BACKEND PROPERTY STRINGS amd nvidia intel)
@@ -22,6 +24,28 @@ if(NOT THEROCK_MODULE_SDK_ROOT)
   message(FATAL_ERROR "Set THEROCK_MODULE_SDK_ROOT to the installed backend SDK")
 endif()
 
+# One contract model supplies both pack metadata and compiled runner descriptions.
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+set(THEROCK_MODULE_TOOLS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../build_tools" CACHE PATH
+  "TheRock build tools directory for launch contract generation")
+set(_contract_generator "${THEROCK_MODULE_TOOLS_DIR}/configure_module_contract.py")
+set(_contract_model "${THEROCK_MODULE_TOOLS_DIR}/_therock_utils/module_contract.py")
+set(_contract_header "${CMAKE_CURRENT_BINARY_DIR}/module_contract_data.h")
+set(_contract_config_description "${CMAKE_CURRENT_BINARY_DIR}/runner-contract-config.json")
+set(_contract_description "${CMAKE_CURRENT_BINARY_DIR}/runner-contract.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${_contract_generator}" "${_contract_model}" "${_contract_header}" "${_contract_config_description}")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${_contract_generator}"
+  --vendor "${THEROCK_MODULE_BACKEND}"
+  --header "${_contract_header}" --description "${_contract_config_description}"
+  COMMAND_ERROR_IS_FATAL ANY)
+file(READ "${_contract_config_description}" _contract_json)
+string(JSON _contract_abi GET "${_contract_json}" contract abi)
+string(JSON _contract_version GET "${_contract_json}" contract version)
+string(JSON _contract_hash GET "${_contract_json}" contract_sha256)
+set(_contract_args --launch-abi "${_contract_abi}" --launch-abi-version "${_contract_version}"
+  --launch-contract-sha256 "${_contract_hash}")
+
 # Imported SDK paths can change between configurations. Internal discoveries
 # must follow the selected prefix rather than a prior find_* cache entry.
 foreach(_discovered _hip_include _hip_runtime _level_zero_include _level_zero_loader
@@ -35,6 +59,8 @@ if(THEROCK_MODULE_BACKEND STREQUAL "intel")
 else()
   add_executable(therock_module_validation loader.cpp)
 endif()
+target_include_directories(therock_module_validation PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+therock_multi_vendor_guard_consumer(therock_module_validation)
 target_compile_features(therock_module_validation PRIVATE cxx_std_17)
 set_target_properties(therock_module_validation PROPERTIES CXX_EXTENSIONS NO)
 
@@ -165,7 +191,7 @@ foreach(_module saxpy relu)
           "${_bitcode}" -o "${_payload}.unvalidated"
         COMMAND "${_spirv_validator}" --target-env opencl1.2 "${_payload}.unvalidated"
         COMMAND "${CMAKE_COMMAND}" -E rename "${_payload}.unvalidated" "${_payload}"
-        DEPENDS kernels.cl
+        DEPENDS kernels.cl "${_contract_config_description}" ${_therock_input_dependencies}
         BYPRODUCTS "${_bitcode}"
         COMMENT "Compiling and validating portable SPIR-V ${_module} for ${THEROCK_MODULE_TARGET}"
         VERBATIM
@@ -189,7 +215,7 @@ foreach(_module saxpy relu)
         COMMAND "${_compiler}" ${_device_args} -O2 -std=c++17
           "-DTHEROCK_MODULE_RELU=${_relu}"
           "${CMAKE_CURRENT_SOURCE_DIR}/kernels.cpp" -o "${_payload}"
-        DEPENDS kernels.cpp
+        DEPENDS kernels.cpp "${_contract_config_description}" ${_therock_input_dependencies}
         COMMENT "Compiling native ${_module}.${_format} for ${THEROCK_MODULE_TARGET}"
         VERBATIM
       )
@@ -200,7 +226,8 @@ foreach(_module saxpy relu)
       add_test(NAME "${_test}" COMMAND therock_module_validation
         --payload "${_payload}" --symbol "therock_module_${_module}"
         --device "${THEROCK_MODULE_DEVICE_INDEX}" --expect-arch "${_runtime_arch}"
-        ${_identity_args})
+        ${_identity_args} ${_contract_args} --payload-format "${_format}")
+      therock_multi_vendor_guard_test("${_test}")
       set_tests_properties("${_test}" PROPERTIES
         LABELS "multi-vendor;native-module;gpu;${THEROCK_MODULE_BACKEND}"
         RUN_SERIAL TRUE TIMEOUT 180)
@@ -208,7 +235,52 @@ foreach(_module saxpy relu)
   endforeach()
 endforeach()
 add_custom_target(therock_module_payloads ALL DEPENDS ${_payloads})
+
+# Publish the contract only after all outputs implementing it have built. A
+# configure-only contract change must not relabel previously completed outputs.
+add_custom_command(OUTPUT "${_contract_description}"
+  COMMAND "${CMAKE_COMMAND}" -E copy
+    "${_contract_config_description}" "${_contract_description}"
+  DEPENDS therock_module_validation ${_payloads} "${_contract_config_description}"
+  COMMENT "Recording completed native module launch contract"
+  VERBATIM)
+add_custom_target(therock_module_contract ALL DEPENDS "${_contract_description}")
+
+# This gate is unconditional: standalone native builds also require a completed
+# contract. Check before the imported-input helper can remove staged outputs.
+_therock_multi_vendor_quote(_contract_config_literal "${_contract_config_description}")
+_therock_multi_vendor_quote(_contract_completed_literal "${_contract_description}")
+string(CONFIGURE [[
+if(NOT EXISTS @_contract_completed_literal@ OR IS_DIRECTORY @_contract_completed_literal@)
+  message(FATAL_ERROR "Completed native module contract is missing. Build the native module runner and all payloads before installing.")
+endif()
+if(NOT EXISTS @_contract_config_literal@ OR IS_DIRECTORY @_contract_config_literal@)
+  message(FATAL_ERROR "Configured native module contract is missing. Configure and build the native module consumer before installing.")
+endif()
+file(SHA256 @_contract_config_literal@ _configured_contract_sha256)
+file(SHA256 @_contract_completed_literal@ _completed_contract_sha256)
+if(NOT _completed_contract_sha256 STREQUAL _configured_contract_sha256)
+  message(FATAL_ERROR "Stale completed native module contract. Rebuild the native module runner and all payloads before installing.")
+endif()
+]] _contract_install_check @ONLY)
+install(CODE "${_contract_install_check}")
+set(_installed_outputs
+  "bin/${THEROCK_MODULE_INSTALL_SUBDIR}/therock_module_validation${CMAKE_EXECUTABLE_SUFFIX}"
+  "bin/${THEROCK_MODULE_INSTALL_SUBDIR}/input-build-receipt.json"
+  "bin/${THEROCK_MODULE_INSTALL_SUBDIR}/runner-contract.json")
+foreach(_payload IN LISTS _payloads)
+  get_filename_component(_name "${_payload}" NAME)
+  list(APPEND _installed_outputs "share/therock/modules/${THEROCK_MODULE_INSTALL_SUBDIR}/${_name}")
+endforeach()
+therock_multi_vendor_prepare_install(
+  RECEIPT "${CMAKE_CURRENT_BINARY_DIR}/input-build-receipt.json"
+  FILES ${_installed_outputs})
 install(TARGETS therock_module_validation
   RUNTIME DESTINATION "bin/${THEROCK_MODULE_INSTALL_SUBDIR}")
+install(FILES "${_contract_description}" DESTINATION "bin/${THEROCK_MODULE_INSTALL_SUBDIR}")
 install(FILES ${_payloads}
   DESTINATION "share/therock/modules/${THEROCK_MODULE_INSTALL_SUBDIR}")
+
+therock_multi_vendor_record_inputs(therock_module_input_receipt
+  DEPENDS therock_module_validation ${_payloads} "${_contract_description}"
+  INSTALL_DESTINATION "bin/${THEROCK_MODULE_INSTALL_SUBDIR}")

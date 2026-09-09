@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast
 
 from _therock_utils.gpu_targets import PayloadType, parse_gpu_target
+from _therock_utils.module_contract import validation_contract
 from _therock_utils.payload_catalog import PayloadInput, create_pack, extract_payload
 
 
@@ -20,6 +21,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     create = commands.add_parser("create", help="Create one .kpack and catalog.json")
     create.add_argument("--output-dir", type=Path, required=True)
     create.add_argument("--pack-id", required=True)
+    create.add_argument(
+        "--validation-contract",
+        action="store_true",
+        help="Declare the fixed validation launch ABI and write schema 2 (default: schema 1)",
+    )
     create.add_argument(
         "--entry",
         nargs=5,
@@ -46,6 +52,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     payload_type=cast(PayloadType, payload_type),
                     entry_points=(symbol,),
                     data=Path(filename).read_bytes(),
+                    contract=(
+                        validation_contract() if args.validation_contract else None
+                    ),
                 )
                 for module, target, payload_type, symbol, filename in args.entry
             ]

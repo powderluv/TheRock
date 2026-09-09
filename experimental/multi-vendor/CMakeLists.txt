@@ -85,6 +85,8 @@ endforeach()
 if(_needs_nvidia AND NOT THEROCK_ENABLE_HIP_NVIDIA_SDK)
   message(FATAL_ERROR "Selected NVIDIA targets require THEROCK_ENABLE_HIP_NVIDIA_SDK=ON")
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/input_provenance.cmake")
+
 if(_needs_nvidia)
   # CLR already supports installing the HIP common and HIPNV headers without
   # compiling its AMD runtime. CUDA remains an externally installed dependency.
@@ -92,6 +94,7 @@ if(_needs_nvidia)
     EXTERNAL_SOURCE_DIR "${THEROCK_ROCM_SYSTEMS_SOURCE_DIR}/projects/clr"
     BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/hip-nvidia-sdk"
     DISABLE_AMDGPU_TARGETS
+    BUILD_GUARDS multi-vendor-verify-inputs
     NO_MERGE_COMPILE_COMMANDS
     CMAKE_ARGS
       "-DCLR_BUILD_HIP=ON"
@@ -121,8 +124,10 @@ if(_needs_nvidia)
   target_sources(hip-nvidia-sdk PRIVATE ${_hip_nvidia_sdk_sources})
   therock_cmake_subproject_provide_package(hip-nvidia-sdk hip lib/cmake/hip)
   therock_cmake_subproject_activate(hip-nvidia-sdk)
+  _therock_multi_vendor_register_inputs(hip-nvidia-sdk)
   therock_provide_artifact(hip-nvidia-sdk
     TARGET_NEUTRAL
+    BUILD_GUARDS multi-vendor-verify-inputs
     DESCRIPTOR artifact-hip-nvidia-sdk.toml
     DISTRIBUTION hip-nvidia
     COMPONENTS dev
@@ -136,6 +141,7 @@ if(THEROCK_BUILD_TESTING AND THEROCK_ENABLE_MULTI_VENDOR_MODULES)
 endif()
 
 if(NOT THEROCK_BUILD_TESTING OR NOT THEROCK_ENABLE_MULTI_VENDOR_VALIDATION)
+  _therock_multi_vendor_finalize_inputs()
   return()
 endif()
 
@@ -146,14 +152,16 @@ file(MAKE_DIRECTORY "${_metadata_stage}/share/therock/multi-vendor")
 configure_file("${CMAKE_CURRENT_BINARY_DIR}/gpu_targets.json"
   "${_metadata_stage}/share/therock/multi-vendor/gpu_targets.json" COPYONLY)
 file(SHA256 "${CMAKE_CURRENT_BINARY_DIR}/gpu_targets.json" _metadata_sha256)
+configure_file("${_therock_input_report}"
+  "${_metadata_stage}/share/therock/multi-vendor/hip-input-provenance.json" COPYONLY)
 set(_validation_artifact_sections
   "# Target selection SHA256: ${_metadata_sha256}\n"
   "[components.test.\"experimental/multi-vendor/metadata-stage\"]\n"
-  "include = [\"share/therock/multi-vendor/gpu_targets.json\"]\n\n"
+  "include = [\"share/therock/multi-vendor/gpu_targets.json\", \"share/therock/multi-vendor/hip-input-provenance.json\"]\n\n"
 )
 # set() forms a CMake list; concatenate the descriptor fragments as plain TOML.
 list(JOIN _validation_artifact_sections "" _validation_artifact_sections)
-message(STATUS "Validation artifact cache reuse is disabled for external SDK/compiler inputs")
+message(STATUS "Validation artifact cache reuse is disabled: imported-input locks do not cover the full build environment")
 foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
   set(_vendor "${THEROCK_MULTI_VENDOR_${_key}_VENDOR}")
   set(_processor "${THEROCK_MULTI_VENDOR_${_key}_PROCESSOR}")
@@ -207,10 +215,14 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
     EXTERNAL_SOURCE_DIR "${THEROCK_SOURCE_DIR}/tests/multi_vendor"
     BINARY_DIR "${_binary_dir}"
     DISABLE_AMDGPU_TARGETS
+    BUILD_GUARDS multi-vendor-verify-inputs
+    EXTRA_DEPENDS "${_therock_input_report}" "${_therock_input_guard}"
     NO_INSTALL_RPATH
     FPRINT_SOURCE_HASH
     CMAKE_ARGS
       "-DBUILD_TESTING=ON"
+      "-DTHEROCK_MULTI_VENDOR_INPUT_GUARD=${_therock_input_guard}"
+      "-DTHEROCK_MULTI_VENDOR_INPUT_PROVENANCE=${_therock_input_report}"
       "-DTHEROCK_MULTI_VENDOR_BACKEND=${_vendor}"
       "-DCMAKE_HIP_PLATFORM=${_hip_platform}"
       "-DCMAKE_HIP_COMPILER=${_compiler}"
@@ -222,19 +234,28 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
       ${_sdk_args}
     BUILD_DEPS ${_build_deps}
   )
-  target_sources("${_target}" PRIVATE "${THEROCK_SOURCE_DIR}/tests/multi_vendor/validation.hip")
+  target_sources("${_target}" PRIVATE
+    "${THEROCK_SOURCE_DIR}/tests/multi_vendor/validation.hip"
+    "${THEROCK_SOURCE_DIR}/tests/multi_vendor/input_guard.cmake")
   therock_cmake_subproject_activate("${_target}")
-  # Source hashes do not describe an installed compiler/runtime. Until their
-  # identities are captured, these binaries must not advertise a reusable key.
-  set_property(TARGET "${_target}" PROPERTY THEROCK_FPRINT "")
+  _therock_multi_vendor_register_inputs("${_target}")
   list(APPEND _validation_projects "${_target}")
   add_dependencies(therock-build-tests "${_target}")
+  add_test(NAME "multi-vendor-hip-receipt-${_key}"
+    COMMAND "${CMAKE_COMMAND}"
+      "-DTHEROCK_MULTI_VENDOR_CHECK_PROVENANCE=${_therock_input_report}"
+      "-DTHEROCK_MULTI_VENDOR_CHECK_RECEIPTS=${_binary_dir}/stage/bin/${_key}/input-build-receipt.json"
+      -P "${THEROCK_SOURCE_DIR}/tests/multi_vendor/input_guard.cmake")
+  set_tests_properties("multi-vendor-hip-receipt-${_key}" PROPERTIES
+    FIXTURES_SETUP "multi-vendor-hip-receipt-${_key}" FIXTURES_REQUIRED multi-vendor-inputs
+    LABELS "multi-vendor;provenance")
   add_test(NAME "multi-vendor-${_key}"
     COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${_binary_dir}/build"
       --output-on-failure --no-tests=error -C "$<CONFIG>"
   )
   set_tests_properties("multi-vendor-${_key}" PROPERTIES
     LABELS "multi-vendor;gpu;${_vendor}"
+    FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-hip-receipt-${_key}"
     RUN_SERIAL TRUE
     TIMEOUT 600
   )
@@ -248,9 +269,12 @@ configure_file(artifact-multi-vendor-validation.toml.in
   "${CMAKE_CURRENT_BINARY_DIR}/artifact-multi-vendor-validation.toml" @ONLY)
 list(JOIN THEROCK_MULTI_VENDOR_TARGET_KEYS "-" _validation_bundle)
 therock_provide_artifact(multi-vendor-validation
+  BUILD_GUARDS multi-vendor-verify-inputs
   DESCRIPTOR "${CMAKE_CURRENT_BINARY_DIR}/artifact-multi-vendor-validation.toml"
   DISTRIBUTION multi-vendor-validation
   DIST_BUNDLE_NAME "${_validation_bundle}"
   COMPONENTS test
   SUBPROJECT_DEPS ${_validation_projects}
 )
+
+_therock_multi_vendor_finalize_inputs()

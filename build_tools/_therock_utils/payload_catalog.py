@@ -9,6 +9,11 @@ canonical vendor:backend:processor[:features] identity as its exact target key.
 This preserves the existing two-dimensional KPAK TOC while allowing multiple
 formats of a module for one target. No AMD ISA compatibility matcher is used.
 
+Schema 1 retains legacy entries without contracts. Schema 2 requires a logical
+module contract and its digest on every entry, mirrored in archive metadata.
+The contract describes native adapter arguments, not a packed vendor-neutral
+wire block. Selecting an entry does not negotiate or implement that contract.
+
 SHA256 checks provide integrity relative to the supplied catalog, not publisher
 authentication. Catalogs contain no hardware qualification claims.
 """
@@ -20,13 +25,14 @@ import re
 import struct
 import tempfile
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 from rocm_kpack.kpack import PackedKernelArchive
 
 from .gpu_targets import PayloadType, parse_gpu_target
+from .module_contract import ModuleContract, verify_contract
 
 
 def _identifier(value: str, label: str) -> None:
@@ -79,11 +85,14 @@ class PayloadInput:
     payload_type: PayloadType
     entry_points: tuple[str, ...]
     data: bytes
+    contract: ModuleContract | None = None
 
     def __post_init__(self) -> None:
         _entry_fields(self.module, self.target, self.payload_type, self.entry_points)
         if not isinstance(self.data, bytes) or not self.data:
             raise ValueError("Payload must be nonempty bytes")
+        if self.contract is not None and not isinstance(self.contract, ModuleContract):
+            raise ValueError("Payload contract must be a ModuleContract")
         object.__setattr__(self, "entry_points", tuple(sorted(self.entry_points)))
 
 
@@ -94,11 +103,28 @@ class PayloadEntry:
     payload_type: PayloadType
     entry_points: tuple[str, ...]
     sha256: str
+    contract: ModuleContract | None = None
 
     def __post_init__(self) -> None:
         _entry_fields(self.module, self.target, self.payload_type, self.entry_points)
         _digest(self.sha256)
+        if self.contract is not None and not isinstance(self.contract, ModuleContract):
+            raise ValueError("Entry contract must be a ModuleContract")
         object.__setattr__(self, "entry_points", tuple(sorted(self.entry_points)))
+
+    def record(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "module": self.module,
+            "target": self.target,
+            "payload_type": self.payload_type,
+            "entry_points": list(self.entry_points),
+            "sha256": self.sha256,
+        }
+        if self.contract is not None:
+            result.update(
+                contract=self.contract.record(), contract_sha256=self.contract.sha256
+            )
+        return result
 
     @property
     def key(self) -> tuple[str, str, PayloadType]:
@@ -128,6 +154,10 @@ class PayloadPack:
             raise ValueError("Pack entries must be PayloadEntry values")
         if len({entry.key for entry in self.entries}) != len(self.entries):
             raise ValueError("Ambiguous duplicate payload entry")
+        if len({entry.contract is not None for entry in self.entries}) != 1:
+            raise ValueError(
+                "Cannot mix entries with and without contracts in one pack"
+            )
 
 
 @dataclass(frozen=True)
@@ -136,7 +166,7 @@ class PayloadCatalog:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
             raise ValueError(
                 f"Unsupported catalog schema version: {self.schema_version!r}"
             )
@@ -151,6 +181,28 @@ class PayloadCatalog:
         keys = [entry.key for pack in self.packs for entry in pack.entries]
         if len(set(keys)) != len(keys):
             raise ValueError("Ambiguous duplicate payload entry")
+        for pack in self.packs:
+            if any(
+                (entry.contract is not None) != (self.schema_version == 2)
+                for entry in pack.entries
+            ):
+                raise ValueError(
+                    "Catalog schema 2 requires contracts; schema 1 forbids them"
+                )
+
+    def record(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "packs": [
+                {
+                    "pack_id": pack.pack_id,
+                    "path": pack.path,
+                    "sha256": pack.sha256,
+                    "entries": [entry.record() for entry in pack.entries],
+                }
+                for pack in self.packs
+            ],
+        }
 
 
 def _object(value: object, fields: set[str], label: str) -> dict[str, object]:
@@ -181,15 +233,16 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def load_catalog(path: Path) -> PayloadCatalog:
-    """Parse strict schema 1 metadata; filesystem integrity is checked at extraction."""
+    """Parse strict schema 1/2 metadata; filesystem integrity is checked at extraction."""
     decoded: object = json.loads(
         path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object
     )
     raw = _object(decoded, {"schema_version", "packs"}, "catalog")
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+    if type(raw["schema_version"]) is not int or raw["schema_version"] not in (1, 2):
         raise ValueError(
             f"Unsupported catalog schema version: {raw['schema_version']!r}"
         )
+    schema_version = cast(int, raw["schema_version"])
     packs: list[PayloadPack] = []
     for value in _list(raw["packs"], "packs"):
         pack = _object(value, {"pack_id", "path", "sha256", "entries"}, "pack")
@@ -197,7 +250,8 @@ def load_catalog(path: Path) -> PayloadCatalog:
         for entry_value in _list(pack["entries"], "entries"):
             entry = _object(
                 entry_value,
-                {"module", "target", "payload_type", "entry_points", "sha256"},
+                {"module", "target", "payload_type", "entry_points", "sha256"}
+                | ({"contract", "contract_sha256"} if schema_version == 2 else set()),
                 "payload entry",
             )
             entries.append(
@@ -212,6 +266,14 @@ def load_catalog(path: Path) -> PayloadCatalog:
                         for symbol in _list(entry["entry_points"], "entry points")
                     ),
                     sha256=_string(entry["sha256"], "payload SHA256"),
+                    contract=(
+                        verify_contract(
+                            entry["contract"],
+                            _string(entry["contract_sha256"], "contract SHA256"),
+                        )
+                        if schema_version == 2
+                        else None
+                    ),
                 )
             )
         packs.append(
@@ -222,7 +284,7 @@ def load_catalog(path: Path) -> PayloadCatalog:
                 entries=tuple(entries),
             )
         )
-    return PayloadCatalog(tuple(packs))
+    return PayloadCatalog(tuple(packs), schema_version=schema_version)
 
 
 def create_pack(output_dir: Path, pack_id: str, inputs: Iterable[PayloadInput]) -> Path:
@@ -246,6 +308,7 @@ def create_pack(output_dir: Path, pack_id: str, inputs: Iterable[PayloadInput]) 
             item.payload_type,
             item.entry_points,
             hashlib.sha256(item.data).hexdigest(),
+            item.contract,
         )
         for item in selected
     )
@@ -262,7 +325,17 @@ def create_pack(output_dir: Path, pack_id: str, inputs: Iterable[PayloadInput]) 
                 entry.archive_module,
                 item.target,
                 item.data,
-                metadata={"entry_points": list(entry.entry_points)},
+                metadata={
+                    "entry_points": list(entry.entry_points),
+                    **(
+                        {
+                            "contract": entry.contract.record(),
+                            "contract_sha256": entry.contract.sha256,
+                        }
+                        if entry.contract is not None
+                        else {}
+                    ),
+                },
                 payload_type=item.payload_type,
             )
         )
@@ -289,10 +362,11 @@ def create_pack(output_dir: Path, pack_id: str, inputs: Iterable[PayloadInput]) 
                     hashlib.sha256(staged_pack.read_bytes()).hexdigest(),
                     entries,
                 ),
-            )
+            ),
+            schema_version=2 if entries[0].contract is not None else 1,
         )
         staged_catalog.write_text(
-            json.dumps(asdict(catalog), indent=2, sort_keys=True) + "\n",
+            json.dumps(catalog.record(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         try:
@@ -318,14 +392,20 @@ def _contained_pack(catalog_path: Path, pack: PayloadPack) -> Path:
     return resolved
 
 
-def extract_payload(
+@dataclass(frozen=True)
+class VerifiedPayload:
+    entry: PayloadEntry
+    data: bytes
+
+
+def extract_verified_payload(
     catalog_paths: Iterable[Path],
     module: str,
     target: str,
     payload_type: PayloadType,
     *,
     entry_point: str | None = None,
-) -> bytes:
+) -> VerifiedPayload:
     """Select a unique exact module/target/format across packs, verifying integrity.
 
     Every supplied pack hash is checked before selection. The selected archive is
@@ -385,17 +465,33 @@ def extract_payload(
                 toc_entry = archive.toc[entry.archive_module][entry.target]
                 if toc_entry["type"] != entry.payload_type:
                     raise ValueError("Archive payload type does not match catalog")
-                if toc_entry.get("metadata", {}).get("entry_points") != list(
-                    entry.entry_points
-                ):
+                metadata = toc_entry.get("metadata", {})
+                if metadata.get("entry_points") != list(entry.entry_points):
                     raise ValueError("Archive entry points do not match catalog")
+                if entry.contract is None:
+                    if "contract" in metadata or "contract_sha256" in metadata:
+                        raise ValueError(
+                            "Schema 1 archive must not contain contract metadata"
+                        )
+                else:
+                    metadata = _object(
+                        metadata,
+                        {"entry_points", "contract", "contract_sha256"},
+                        "archive contract metadata",
+                    )
+                    archive_contract = verify_contract(
+                        metadata["contract"],
+                        _string(metadata["contract_sha256"], "archive contract SHA256"),
+                    )
+                    if archive_contract != entry.contract:
+                        raise ValueError("Archive contract does not match catalog")
             payload = archive.get_kernel(selected.archive_module, selected.target)
             if (
                 payload is None
                 or hashlib.sha256(payload).hexdigest() != selected.sha256
             ):
                 raise ValueError("Payload SHA256 mismatch")
-            return payload
+            return VerifiedPayload(selected, payload)
     except (
         KeyError,
         TypeError,
@@ -406,3 +502,17 @@ def extract_payload(
         OverflowError,
     ) as exc:
         raise ValueError(f"Invalid packed payload: {exc}") from exc
+
+
+def extract_payload(
+    catalog_paths: Iterable[Path],
+    module: str,
+    target: str,
+    payload_type: PayloadType,
+    *,
+    entry_point: str | None = None,
+) -> bytes:
+    """Return verified payload bytes, preserving the schema-1 extraction API."""
+    return extract_verified_payload(
+        catalog_paths, module, target, payload_type, entry_point=entry_point
+    ).data

@@ -21,6 +21,10 @@
 # selector. Its filename-safe value is incompatible with TARGET_NEUTRAL and the
 # AMD kpack splitter. Existing callers retain AMD bundle behavior.
 #
+# BUILD_GUARDS names existing custom targets that must complete before artifact
+# population. These are ordering dependencies, not invalidation stamps; callers
+# must separately declare files whose changes require repopulating artifacts.
+#
 # This will produce the following convenience targets:
 # - artifact-${slice_name} : Populate the build/artifacts/{qualified_name}
 #   directory. Added as a dependency of the `therock-artifacts` target.
@@ -31,8 +35,15 @@ function(therock_provide_artifact slice_name)
   cmake_parse_arguments(PARSE_ARGV 1 ARG
     "TARGET_NEUTRAL"
     "DESCRIPTOR;DISTRIBUTION;DIST_BUNDLE_NAME"
-    "COMPONENTS;SUBPROJECT_DEPS"
+    "COMPONENTS;SUBPROJECT_DEPS;BUILD_GUARDS"
   )
+
+  foreach(_guard IN LISTS ARG_BUILD_GUARDS)
+    if(NOT TARGET "${_guard}")
+      message(FATAL_ERROR
+        "BUILD_GUARDS target '${_guard}' must exist before providing artifact '${slice_name}'")
+    endif()
+  endforeach()
 
   if(NOT ${slice_name} MATCHES "^[A-Za-z][A-Za-z0-9-]*$")
     message(FATAL_ERROR
@@ -258,6 +269,7 @@ function(therock_provide_artifact slice_name)
     ${_flatten_command_list}
     DEPENDS
       ${_stamp_file_deps}
+      ${ARG_BUILD_GUARDS}
       "${ARG_DESCRIPTOR}"
       "${_fileset_tool}"
     VERBATIM

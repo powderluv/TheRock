@@ -1,6 +1,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
+import copy
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest import mock
 
 sys.path.insert(0, os.fspath(Path(__file__).parent.parent))
@@ -20,11 +22,14 @@ sys.path.insert(
 import msgpack
 from rocm_kpack.kpack import PackedKernelArchive
 
+from _therock_utils.module_contract import validation_contract
+
 from _therock_utils.payload_catalog import (
     PayloadCatalog,
     PayloadInput,
     create_pack,
     extract_payload,
+    extract_verified_payload,
     load_catalog,
 )
 
@@ -34,14 +39,38 @@ _AMD = "amd:hip:gfx1201"
 _INTEL = "intel:level-zero:xe2-b70"
 
 
-def _input(module="math/saxpy", target=_NVIDIA, payload_type="cubin", data=b"kernel"):
-    return PayloadInput(module, target, payload_type, ("launch",), data)
+def _input(
+    module="math/saxpy",
+    target=_NVIDIA,
+    payload_type="cubin",
+    data=b"kernel",
+    contract=None,
+):
+    return PayloadInput(
+        module, target, payload_type, ("launch",), data, contract=contract
+    )
 
 
 def _edit_catalog(path, update):
     value = json.loads(path.read_text())
     update(value)
     path.write_text(json.dumps(value))
+
+
+def _edit_archive(path, update):
+    pack_path = path.parent / load_catalog(path).packs[0].path
+    data = pack_path.read_bytes()
+    offset = struct.unpack("<4sIQ", data[:16])[2]
+    toc = msgpack.unpackb(data[offset:], raw=False)
+    update(toc)
+    altered = data[:offset] + msgpack.packb(toc, use_bin_type=True)
+    pack_path.write_bytes(altered)
+    _edit_catalog(
+        path,
+        lambda value: value["packs"][0].update(
+            sha256=hashlib.sha256(altered).hexdigest()
+        ),
+    )
 
 
 class PayloadCatalogTest(unittest.TestCase):
@@ -84,6 +113,196 @@ class PayloadCatalogTest(unittest.TestCase):
                 self.assertIn(item.target, toc)
                 self.assertEqual(toc[item.target]["type"], item.payload_type)
         self.assertEqual(set(archive.gfx_arches), {_AMD, _NVIDIA, _INTEL})
+
+    def test_schema_one_serialization_omits_contract_fields_exactly(self):
+        path = self._create()
+        catalog = load_catalog(path)
+        expected = {
+            "schema_version": 1,
+            "packs": [
+                {
+                    "pack_id": "pack-a",
+                    "path": "pack-a.kpack",
+                    "sha256": catalog.packs[0].sha256,
+                    "entries": [
+                        {
+                            "module": "math/saxpy",
+                            "target": _NVIDIA,
+                            "payload_type": "cubin",
+                            "entry_points": ["launch"],
+                            "sha256": hashlib.sha256(b"kernel").hexdigest(),
+                        }
+                    ],
+                }
+            ],
+        }
+        self.assertEqual(
+            path.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n"
+        )
+        archive = PackedKernelArchive.read(path.parent / "pack-a.kpack")
+        self.assertEqual(
+            archive.toc["math/saxpy/cubin"][_NVIDIA]["metadata"],
+            {"entry_points": ["launch"]},
+        )
+        self.assertIsNone(
+            extract_verified_payload(
+                (path,), "math/saxpy", _NVIDIA, "cubin"
+            ).entry.contract
+        )
+
+    def test_schema_two_contract_roundtrip_all_formats_and_determinism(self):
+        contract = validation_contract()
+        inputs = (
+            _input(target=_AMD, payload_type="hsaco", contract=contract),
+            _input(contract=contract),
+            _input(payload_type="ptx", contract=contract),
+            _input(target=_INTEL, payload_type="spirv", contract=contract),
+        )
+        path = self._create(inputs=inputs)
+        second = create_pack(self.root / "copy", "pack-a", reversed(inputs))
+        self.assertEqual(path.read_bytes(), second.read_bytes())
+        self.assertEqual(
+            (path.parent / "pack-a.kpack").read_bytes(),
+            (second.parent / "pack-a.kpack").read_bytes(),
+        )
+        catalog = load_catalog(path)
+        self.assertEqual(catalog.schema_version, 2)
+        archive = PackedKernelArchive.read(path.parent / "pack-a.kpack")
+        for item in inputs:
+            with self.subTest(target=item.target, payload_type=item.payload_type):
+                selected = extract_verified_payload(
+                    (path,),
+                    item.module,
+                    item.target,
+                    item.payload_type,
+                    entry_point="launch",
+                )
+                self.assertEqual(selected.data, item.data)
+                self.assertEqual(selected.entry.contract, contract)
+                self.assertEqual(selected.entry.target, item.target)
+                metadata = archive.toc[item.module + "/" + item.payload_type][
+                    item.target
+                ]["metadata"]
+                self.assertEqual(metadata["contract"], contract.record())
+                self.assertEqual(metadata["contract_sha256"], contract.sha256)
+                self.assertEqual(
+                    extract_payload(
+                        (path,), item.module, item.target, item.payload_type
+                    ),
+                    item.data,
+                )
+
+    def test_contract_mixing_fails_before_any_output_is_created(self):
+        output = self.root / "mixed"
+        with self.assertRaisesRegex(ValueError, "mix"):
+            create_pack(
+                output,
+                "mixed",
+                (
+                    _input(module="a", contract=validation_contract()),
+                    _input(module="b"),
+                ),
+            )
+        self.assertFalse(output.exists())
+
+    def test_schema_two_missing_malformed_and_wrong_hash_contracts_rejected(self):
+        path = self._create(inputs=(_input(contract=validation_contract()),))
+        baseline = json.loads(path.read_text())
+        variants = []
+        for field in ("contract", "contract_sha256"):
+            changed = copy.deepcopy(baseline)
+            del changed["packs"][0]["entries"][0][field]
+            variants.append(changed)
+        changed = copy.deepcopy(baseline)
+        changed["packs"][0]["entries"][0]["contract_sha256"] = "0" * 64
+        variants.append(changed)
+        changed = copy.deepcopy(baseline)
+        changed["packs"][0]["entries"][0]["contract"]["version"] = True
+        variants.append(changed)
+        changed = copy.deepcopy(baseline)
+        changed["packs"][0]["entries"][0]["contract"]["unknown"] = "field"
+        variants.append(changed)
+        changed = copy.deepcopy(baseline)
+        changed["schema_version"] = 1
+        variants.append(changed)
+        for index, value in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                path.write_text(json.dumps(value))
+                load_catalog(path)
+
+    def test_catalog_and_archive_contracts_must_match_for_unselected_entry(self):
+        contract = validation_contract()
+        path = self._create(
+            inputs=(
+                _input(contract=contract),
+                _input(module="other", contract=contract),
+            )
+        )
+        alternate = replace(contract, version=2)
+        _edit_archive(
+            path,
+            lambda toc: toc["toc"]["other/cubin"][_NVIDIA]["metadata"].update(
+                contract=alternate.record(), contract_sha256=alternate.sha256
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "contract"):
+            extract_verified_payload((path,), "math/saxpy", _NVIDIA, "cubin")
+
+    def test_archive_contract_schema_and_digest_are_checked_not_only_dictionary_equality(
+        self,
+    ):
+        contract = validation_contract()
+        for label, update in (
+            ("bool", lambda metadata: metadata["contract"].update(version=True)),
+            ("digest", lambda metadata: metadata.update(contract_sha256="0" * 64)),
+            ("missing", lambda metadata: metadata.pop("contract")),
+        ):
+            with self.subTest(label=label):
+                path = self._create(label, (_input(contract=contract),))
+                _edit_archive(
+                    path,
+                    lambda toc: update(
+                        toc["toc"]["math/saxpy/cubin"][_NVIDIA]["metadata"]
+                    ),
+                )
+                with self.assertRaises(ValueError):
+                    extract_payload((path,), "math/saxpy", _NVIDIA, "cubin")
+
+    def test_schema_downgrade_cannot_hide_archive_contract_metadata(self):
+        path = self._create(inputs=(_input(contract=validation_contract()),))
+
+        def downgrade(value):
+            value["schema_version"] = 1
+            for entry in value["packs"][0]["entries"]:
+                del entry["contract"]
+                del entry["contract_sha256"]
+
+        _edit_catalog(path, downgrade)
+        self.assertEqual(load_catalog(path).schema_version, 1)
+        with self.assertRaisesRegex(ValueError, "Schema 1"):
+            extract_payload((path,), "math/saxpy", _NVIDIA, "cubin")
+
+    def test_verified_payload_returns_metadata_and_bytes_from_the_same_snapshot(self):
+        contract = validation_contract()
+        path = self._create(inputs=(_input(contract=contract),))
+        original_read = PackedKernelArchive.read
+        pack_path = path.parent / "pack-a.kpack"
+
+        def replace_originals_after_snapshot(snapshot):
+            path.write_text("{}")
+            pack_path.write_bytes(b"replaced after verification")
+            return original_read(snapshot)
+
+        with mock.patch(
+            "_therock_utils.payload_catalog.PackedKernelArchive.read",
+            side_effect=replace_originals_after_snapshot,
+        ):
+            selected = extract_verified_payload((path,), "math/saxpy", _NVIDIA, "cubin")
+        self.assertEqual(selected.data, b"kernel")
+        self.assertEqual(selected.entry.contract, contract)
+        self.assertEqual(
+            selected.entry.sha256, hashlib.sha256(selected.data).hexdigest()
+        )
 
     def test_same_target_missing_module_in_first_pack_continues(self):
         first = self._create("pack-first", (_input(module="other"),))

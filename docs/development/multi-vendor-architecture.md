@@ -1,9 +1,13 @@
 # Multi-vendor ROCm build and module architecture
 
 **Status: experimental implementation and proposed expansion.** This document
-describes the implementation validated on Shark-a on 6 September 2026 and the
-decisions needed to extend it. Operational commands belong in the
-[build runbook](multi-vendor-hip.md).
+describes the initial implementation validated on Shark-a on 6 September 2026,
+the subsequent input, launch-contract, discovery, event, session, pipeline, service,
+and installed consumer work, and
+decisions needed to extend it.
+The hardware validation record below remains tied to its stated checkpoint.
+Operational commands belong in the [build runbook](multi-vendor-hip.md) and
+[imported-input guide](multi-vendor-inputs.md).
 
 ## Decision and scope
 
@@ -47,6 +51,22 @@ logical packs. Its AMD/NVIDIA packed tests passed in six cases. Attempting the
 two Intel tests failed at driver initialization because no Intel device/compute
 driver was available; these are explicit failures, not successful skips.
 
+Later increments also add [verified dispatch](multi-vendor-dispatch.md),
+[explicit events](multi-vendor-events.md), and
+[multi-module sessions](multi-vendor-sessions.md).
+[Device pipelines](multi-vendor-pipelines.md) also bind one stage's GPU output
+to the next stage's input, keeping intermediates on device. Sessions load modules from
+separate packs and reuse one native context and resource set. They preserve
+exact target/format selection and the fixture ABI. The subsequent
+[persistent service](multi-vendor-service.md) exposes connection-scoped module
+and buffer handles with caller-supplied FP32 data. The
+[installed Python client](multi-vendor-client.md) adds verified logical module
+selection for applications and supports independent workers for multiple vendors
+in one Python host. Public device/context/event
+handles and a production shared-library interface remain roadmap work. Evidence
+for these increments stays in separate snapshots rather than being added to the
+initial checkpoint counts.
+
 ## Shared build graph
 
 The entry point in [the root CMake project](../../CMakeLists.txt) defaults to the
@@ -75,7 +95,8 @@ flowchart TD
     Hip --> HipDist["HIP validation distribution"]
     Native --> Stages["Target-specific child stages"]
     Stages --> Assemble["Shared pack assembler"]
-    Assemble --> ModuleDist["Native runners and module packs"]
+    Python["Selected Python runtime sources"] --> Assemble
+    Assemble --> ModuleDist["Native runners, module packs, and Python client"]
 ```
 
 Child stages isolate binaries under target slugs. Registered kernel sources
@@ -178,8 +199,12 @@ flowchart TD
     Request["Module, target, format and entry point"] --> Select["Exact catalog selection"]
     Catalogs["SAXPY and ReLU catalogs and packs"] --> Select
     Select --> Verify["Check hashes, metadata and unique match"]
-    Verify --> Bytes["Verified temporary payload"]
-    Bytes --> Runner{"Caller-selected backend runner"}
+    Verify --> Contract["Match catalog, archive and compiled runner contracts"]
+    Description["Offline runner description"] --> Contract
+    Contract --> Bytes["Verified temporary payload"]
+    Bytes --> Observed["Observed device identity and launch geometry"]
+    Registry["Verified distribution registry"] --> Runner{"Exact registered runner"}
+    Observed --> Runner
     Runner --> Amd["AMD HIP module API"]
     Runner --> Cuda["NVIDIA CUDA Driver API"]
     Runner --> Intel["Intel Level Zero API"]
@@ -188,13 +213,18 @@ flowchart TD
     Intel --> Result
 ```
 
-The caller supplies one backend-specific runner executable; the diagram's
-branches are alternatives, not an in-process runtime dispatcher.
+The distribution registry now supplies the backend-specific runner for an exact
+requested target. The diagram's branches remain separate executable alternatives.
+The explicit-runner validation interface is also retained.
 The [validation wrapper](../../build_tools/validate_multi_vendor_modules.py)
 requests an explicit module, target, format, and declared entry point. Selection
 checks all supplied pack hashes, rejects ambiguous matches, enforces relative
 path containment, and checks the selected archive's TOC, types, entry points,
-and payload hash against its catalog. Extraction uses the bytes already hashed.
+and payload hash against its catalog. Schema-2 catalogs also bind an explicit
+launch contract into each archive entry. Extraction returns the selected
+metadata and bytes from the same verified snapshot. The wrapper then compares
+the contract with the chosen runner's offline, versioned description before
+starting payload execution.
 
 There is no automatic cubin-to-PTX, architecture, or backend fallback. In
 particular, the ReLU tests supply the SAXPY catalog first and must continue to
@@ -207,6 +237,110 @@ packs privately, then publishes complete files. Missing or empty inputs preserve
 previous published outputs. Publication is per file within a private build,
 not an atomic transaction for a live deployment. The distribution carries
 catalogs, packs, and native runners; loose compiler payloads stay in child stages.
+
+### Explicit launch and adapter contracts
+
+Native validation packs now use catalog schema 2 while retaining KPAK v1.
+The logical `therock.validation.f32-vector` ABI, version 1, specifies five
+ordered arguments, 64-bit device-pointer storage, a 128-item group, runner-owned
+resources, ordered copies/launch/readback, and host-synchronized completion.
+Binding remains backend-native; this is not a common packed argument block.
+
+Each compiled runner provides a protocol-1 `--describe-contract` response with
+`scope: "compiled-adapter"`. Pack assembly checks staged descriptions; execution
+checks the actual runner's description, required capabilities, formats, symbols,
+and full contract. Standalone payload modes repeat ABI/hash/format checks before
+GPU initialization. The service validates its OPEN contract before initialization
+and validates formats and kernels as modules are loaded into the open device scope.
+Both paths check observed device/kernel limits before launch. Legacy schema-1
+catalogs remain extractable but cannot qualify guarded execution.
+
+This establishes a versioned boundary for the fixtures, not a general dispatch
+plugin ABI or device qualification. See the
+[module-contract guide](multi-vendor-module-contracts.md) for schemas, migration,
+ownership, and remaining limits.
+
+### Runtime discovery and registry dispatch
+
+Pack assembly now publishes a schema-1 runner registry containing exact targets,
+distribution-relative executable paths and hashes, compiled descriptions, and
+catalog paths. A unified source-tree command discovers devices across those
+runners or dispatches one exact target. The packed-module CTests use this path.
+
+Native `--list-devices` reports observed properties through HIP, CUDA Driver, or
+Level Zero without explicitly creating execution resources. This is distinct
+from the offline `--describe-contract` response. Intel uses PCI identity and
+reports an unknown architecture as null. Driver availability, identity matching,
+and successful fixture execution remain separate observations. SM90 inventory
+on an SM120 host therefore cannot qualify SM90 execution.
+
+Dispatch verifies the selected executable, payload snapshot, and descriptions;
+checks the selected device identity and contract geometry; then enters the
+existing guarded native launch path. There is no implicit architecture or format
+fallback. Unobservable architecture feature suffixes fail in this interface.
+Native inventory schema 2 now carries a driver-reported device UUID. Callers can
+select by UUID, and both UUID and ordinal dispatch pass the observed UUID to the
+execution process. A changed ordinal-to-UUID mapping fails before explicitly
+creating execution resources. This binds the selected device across the process
+boundary without claiming a stable public device/context handle ABI.
+
+See the [discovery and dispatch guide](multi-vendor-dispatch.md) for commands,
+registry integrity, driver errors, process-local ordinals, and remaining limits.
+
+### Event dependencies across queues
+
+The native fixtures now submit upload, compute, and readback through three queues
+with explicit event dependencies. The logical kernel ABI and contract hash stay
+unchanged; compiled adapters additionally advertise `cross-queue-events`.
+Callers can require that capability, and packed-module CTests do so before
+qualifying the new path. An older compatible adapter is still usable for the
+original contract but cannot satisfy an event-required run.
+
+AMD/NVIDIA use nonblocking streams and timing-disabled events. Level Zero uses
+three asynchronous queue handles, regular command lists, and explicit device/host
+event visibility scopes. Completion governs event/list reuse and resource
+release, including partial-submission failures. This is an internal fixture path,
+not a public event-handle ABI or a claim of physical overlap or performance.
+See the [event validation guide](multi-vendor-events.md).
+
+### Persistent module workers
+
+Service RPC v1 adds a connection-scoped worker with opaque module and buffer
+handles, offset transfers, launches, synchronization, and release. The Python
+client validates HELLO against the expected compiled description before OPEN
+binds the selected device UUID. The verified `run-service` command obtains
+payloads from catalogs and exercises one to three composed stages with caller
+data. Direct client sessions support 32 live modules and 64 live buffers.
+
+AMD/NVIDIA keep one nonblocking stream and may acknowledge queued launches before
+completion; Intel completes each operation on one persistent queue before its
+reply. All paths drain before freeing referenced resources. This is a bounded
+process API with the existing vector kernel ABI, not a shared-library C ABI or
+public event interface. See the [service guide](multi-vendor-service.md) for
+wire framing, ownership, failures, and qualification.
+
+### Installed application client
+
+The staged `therock_multi_vendor` Python package exposes `open_session` and
+`ModuleRequest`. It shares exact pack/device selection with the validation CLI,
+loads the complete declared module set before returning a session, and retains
+private verified payload files through cleanup. Public module lookup does not
+accept arbitrary filesystem paths. Existing opaque buffers and loaded modules
+support application-provided data and repeated launches.
+
+The shared pack child builds and installs the selected Python runtime and an
+example alongside runners and packs. The runtime manifest binds its declared
+source files to staged output bytes; install checks those inputs before replacing
+prior outputs. Python dependencies and vendor SDK/driver dependencies remain
+external. The included kpack code is an archive-reader subset, not the full
+kpack transformation toolkit.
+
+One Python consumer can retain AMD and NVIDIA sessions together. Intermediate
+values cross that boundary through explicit host READ/WRITE operations; handles
+remain local to their worker. Isolated imports and a relocated distribution
+exercise checkout independence. This does not add a shared device address space,
+a multi-device worker, general kernel arguments, or a shared-library C ABI.
+See the [client guide](multi-vendor-client.md) for the API and validation scope.
 
 ### Separate legacy C++ kpack repair
 
@@ -238,12 +372,25 @@ applicable. The Level Zero development prefix is separate from the chipStar
 prefix. Shark-a's isolated loader/header package is 1.16.1, exposing API 1.9;
 that loader is not an Intel compute driver.
 
-Imported SDK/compiler content identities are not yet incorporated into reusable
-fingerprints, so affected validation artifacts disable cache reuse. Changing SDK
-prefixes updates discovered include/link paths, but replacing compiler or SDK
-contents in place requires a clean build. A production solution needs source
-revisions, tool hashes, options, runtime ABI requirements, and redistribution
-boundaries recorded in artifact provenance.
+The profile now captures immutable content locks for declared SDK trees and
+tool executables, with observed locations in a separate provenance report.
+Configuration, participating producer/artifact operations, and CTest fixtures
+verify those inputs. An in-place SDK change fails against the existing lock;
+operators must restore the inputs, use a clean build, or explicitly select a
+reviewed replacement lock. The provenance file also participates in consumer
+rebuild dependencies. Completed validation builds install receipts containing
+that observation; pack assembly and CTest reject missing or stale receipts.
+This prevents an explicit lock update from relabeling old staged payloads or
+qualifying an old test binary. Receipts establish local build ordering rather
+than authenticated output provenance. See the
+[imported-input guide](multi-vendor-inputs.md).
+
+These identities cover declared inputs only. Compiler-discovered host headers,
+dynamic libraries, subprocesses, environment, driver state, and the complete
+toolchain closure remain outside that scope. Affected artifact fingerprints
+remain disabled, and unqualified prebuilt stages are rejected. A production
+solution still needs pinned provider recipes, options, runtime ABI requirements,
+and redistribution boundaries recorded in complete build provenance.
 
 ## Alternatives Considered
 
@@ -284,13 +431,26 @@ without measurements.
    selected PCI identity, and run packed Level Zero tests. Record JIT logs,
    arithmetic, ordering, cleanup, and toolchain versions; offline validation
    alone cannot close this gate.
-1. **Stabilize build inputs.** Add pinned toolchain/provider recipes and imported
-   SDK provenance. Restore cache reuse only when equivalent inputs produce
-   equivalent keys. Preserve existing AMD profile behavior.
-1. **Define capabilities and dispatch ABI.** Specify discovery, context and
-   allocation ownership, streams/queues, events, argument layout, module
-   lifetime, errors, and version negotiation. Unsupported operations must fail
-   explicitly. Define any fallback policy separately from exact identity.
+1. **Complete build provenance.** Declared SDK/tool content locks and guards are
+   implemented. Add pinned toolchain/provider recipes and capture implicit
+   dependencies, options, and runtime ABI requirements. Restore cache reuse only
+   when equivalent inputs produce equivalent keys and prebuilt imports carry
+   original build provenance. Preserve existing AMD profile behavior.
+1. **Define capabilities and dispatch ABI.** The versioned fixture launch contract
+   and compiled-adapter negotiation are implemented, along with native device
+   discovery, registry-based process dispatch, and UUID identity binding across
+   discovery and execution. Native event dependencies across three queues are now
+   exercised by the fixtures. Multi-module sessions reuse an internal context,
+   allocations, queues, and events while retaining loaded modules. Device
+   pipelines compose packed kernels through alternating scratch buffers. The
+   persistent process service now supplies opaque module/buffer handles, explicit
+   release, offset transfers, and versioned framing/errors for caller data. The
+   installed Python facade adds verified module selection and retains independent
+   vendor workers within one application.
+   Extend beyond the fixed vector binding to public device/context/event
+   ownership, general argument layouts, and an agreed shared-library ABI.
+   Unsupported operations must fail explicitly. Define any fallback policy
+   separately from exact identity.
 1. **Add math providers incrementally.** Start with a bounded BLAS operation,
    then expand to FFT, sparse, solver, and DNN coverage. Map vendor libraries or
    portable kernels through explicit provider contracts, testing numerical
@@ -302,7 +462,8 @@ without measurements.
 
 ## Validation record and reproducible handoff
 
-The latest Python regression run recorded **137 passed and one failure** in
+The initial implementation's broader Python regression run recorded
+**137 passed and one failure** in
 `ManifestValidationTest.test_artifact_subprojects_matches_cmake`. Pristine
 baseline and working-tree default configurations produced the same artifact
 mapping; checked-in manifest drift predates this change. The suite is therefore
@@ -320,20 +481,27 @@ Evidence is local to Shark-a under
 supersede older Intel-status statements. Build outputs and evidence are not
 automatically part of a Git clone.
 
-The implementation checkpoint is TheRock
+The hardware and regression evidence above belongs to implementation checkpoint
+TheRock
 `6d531456f00841cca5247983a0750c921155f22d`, referencing `rocm-systems`
 `a5dd53d3be5ced72d3e1f521c2067d341aadece3` (module-aware C++ lookup), which includes
-`3dbb0eaebbc7b02891b1b54725410221b20ff115` (typed Python payloads). These commits
-are local and have not been pushed. The submodule URL remains the official ROCm
-repository. Forty-two recorded source hashes matched the validation snapshot,
-and commit-time changed-file checks passed.
+`3dbb0eaebbc7b02891b1b54725410221b20ff115` (typed Python payloads). Forty-two
+recorded source hashes matched that initial validation snapshot, and its
+commit-time changed-file checks passed.
 
-Use the runbook and pinned source fetch workflow for reproduction; record both
-TheRock and `rocm-systems` revisions plus external SDK versions. A parent commit
-referencing a local submodule commit is insufficient for a team handoff:
-make the submodule commit available from its configured repository URL before
-sharing the parent revision for fresh recursive clones or pinned source
-fetching. Publishing to a fork requires documenting and configuring that URL
-override; default clones still use the official ROCm URL. Local commits do
-not publish those objects or provision SDKs. The broader support claim remains
-conditional on the roadmap gates above.
+The complete implementation and guides are published on the
+[powderluv/TheRock multi-vendor branch](https://github.com/powderluv/TheRock/tree/users/powderluv/multi-vendor-rocm).
+The required child commits are on the matching
+[powderluv/rocm-systems branch](https://github.com/powderluv/rocm-systems/tree/users/powderluv/multi-vendor-rocm).
+This experimental branch configures that fork in `.gitmodules` and retains the
+exact child commit above. Use pinned source fetching (`--no-remote`); following
+`develop` would discard the tested child changes.
+
+The installed-client checkpoint passed 345 focused regression tests, 26 native
+profile CTests, and 30 combined HIP/native CTests. The consumer also passed from
+a relocated distribution outside the checkout. Those suites overlap and do not
+form an additive test total. Intel B70 and SM90 hardware execution remain
+unqualified. See the [getting-started guide](multi-vendor-getting-started.md) for
+clone, dependency, build, application, and validation commands. Build outputs and
+machine-local evidence are not included in the source repository; record both
+repository revisions and external SDK versions when reproducing the work.

@@ -1,0 +1,5 @@
+# Install these external dependencies explicitly in the consuming Python environment.
+# No dependency download or installation is performed by TheRock packaging/import.
+# rocm_kpack here is an archive-reader subset, not its full binary-surgery package.
+msgpack>=1.0.0
+zstandard>=0.20.0

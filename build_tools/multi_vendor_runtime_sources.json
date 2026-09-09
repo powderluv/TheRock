@@ -1,0 +1,85 @@
+{
+  "files": [
+    {
+      "destination": "share/therock/examples/packed_session_client.py",
+      "path": "tests/multi_vendor/modules/packed_session_client.py",
+      "root": "repository"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/device_inventory.py",
+      "path": "_therock_utils/device_inventory.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/gpu_targets.py",
+      "path": "_therock_utils/gpu_targets.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/module_contract.py",
+      "path": "_therock_utils/module_contract.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/module_selection.py",
+      "path": "_therock_utils/module_selection.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/module_service.py",
+      "path": "_therock_utils/module_service.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/payload_catalog.py",
+      "path": "_therock_utils/payload_catalog.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/runner_query.py",
+      "path": "_therock_utils/runner_query.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/_therock_utils/runner_registry.py",
+      "path": "_therock_utils/runner_registry.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/licenses/TheRock-LICENSE",
+      "path": "LICENSE",
+      "root": "repository"
+    },
+    {
+      "destination": "share/therock/python/licenses/rocm-kpack-LICENSE",
+      "path": "LICENSE",
+      "root": "kpack"
+    },
+    {
+      "destination": "share/therock/python/requirements.txt",
+      "path": "multi_vendor_runtime/requirements.txt",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/rocm_kpack/__init__.py",
+      "path": "multi_vendor_runtime/rocm_kpack_init.py",
+      "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/rocm_kpack/compression.py",
+      "path": "python/rocm_kpack/compression.py",
+      "root": "kpack"
+    },
+    {
+      "destination": "share/therock/python/rocm_kpack/kpack.py",
+      "path": "python/rocm_kpack/kpack.py",
+      "root": "kpack"
+    },
+    {
+      "destination": "share/therock/python/therock_multi_vendor/__init__.py",
+      "path": "therock_multi_vendor/__init__.py",
+      "root": "tools"
+    }
+  ],
+  "schema_version": 1
+}

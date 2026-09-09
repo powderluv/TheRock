@@ -2,7 +2,8 @@
 
 See the [multi-vendor architecture](multi-vendor-architecture.md) for the design,
 implementation boundaries, alternatives, and proposed next steps. This page is
-the build and validation runbook.
+the build and validation runbook. The [imported-input guide](multi-vendor-inputs.md)
+covers SDK/compiler locks, verification, and reviewed updates.
 
 The `multi-vendor-hip` build profile uses TheRock's subproject, artifact, and
 consumer graph infrastructure for backend-specific HIP SDK consumers. It is an
@@ -33,13 +34,16 @@ module consumer uses a portable SPIR64 frontend and LLVM-to-SPIR-V translator.
 
 ## Build and validate
 
-Use Python 3.10 or newer, install TheRock's Python requirements, and fetch sources
-as usual. Full source
-fetching works; an isolated profile checkout can fetch just its source stage:
+Follow the [getting-started guide](multi-vendor-getting-started.md) to clone the
+published fork and install Python dependencies. Fetch the pinned child commit
+for this experimental branch using its isolated source stage:
 
 ```sh
-python build_tools/fetch_sources.py --stage multi-vendor-hip
+.venv/bin/python build_tools/fetch_sources.py --stage multi-vendor-hip --no-remote
 ```
+
+The stage needs only `rocm-systems`; `--no-remote` preserves the committed fork
+revision. Fetch into a clean checkout because the script can reset submodule work.
 
 The NVIDIA HIP language requires CMake 3.28 or newer. Configure one graph with
 both Radeon and NVIDIA targets:
@@ -68,9 +72,14 @@ See [the validation consumer](../../tests/multi_vendor/README.md) for standalone
 use and device selection. Keep GPU test results separate from target selection:
 the generated `gpu_targets.json` is explicitly unvalidated configuration metadata.
 The aggregate validation artifact installs this manifest under
-`share/therock/multi-vendor/`. Validation artifact cache reuse is disabled because
-installed SDKs and compilers are external inputs without content identities.
-Start a clean build directory after changing an SDK or compiler in place.
+`share/therock/multi-vendor/`. Imported SDK/tool contents are now locked during
+configuration and verified before participating builds, artifacts, and tests.
+A changed SDK fails against the existing lock. Use a clean build or follow the
+[reviewed update workflow](multi-vendor-inputs.md#review-an-sdk-update-and-select-a-new-lock)
+to select a new lock explicitly. Complete the normal build after selecting a new
+lock: stage and test receipts reject old consumer outputs until rebuilt.
+Artifact cache reuse remains disabled because declared-input hashes do not cover
+the full build environment.
 
 For Intel, use CMake 4.3 or newer and an installed chipStar toolchain:
 
@@ -141,7 +150,10 @@ The distribution contains native runners under `bin/<target-key>/` and catalogs
 and archives under `share/therock/packs/{saxpy,relu}/`. Raw compiler outputs remain
 in child stages; only packed device payloads enter this distribution. Each ReLU
 test supplies the SAXPY catalog first, exercising module lookup beyond the first
-same-target pack. For an explicit NVIDIA PTX run:
+same-target pack. The assembler emits schema-2 catalogs and checks staged
+runner contracts. The wrapper negotiates the compiled adapter contract before
+GPU execution; see the [module-contract guide](multi-vendor-module-contracts.md).
+For an explicit NVIDIA PTX run:
 
 ```sh
 module_dist="$PWD/build/multi-vendor/dist/multi-vendor-modules"
@@ -155,7 +167,10 @@ PYTHONPATH="$PWD/rocm-systems/shared/kpack/python" \
 ```
 
 `build_tools/multi_vendor_pack.py` provides lower-level `create` and `extract`
-commands for these catalogs. Its Python dependency is the fetched `rocm_kpack`
+commands for these catalogs. Generic creation defaults to schema 1; add
+`--validation-contract` only for kernels implementing the documented fixture ABI.
+Schema-1 extraction remains supported, while guarded execution requires schema 2.
+Its Python dependency is the fetched `rocm_kpack`
 package; the example supplies that source package through `PYTHONPATH`. Creation
 requires fresh catalog/pack destinations. The build assembler creates complete
 packs privately and replaces its managed output files before stage installation.
@@ -202,7 +217,8 @@ translator to a matching binary beside that frontend, and the validator to
 `spirv-val` in the Level Zero SDK or `PATH`. An explicitly supplied frontend
 allows an Intel-only build without an AMD SDK. Clang and the translator must
 support the same LLVM bitcode version; compiler or validation errors fail the
-build. Imported toolchains require a clean build after in-place changes.
+build. Imported toolchain changes must match the selected input lock; use the
+[imported-input guide](multi-vendor-inputs.md) to review and select an update.
 
 The Level Zero runner selects only Intel GPU root devices, with indices sorted
 by driver UUID then device UUID. It checks the Intel vendor ID `0x8086` and, for
@@ -242,3 +258,49 @@ launch ABI, and integration of the selected payload with production runtimes.
 AMD code objects, CUDA cubin/PTX, and Intel SPIR-V require distinct compiler and
 runtime handling; the existing AMD code-object surgery pipeline remains disabled
 for these explicitly named bundles.
+
+## Device discovery and exact dispatch
+
+Native-module builds now publish a runner registry alongside their packs. The
+packed-module CTests use the registry to select and verify the runner, discover
+the selected device, and check its identity before execution. Use the
+[discovery and dispatch guide](multi-vendor-dispatch.md) for the unified `list`
+and `run` commands. An unavailable Intel driver is reported separately during
+listing and still prevents Intel execution; it does not block an AMD/NVIDIA run.
+
+Multi-pack session execution is available through the
+[`run-batch` dispatcher](multi-vendor-sessions.md). It alternates exact module
+selections while reusing native context, buffers, queues, and events. Packed
+session CTests include uniform and mixed NVIDIA cubin/PTX selections, with the
+same imported-input guards and hardware identity checks.
+
+[`run-pipeline`](multi-vendor-pipelines.md) composes packed vector kernels on
+the selected device and validates the final scratch results after the complete
+chain. Pipeline CTests preserve exact target/format selection and UUID binding.
+
+## Persistent worker validation
+
+After rebuilding `therock-dist`, `run-service` uses verified pack payloads
+with a persistent worker and Python-supplied vectors. Its one-to-three-stage
+fixture exercises buffer/module handles, changed alpha values, offset transfers,
+device composition, and explicit release. The direct `NativeModuleSession`
+API provides the same ownership boundary for caller data with up to 32 live
+modules and 64 buffers. See the [service guide](multi-vendor-service.md) for
+commands, API usage, protocol limits, and failure handling.
+
+The service requires `persistent-module-service` in the compiled description
+and checks exact HELLO identity before OPEN. Rebuild and stage current binaries,
+descriptions, registry hashes, and receipts together. Existing imported-input
+locks and external driver/SDK requirements continue to apply; Intel execution
+remains deferred pending B70 hardware.
+
+## Installed application validation
+
+The module distribution now includes `therock_multi_vendor` and a standalone
+consumer under `share/therock/examples/packed_session_client.py`. The
+`packed-client-*` CTests run this installed example with Python `-I`, checking
+that runtime imports come from the distribution. A paired AMD/NVIDIA case
+retains both workers and exchanges intermediate results through host memory.
+See the [client guide](multi-vendor-client.md) for commands, dependencies,
+verification, and ownership limits. Intel and SM90 execution still require
+matching hardware.

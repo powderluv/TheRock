@@ -3,6 +3,7 @@
 
 """Real KPAK assembly tests with synthetic bytes; no GPU qualification is implied."""
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -16,6 +17,12 @@ sys.path.insert(0, str(REPO_ROOT / "rocm-systems/shared/kpack/python"))
 from rocm_kpack.kpack import PackedKernelArchive
 from _therock_utils.gpu_targets import parse_gpu_targets
 from _therock_utils.payload_catalog import extract_payload, load_catalog
+from _therock_utils.runner_registry import load_registry
+from _therock_utils.module_contract import (
+    parse_contract,
+    runner_description,
+    validation_contract,
+)
 from assemble_multi_vendor_modules import MODULES, assemble, read_targets
 from configure_multi_vendor import configure_targets
 
@@ -41,6 +48,14 @@ class AssembleMultiVendorModulesTest(unittest.TestCase):
         self.targets = parse_gpu_targets(identities)
         _, self.selector = configure_targets(identities, self.root / "selection")
         for target in self.targets:
+            description = self.description_path(target)
+            description.parent.mkdir(parents=True, exist_ok=True)
+            description.write_text(
+                json.dumps(runner_description(target.vendor).record())
+            )
+            description.with_name("therock_module_validation").write_bytes(
+                f"synthetic runner for {target.canonical_id}".encode()
+            )
             for module in MODULES:
                 for payload_type in target.payload_types:
                     data = f"synthetic:{module}:{target.canonical_id}:{payload_type}".encode()
@@ -48,6 +63,15 @@ class AssembleMultiVendorModulesTest(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(data)
                     self.expected[(module, target.canonical_id, payload_type)] = data
+
+    def description_path(self, target):
+        return (
+            self.build_root
+            / target.slug
+            / "stage/bin"
+            / target.slug
+            / "runner-contract.json"
+        )
 
     def payload_path(self, target, module, payload_type):
         return (
@@ -68,7 +92,7 @@ class AssembleMultiVendorModulesTest(unittest.TestCase):
     def assemble(self):
         assemble(self.selector, self.build_root, self.output)
 
-    def test_multiple_targets_roundtrip_with_exact_formats_and_only_packs(self):
+    def test_multiple_targets_roundtrip_with_exact_formats_packs_and_registry(self):
         self.select((AMD, AMD_FEATURES, NVIDIA_OTHER, NVIDIA, INTEL))
         self.assemble()
         expected_files = {
@@ -76,11 +100,39 @@ class AssembleMultiVendorModulesTest(unittest.TestCase):
             for module in MODULES
             for filename in ("catalog.json", f"validation-{module}.kpack")
         }
+        expected_files.add("runners.json")
         self.assertEqual(set(self.snapshot()), expected_files)
+        registry = load_registry(self.output / "runners.json")
+        self.assertEqual(
+            {entry.target.canonical_id for entry in registry.runners},
+            {target.canonical_id for target in self.targets},
+        )
+        self.assertEqual(
+            registry.catalogs,
+            tuple(f"share/therock/packs/{module}/catalog.json" for module in MODULES),
+        )
+        for entry in registry.runners:
+            self.assertEqual(
+                entry.path, f"bin/{entry.target.slug}/therock_module_validation"
+            )
+            self.assertEqual(entry.description, runner_description(entry.target.vendor))
+            self.assertEqual(
+                entry.sha256,
+                hashlib.sha256(
+                    self.description_path(entry.target)
+                    .with_name("therock_module_validation")
+                    .read_bytes()
+                ).hexdigest(),
+            )
         catalogs = tuple(self.output / module / "catalog.json" for module in MODULES)
         for module, catalog_path in zip(MODULES, catalogs):
             catalog = load_catalog(catalog_path)
+            self.assertEqual(catalog.schema_version, 2)
             self.assertEqual(len(catalog.packs), 1)
+            for entry in catalog.packs[0].entries:
+                self.assertEqual(
+                    entry.contract.record(), validation_contract().record()
+                )
             pack = catalog.packs[0]
             archive_path = catalog_path.parent / pack.path
             self.assertEqual(archive_path.read_bytes()[:4], b"KPAK")
@@ -113,6 +165,81 @@ class AssembleMultiVendorModulesTest(unittest.TestCase):
                             ),
                             self.expected[(module, target.canonical_id, payload_type)],
                         )
+
+    def test_missing_later_runner_preserves_previous_outputs(self):
+        self.assemble()
+        original = self.snapshot()
+        self.description_path(self.targets[-1]).with_name(
+            "therock_module_validation"
+        ).unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.assemble()
+        self.assertEqual(self.snapshot(), original)
+
+    def test_empty_runner_preserves_previous_outputs(self):
+        self.assemble()
+        original = self.snapshot()
+        self.description_path(self.targets[-1]).with_name(
+            "therock_module_validation"
+        ).write_bytes(b"")
+        with self.assertRaisesRegex(ValueError, "Staged runner is empty"):
+            self.assemble()
+        self.assertEqual(self.snapshot(), original)
+
+    def test_changed_runner_updates_only_registry(self):
+        self.assemble()
+        original = self.snapshot()
+        updated = b"updated synthetic runner"
+        self.description_path(self.targets[-1]).with_name(
+            "therock_module_validation"
+        ).write_bytes(updated)
+        self.assemble()
+        changed = {
+            name for name, data in self.snapshot().items() if data != original[name]
+        }
+        self.assertEqual(changed, {"runners.json"})
+        entry = next(
+            entry
+            for entry in load_registry(self.output / "runners.json").runners
+            if entry.target == self.targets[-1]
+        )
+        self.assertEqual(entry.sha256, hashlib.sha256(updated).hexdigest())
+
+    def test_missing_later_runner_description_preserves_previous_outputs(self):
+        self.assemble()
+        original = self.snapshot()
+        self.description_path(self.targets[-1]).unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.assemble()
+        self.assertEqual(self.snapshot(), original)
+
+    def test_incompatible_staged_runner_description_cannot_relabel_payloads(self):
+        self.assemble()
+        original = self.snapshot()
+        path = self.description_path(self.targets[-1])
+        valid = runner_description(self.targets[-1].vendor).record()
+        alternate = parse_contract({**validation_contract().record(), "version": 2})
+        changes = (
+            {
+                **valid,
+                "contract": alternate.record(),
+                "contract_sha256": alternate.sha256,
+            },
+            {**valid, "vendor": "amd", "backend": "hip"},
+            {**valid, "payload_types": ["cubin"]},
+            {**valid, "entry_points": ["therock_module_saxpy"]},
+            {**valid, "contract_sha256": "0" * 64},
+            {**valid, "scope": "hardware-qualified"},
+        )
+        for description in changes:
+            with self.subTest(description=description):
+                path.write_text(json.dumps(description))
+                with self.assertRaises(ValueError):
+                    self.assemble()
+                self.assertEqual(self.snapshot(), original)
+        path.write_text(json.dumps(valid))
+        self.assemble()
+        self.assertEqual(self.snapshot(), original)
 
     def test_managed_output_can_be_rebuilt_deterministically(self):
         self.assemble()
