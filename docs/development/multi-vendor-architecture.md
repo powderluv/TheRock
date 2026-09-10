@@ -3,7 +3,7 @@
 **Status: experimental implementation and proposed expansion.** This document
 describes the initial implementation validated on Shark-a on 6 September 2026,
 the subsequent input, launch-contract, discovery, event, session, pipeline, service,
-installed consumer, selective distribution, bounded math-provider, and SGEMM session work, and
+installed consumer, selective distribution, bounded math-provider, SGEMM session, and opt-in Intel oneMKL work, and
 decisions needed to extend it.
 The hardware validation record below remains tied to its stated checkpoint.
 Operational commands belong in the [getting-started guide](multi-vendor-getting-started.md),
@@ -44,7 +44,7 @@ accepted by the target parser.
 | AMD Radeon AI PRO R9700, `amd:hip:gfx1201`                              | Installed ROCm 7.2 SDK; HIP source tests and native HIP module loading         | HIP arithmetic, reduction, streams/events passed; packed SAXPY and ReLU HSACO execution passed.                                           |
 | NVIDIA RTX PRO 6000 Blackwell Workstation Edition, `nvidia:cuda:sm_120` | Pinned HIPNV headers with CUDA 13.2; independent CUDA Driver API module loader | HIP tests passed; both SAXPY and ReLU passed through cubin and PTX loading.                                                               |
 | NVIDIA `nvidia:cuda:sm_90`                                              | Additional compiler and pack variant                                           | Compilation, extraction, and architecture inspection passed. No SM90 hardware execution was performed.                                    |
-| Intel Arc Pro B70, `intel:level-zero:xe2-b70`                           | Native Level Zero loader; OpenCL C to SPIR-V compilation                       | Both real SPIR-V modules compiled and passed offline validation. Intel execution remains unvalidated pending the card and compute driver. |
+| Intel Arc Pro B70, `intel:level-zero:xe2-b70`                           | Native Level Zero loader; SPIR-V modules; opt-in oneMKL SGEMM                  | Both real SPIR-V modules compiled and passed offline validation. Intel execution remains unvalidated pending the card and compute driver. |
 | Intel HIP/chipStar consumer                                             | Imported chipStar SDK integration                                              | Separate integration path retained; its toolchain and hardware execution have not been validated.                                         |
 
 The three-vendor distribution contains eight payload variants across two
@@ -191,8 +191,12 @@ deliberately small execution contract, not a general application launch ABI.
 
 The opt-in [SGEMM provider](multi-vendor-sgemm.md) adds FP32, column-major,
 non-transposed `C = alpha * A * B + beta * C` through rocBLAS on AMD and
-cuBLAS on NVIDIA. It reuses each persistent worker's existing primary context,
-stream, and opaque buffers. The Python facade supplies dimensions, leading
+cuBLAS on NVIDIA. Those providers reuse each persistent worker's existing
+primary context, stream, and opaque buffers. The separately enabled
+[Intel oneMKL provider](multi-vendor-intel-sgemm.md) borrows the Level Zero
+context/device and native allocations into an owned in-order SYCL queue.
+Explicit completion orders Level Zero kernels/copies and SYCL BLAS calls; the
+Intel implementation replies only after completion. The Python facade supplies dimensions, leading
 dimensions, element offsets, and finite FP32 scalars; both client and worker
 validate bounds and output aliasing before a library call. Dimensions are bounded
 to 1..256 in this first contract.
@@ -208,8 +212,11 @@ still use separate workers and explicit host transfers.
 
 `THEROCK_ENABLE_MULTI_VENDOR_SGEMM` defaults to `OFF`. Enabling it changes AMD
 and NVIDIA runner capabilities and links their selected SDK's BLAS library;
-Intel retains its native Level Zero module path and advertises no SGEMM provider.
-An explicit Intel child-provider request fails configuration. The default module
+Intel uses the independent OFF-by-default option
+`THEROCK_ENABLE_MULTI_VENDOR_INTEL_SGEMM`, with a declared oneAPI SDK and DPC++
+compiler. When enabled, it advertises `blas-provider-onemkl-v1` and the same
+SGEMM operation capability. Its native module compiler remains the selected
+OpenCL-to-SPIR-V toolchain. Intel device execution is still unqualified. The default module
 worker retains its previous dependencies and description. Distributions and exact
 target exports carry the matching bundled Python client and worker descriptions;
 older host clients that reject unknown capabilities need the updated runtime.
@@ -219,8 +226,9 @@ nor provides a common vendor BLAS binary ABI.
 
 The completed-stage description gate also checks an SGEMM option toggle before
 direct installation: a newly configured provider capability cannot label an older
-worker. Whole-SDK content locks already cover provider files under imported SDK
-roots. Complete runtime provenance and reusable artifact keys remain separate
+worker. Whole-SDK content locks cover provider files under imported SDK
+roots, including the entire oneAPI prefix and separately identified SYCL compiler
+for Intel math builds. Complete runtime provenance and reusable artifact keys remain separate
 acceptance gates.
 
 The [SGEMM session API](multi-vendor-sgemm-sessions.md) also opens a verified
@@ -521,8 +529,9 @@ and contract compatibility when executing an exported payload.
    Unsupported operations must fail explicitly. Define any fallback policy
    separately from exact identity.
 1. **Expand math providers incrementally.** The bounded native rocBLAS/cuBLAS
-   SGEMM operation establishes the first explicit provider contract. Integrate an
-   Intel provider and qualify it on B70, then consider transpose/layout coverage,
+   SGEMM operation establishes the first explicit provider contract. The opt-in
+   Intel oneMKL implementation now needs B70 device, native-allocation, numerical,
+   and failure qualification. Then consider transpose/layout coverage,
    further BLAS operations, FFT, sparse, solver, and DNN support. Map vendor
    libraries or portable kernels through explicit provider contracts, testing
    numerical tolerances and synchronization. A matching function name is
@@ -592,7 +601,8 @@ rocBLAS on R9700 and cuBLAS on RTX PRO 6000 passed matrix bounds/scalar cases,
 unchanged input and guard checks, packed-kernel/library stream composition, and
 a paired host-transfer/worker-lifetime test. A relocated selected AMD/NVIDIA
 distribution passed SGEMM and retained its verified inventory. Intel and SM90
-remain compile-only targets; no Intel math provider is implemented. See the
+remained compile-only targets; no Intel math provider was implemented at that
+checkpoint. See the
 [provider guide](multi-vendor-sgemm.md) for the contract, loaded library versions,
 commands, and limits.
 
@@ -602,3 +612,11 @@ The subsequent [SGEMM session checkpoint](multi-vendor-sgemm-sessions.md) passed
 Shark-a devices and in a relocated selected export with explicit UUID selection.
 The four native worker binaries stayed unchanged; the addition separates
 library-only application opening from verified packed-module opening.
+
+The [Intel oneMKL checkpoint](multi-vendor-intel-sgemm.md) adds an independently
+opted-in provider to the native Level Zero worker. Its four-target build compiles
+and links the real DPC++/oneMKL SDK; **444 focused regressions**, **35 applicable
+native CTests**, and **33 default combined CTests** pass. Intel-only export and
+compiled-capability checks pass offline. B70 allocation interoperability,
+numerical execution, failure behavior on its driver, and performance remain
+unqualified pending the card.

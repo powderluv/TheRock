@@ -111,13 +111,15 @@ class MultiVendorSgemmBuildTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("inside the selected SDK", result.stdout + result.stderr)
 
-    def test_explicit_intel_provider_is_rejected_before_sdk_discovery(self) -> None:
+    def test_explicit_intel_provider_requires_its_sdk_before_contract_generation(
+        self,
+    ) -> None:
         result = self.configure(
             True, "-DTHEROCK_MODULE_BACKEND=intel", "-DTHEROCK_MODULE_TARGET=xe2-b70"
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "Intel has no SGEMM provider",
+            "Intel SGEMM requires THEROCK_MODULE_ONEAPI_ROOT",
             " ".join((result.stdout + result.stderr).split()),
         )
         self.assertFalse((self.build / "module_contract_data.h").exists())

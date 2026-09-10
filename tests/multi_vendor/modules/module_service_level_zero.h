@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "module_service_onemkl.h"
+
 // Included by level_zero_loader.cpp after its anonymous namespace. Reuse its
 // native owners and validation helpers while keeping the protocol independent
 // of Level Zero types. These aliases avoid the service's nested handle names.
@@ -204,7 +206,39 @@ public:
     });
   }
 
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+  std::string sgemm_info() {
+    if (!blas_) {
+      blas_ = std::make_unique<ServiceOneMkl>(selected_.driver,
+                                              selected_.device, context_.value);
+    }
+    return blas_->info();
+  }
+
+  void sgemm(Buffer &a, Buffer &b, Buffer &c,
+             const therock::module_service::SgemmRequest &request) {
+    if (!blas_) {
+      throw std::runtime_error("SGEMM provider has not been negotiated");
+    }
+    // Native module/copy operations already complete before acknowledgment.
+    // The explicit handoff also covers future queued native operations. The
+    // provider drains its separate SYCL queue before returning, preserving one
+    // logical ordered worker stream without importing a regular Level Zero
+    // command queue into the Xe2 SYCL adapter.
+    synchronize();
+    blas_->sgemm(a.allocation.value, b.allocation.value, c.allocation.value,
+                 request);
+  }
+#endif
+
   void synchronize() noexcept {
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+    if (blas_) {
+      // State calls this before freeing buffers or modules, including when a
+      // provider call threw after only partially submitting its operation.
+      blas_->drain();
+    }
+#endif
     if (!queue_.value) {
       return;
     }
@@ -259,6 +293,10 @@ private:
   uint32_t memory_ordinal_ = 0;
   Context context_;
   Queue queue_;
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+  // Destroy the SYCL queue/context wrappers before the native queue/context.
+  std::unique_ptr<ServiceOneMkl> blas_;
+#endif
 };
 
 } // namespace

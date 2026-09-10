@@ -3,7 +3,7 @@
 `open_sgemm_session` opens a verified native BLAS worker without selecting,
 extracting, or loading a packed kernel. Applications doing only matrix
 multiplication no longer need to declare an unrelated SAXPY module. AMD uses
-rocBLAS and NVIDIA uses cuBLAS; the operation contract and native worker are the
+rocBLAS, NVIDIA uses cuBLAS, and opt-in Intel uses oneMKL; the operation contract and native worker are the
 same as the [bounded SGEMM implementation](multi-vendor-sgemm.md).
 
 Use `open_session` when an application needs packed kernels and SGEMM together on
@@ -17,8 +17,10 @@ expose module lookup or kernel launch methods.
 Build with `THEROCK_ENABLE_MULTI_VENDOR_MODULES=ON` and
 `THEROCK_ENABLE_MULTI_VENDOR_SGEMM=ON` using the
 [provider build instructions](multi-vendor-sgemm.md#build-and-dependencies).
-Default workers and Intel workers do not advertise SGEMM and reject this session
-request before device discovery. Vendor libraries and drivers remain external.
+Default workers do not advertise SGEMM and reject this session request before
+device discovery. Intel requires the separate
+[oneMKL build option](multi-vendor-intel-sgemm.md); Intel execution is not yet
+qualified. Vendor libraries and drivers remain external.
 
 The installed example has no payload-format or module arguments:
 
@@ -32,7 +34,8 @@ module_dist="$PWD/build/multi-vendor-sgemm/dist/multi-vendor-modules"
 Omit `--peer-target` for one device. Use `--device` or `--device-uuid` to select the
 primary device, and `--peer-device` or `--peer-device-uuid` for the peer. The two
 forms are mutually exclusive for each worker. Omitted selectors use device index
-zero. The target must match exactly; SM120 execution does not qualify SM90.
+zero. Intel callers can also pass `--expect-device-id 0xe223` to bind the expected
+B70 PCI ID. The target must match exactly; SM120 execution does not qualify SM90.
 
 A small application can call the installed public API directly:
 

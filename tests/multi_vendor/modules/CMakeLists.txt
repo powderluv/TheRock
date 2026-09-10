@@ -10,9 +10,33 @@ therock_multi_vendor_initialize_inputs()
 set(THEROCK_MODULE_BACKEND "" CACHE STRING "Native module backend: amd, nvidia, or intel")
 set_property(CACHE THEROCK_MODULE_BACKEND PROPERTY STRINGS amd nvidia intel)
 option(THEROCK_MODULE_ENABLE_SGEMM
-  "Enable the selected AMD/NVIDIA SDK SGEMM provider in the native worker" OFF)
-if(THEROCK_MODULE_ENABLE_SGEMM AND NOT THEROCK_MODULE_BACKEND MATCHES "^(amd|nvidia)$")
-  message(FATAL_ERROR "THEROCK_MODULE_ENABLE_SGEMM supports only AMD and NVIDIA; Intel has no SGEMM provider")
+  "Enable the selected SDK SGEMM provider in the native worker" OFF)
+set(THEROCK_MODULE_ONEAPI_ROOT "" CACHE PATH "Complete imported oneAPI SDK prefix for Intel SGEMM")
+set(THEROCK_MODULE_ONEMKL_ROOT "" CACHE PATH "oneMKL prefix within the imported oneAPI SDK")
+if(THEROCK_MODULE_ENABLE_SGEMM AND THEROCK_MODULE_BACKEND STREQUAL "intel")
+  if(NOT IS_DIRECTORY "${THEROCK_MODULE_ONEAPI_ROOT}")
+    message(FATAL_ERROR "Intel SGEMM requires THEROCK_MODULE_ONEAPI_ROOT to name a complete imported oneAPI SDK")
+  endif()
+  if(NOT THEROCK_MODULE_ONEMKL_ROOT)
+    set(THEROCK_MODULE_ONEMKL_ROOT "${THEROCK_MODULE_ONEAPI_ROOT}/mkl/latest")
+  endif()
+  if(NOT IS_DIRECTORY "${THEROCK_MODULE_ONEMKL_ROOT}")
+    message(FATAL_ERROR "Intel SGEMM requires THEROCK_MODULE_ONEMKL_ROOT to name a oneMKL SDK directory")
+  endif()
+  file(REAL_PATH "${THEROCK_MODULE_ONEAPI_ROOT}" _oneapi_real)
+  foreach(_input "${CMAKE_CXX_COMPILER}" "${THEROCK_MODULE_ONEMKL_ROOT}")
+    file(REAL_PATH "${_input}" _input_real)
+    cmake_path(IS_PREFIX _oneapi_real "${_input_real}" NORMALIZE _inside_oneapi)
+    if(NOT _inside_oneapi)
+      message(FATAL_ERROR "Intel SGEMM compiler and oneMKL must resolve inside THEROCK_MODULE_ONEAPI_ROOT: ${_input}")
+    endif()
+  endforeach()
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "Intel SGEMM requires an IntelLLVM icpx CMAKE_CXX_COMPILER from the imported oneAPI SDK")
+  endif()
+  file(REAL_PATH "${CMAKE_CXX_COMPILER}" _sycl_compiler_real)
+  get_filename_component(_sycl_bin_dir "${_sycl_compiler_real}" DIRECTORY)
+  get_filename_component(_sycl_sdk "${_sycl_bin_dir}" DIRECTORY)
 endif()
 set(THEROCK_MODULE_TARGET "" CACHE STRING "Compiler architecture or Intel product identity, e.g. gfx1201, 120, xe2-b70")
 set(THEROCK_MODULE_SDK_ROOT "" CACHE PATH "Installed ROCm, CUDA, or Level Zero SDK prefix")
@@ -59,7 +83,9 @@ set(_contract_args --launch-abi "${_contract_abi}" --launch-abi-version "${_cont
 # Imported SDK paths can change between configurations. Internal discoveries
 # must follow the selected prefix rather than a prior find_* cache entry.
 foreach(_discovered _hip_include _hip_runtime _level_zero_include _level_zero_loader
-    _compiler _spirv_translator _spirv_validator _blas_include _blas_library)
+    _compiler _spirv_translator _spirv_validator _blas_include _blas_library
+    _sycl_include _sycl_library _mkl_ilp64 _mkl_sequential _mkl_core
+    _umf_library _hwloc_library)
   unset(${_discovered} CACHE)
   unset(${_discovered})
 endforeach()
@@ -149,7 +175,7 @@ endif()
 
 # Provider discovery is constrained to the selected imported SDK. Never use
 # CUDA stub directories as a runtime path or resolve a BLAS library globally.
-if(THEROCK_MODULE_ENABLE_SGEMM)
+if(THEROCK_MODULE_ENABLE_SGEMM AND NOT THEROCK_MODULE_BACKEND STREQUAL "intel")
   if(THEROCK_MODULE_BACKEND STREQUAL "amd")
     set(_blas_header rocblas/rocblas.h)
     set(_blas_name rocblas)
@@ -179,6 +205,78 @@ if(THEROCK_MODULE_ENABLE_SGEMM)
   target_link_libraries(therock_module_validation PRIVATE "${_blas_library}")
   get_filename_component(_blas_library_dir "${_blas_library}" DIRECTORY)
   set_property(TARGET therock_module_validation APPEND PROPERTY INSTALL_RPATH "${_blas_library_dir}")
+endif()
+
+if(THEROCK_MODULE_ENABLE_SGEMM AND THEROCK_MODULE_BACKEND STREQUAL "intel")
+  # Resolve every link input from the imported tree, independent of MKLROOT,
+  # environment setup scripts, system packages, or the compiler's -qmkl lookup.
+  find_path(_sycl_include sycl/sycl.hpp
+    PATHS "${_sycl_sdk}/include" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_path(_blas_include oneapi/mkl.hpp
+    PATHS "${THEROCK_MODULE_ONEMKL_ROOT}/include" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  set(_onemkl_library_paths "${THEROCK_MODULE_ONEMKL_ROOT}/lib"
+    "${THEROCK_MODULE_ONEMKL_ROOT}/lib/intel64")
+  find_library(_sycl_library sycl
+    PATHS "${_sycl_sdk}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_blas_library mkl_sycl_blas
+    PATHS ${_onemkl_library_paths} NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_mkl_ilp64 mkl_intel_ilp64
+    PATHS ${_onemkl_library_paths} NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_mkl_sequential mkl_sequential
+    PATHS ${_onemkl_library_paths} NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_mkl_core mkl_core
+    PATHS ${_onemkl_library_paths} NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  # The Level Zero UR adapter needs the SDK's UMF, which in turn needs hwloc
+  # from the TCM component. Their sibling directories are outside UR's $ORIGIN
+  # runpath, so a compiler/oneMKL-only installation is not sufficient.
+  find_library(_umf_library umf
+    PATHS "${THEROCK_MODULE_ONEAPI_ROOT}/umf/latest/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(_hwloc_library hwloc
+    PATHS "${THEROCK_MODULE_ONEAPI_ROOT}/tcm/latest/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  foreach(_input "${_sycl_include}/sycl/sycl.hpp" "${_blas_include}/oneapi/mkl.hpp" "${_blas_include}/mkl.h"
+      "${_sycl_library}" "${_blas_library}" "${_mkl_ilp64}" "${_mkl_sequential}" "${_mkl_core}"
+      "${_umf_library}" "${_hwloc_library}")
+    if(NOT EXISTS "${_input}")
+      message(FATAL_ERROR "Intel SGEMM imported input does not exist: ${_input}")
+    endif()
+    file(REAL_PATH "${_input}" _input_real)
+    cmake_path(IS_PREFIX _oneapi_real "${_input_real}" NORMALIZE _inside_oneapi)
+    if(NOT _inside_oneapi OR _input_real MATCHES "/stubs/")
+      message(FATAL_ERROR "Intel SGEMM input must resolve inside the imported oneAPI SDK, outside stub directories: ${_input}")
+    endif()
+  endforeach()
+  target_include_directories(therock_module_validation PRIVATE "${_sycl_include}" "${_blas_include}")
+  target_compile_definitions(therock_module_validation PRIVATE THEROCK_MODULE_ENABLE_SGEMM=1 MKL_ILP64)
+  target_compile_options(therock_module_validation PRIVATE -fsycl)
+  target_link_options(therock_module_validation PRIVATE -fsycl)
+  target_link_libraries(therock_module_validation PRIVATE
+    "${_blas_library}" "${_mkl_ilp64}" "${_mkl_sequential}" "${_mkl_core}" "${_sycl_library}")
+  # Preserve explicit DT_NEEDED entries even though these APIs are called by a
+  # dynamically loaded UR adapter. It then reuses the selected loaded SONAMEs
+  # without requiring a global oneAPI setup script or ambient library paths.
+  target_link_libraries(therock_module_validation PRIVATE
+    "-Wl,--push-state,--no-as-needed" "${_umf_library}" "${_hwloc_library}" "-Wl,--pop-state")
+  get_filename_component(_blas_library_dir "${_blas_library}" DIRECTORY)
+  get_filename_component(_sycl_library_dir "${_sycl_library}" DIRECTORY)
+  get_filename_component(_umf_library_dir "${_umf_library}" DIRECTORY)
+  get_filename_component(_hwloc_library_dir "${_hwloc_library}" DIRECTORY)
+  set(_oneapi_runtime_dirs "${_blas_library_dir}" "${_sycl_library_dir}"
+    "${_umf_library_dir}" "${_hwloc_library_dir}")
+  # SYCL and oneMKL may depend on the SDK's sibling oneTBB component. Retain
+  # only existing directories whose resolved paths stay inside the locked tree.
+  foreach(_runtime_dir "${THEROCK_MODULE_ONEAPI_ROOT}/tbb/latest/lib"
+      "${THEROCK_MODULE_ONEAPI_ROOT}/tbb/latest/lib/intel64/gcc4.8")
+    if(IS_DIRECTORY "${_runtime_dir}")
+      file(REAL_PATH "${_runtime_dir}" _runtime_real)
+      cmake_path(IS_PREFIX _oneapi_real "${_runtime_real}" NORMALIZE _inside_oneapi)
+      if(NOT _inside_oneapi)
+        message(FATAL_ERROR "Intel SGEMM runtime directory escapes imported oneAPI SDK: ${_runtime_dir}")
+      endif()
+      list(APPEND _oneapi_runtime_dirs "${_runtime_real}")
+    endif()
+  endforeach()
+  set_property(TARGET therock_module_validation APPEND PROPERTY BUILD_RPATH ${_oneapi_runtime_dirs})
+  set_property(TARGET therock_module_validation APPEND PROPERTY INSTALL_RPATH ${_oneapi_runtime_dirs})
 endif()
 
 if(THEROCK_MODULE_COMPILER)

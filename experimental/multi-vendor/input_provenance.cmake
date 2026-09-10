@@ -67,6 +67,12 @@ if(THEROCK_BUILD_TESTING AND (THEROCK_ENABLE_MULTI_VENDOR_VALIDATION OR THEROCK_
         _therock_multi_vendor_input(chipstar-compiler file "${_compiler}")
       endif()
       if(THEROCK_ENABLE_MULTI_VENDOR_MODULES)
+        if(THEROCK_ENABLE_MULTI_VENDOR_INTEL_SGEMM)
+          # Include sibling compiler, oneMKL, TBB, and UR runtime components.
+          # Component prefixes alone do not cover the imported SDK closure.
+          _therock_multi_vendor_input(oneapi-sdk tree "${THEROCK_MULTI_VENDOR_ONEAPI_ROOT}")
+          _therock_multi_vendor_input(sycl-compiler file "${THEROCK_MULTI_VENDOR_RESOLVED_SYCL_COMPILER}")
+        endif()
         _therock_multi_vendor_input(level-zero-sdk tree "${THEROCK_MULTI_VENDOR_LEVEL_ZERO_ROOT}")
         _therock_multi_vendor_compiler(_compiler spirv "${THEROCK_MULTI_VENDOR_AMD_ROOT}" clang)
         _therock_multi_vendor_input(spirv-compiler file "${_compiler}")

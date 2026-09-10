@@ -103,8 +103,6 @@ class SgemmContractTest(unittest.TestCase):
                     sgemm_capabilities(vendor),
                 )
         with self.assertRaises(ValueError):
-            runner_description("intel", enable_sgemm=True)
-        with self.assertRaises(ValueError):
             runner_description("amd", enable_sgemm=1)
 
     def test_compatibility_rejects_partial_wrong_vendor_or_multiple_provider_pairs(
@@ -209,7 +207,7 @@ class SgemmContractTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_sgemm_provider_json(text, vendor="nvidia")
 
-    def test_generator_opt_in_is_explicit_and_intel_rejection_preserves_outputs(self):
+    def test_generator_opt_in_is_explicit_and_invalid_input_preserves_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             header, description = root / "contract.h", root / "description.json"
@@ -245,7 +243,7 @@ class SgemmContractTest(unittest.TestCase):
             )
             before = (header.read_bytes(), description.read_bytes())
             with self.assertRaises(ValueError):
-                configure_contract("intel", header, description, enable_sgemm=True)
+                configure_contract("intel", header, description, enable_sgemm=1)
             self.assertEqual((header.read_bytes(), description.read_bytes()), before)
 
 

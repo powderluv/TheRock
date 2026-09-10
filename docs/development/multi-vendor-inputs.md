@@ -80,6 +80,13 @@ and C++ executables. Enabled consumers add their SDK and backend tools:
 | Intel HIP                    | chipStar SDK tree and selected chipStar compiler file.                                                                                             |
 | Intel native modules         | Level Zero SDK tree, SPIR-V frontend, matching translator, and validator files. The ROCm SDK tree is also included when it supplies that frontend. |
 
+Intel native SGEMM additionally locks the entire declared
+`THEROCK_MULTI_VENDOR_ONEAPI_ROOT` and the selected SYCL compiler executable.
+This includes compiler, oneMKL, and sibling runtime components within that prefix;
+the selected oneMKL directory and compiler must resolve inside it. See the
+[Intel provider build guide](multi-vendor-intel-sgemm.md). External system and
+driver dependencies remain outside this declared-input coverage.
+
 A tree lock includes directories, empty directories, permission modes, file
 sizes and SHA256 digests, and symlinks. Directory symlinks are recorded without
 recursive traversal. Their resolved targets must lie in a declared tree or

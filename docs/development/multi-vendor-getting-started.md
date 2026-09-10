@@ -14,6 +14,8 @@ ROCm runtime or a general replacement for HIP/library APIs. The optional
 rocBLAS/cuBLAS calls and includes separate build and validation commands.
 [SGEMM sessions](multi-vendor-sgemm-sessions.md) let library-only applications use
 that provider without loading packed kernels. See the
+[Intel oneMKL guide](multi-vendor-intel-sgemm.md) for its separate SDK/build option
+and pending device validation, and the
 [architecture](multi-vendor-architecture.md) for the design, alternatives to the
 HIP wrapper, multi-pack/multi-architecture layout, and remaining acceptance gates.
 

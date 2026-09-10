@@ -23,9 +23,14 @@ SGEMM_MAX_DIMENSION = 256
 SGEMM_MAX_CAPACITY = 65556
 SGEMM_PROVIDER_CAPABILITIES = (
     "blas-provider-cublas-v1",
+    "blas-provider-onemkl-v1",
     "blas-provider-rocblas-v1",
 )
-_PROVIDERS: dict[Vendor, str] = {"amd": "rocblas", "nvidia": "cublas"}
+_PROVIDERS: dict[Vendor, str] = {
+    "amd": "rocblas",
+    "nvidia": "cublas",
+    "intel": "onemkl",
+}
 
 
 def sgemm_provider_for_vendor(vendor: Vendor) -> str:

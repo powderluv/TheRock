@@ -3,8 +3,10 @@
 **Status: experimental; validated on Shark-a Radeon and NVIDIA GPUs.** This increment
 adds an optional matrix operation to the installed multi-vendor client. AMD
 workers call rocBLAS and NVIDIA workers call cuBLAS using their existing device,
-buffers, and stream. Intel workers remain compilable with SGEMM disabled and do
-not advertise or implement a BLAS provider.
+buffers, and stream. Intel workers now have a separate, opt-in
+[oneMKL provider](multi-vendor-intel-sgemm.md), compiled and linked with Intel
+oneAPI; its device execution remains unqualified. Default Intel workers retain
+SGEMM-disabled behavior.
 
 The operation contract is `therock.blas.f32-sgemm-nn`, version 1, with SHA256
 `fe1ce4851d9a3d5798e19b5e25ece80e4b4b4bbcdbf9dd350cea8912f3e2a5a0`.
@@ -44,9 +46,10 @@ cmake --build build/multi-vendor-sgemm --target therock-dist --parallel 8
 ```
 
 The parent enables SGEMM only for AMD/NVIDIA native children. The standalone
-child option is `THEROCK_MODULE_ENABLE_SGEMM`, also OFF by default; explicitly
-enabling that child option for Intel is rejected. Other selected targets can
-remain in the same parent build with their existing module functionality.
+child option is `THEROCK_MODULE_ENABLE_SGEMM`, also OFF by default. Intel uses
+the independent parent option `THEROCK_ENABLE_MULTI_VENDOR_INTEL_SGEMM` and
+requires an explicit oneAPI SDK. Other selected targets can remain in the same
+parent build with their existing module functionality.
 Configured provider headers and libraries must resolve within the selected SDK,
 and stub libraries are rejected. Enabled workers retain the selected provider
 library directory in their installation RPATH.
@@ -82,7 +85,7 @@ negotiated independently of the vector module ABI.
 | Offsets            | Nonnegative FP32-element offsets from each buffer's start             |
 | Scalars            | Alpha and beta must be finite and representable as FP32               |
 | Aliasing           | C cannot use either input's buffer handle; A and B may share a handle |
-| Submission         | Enqueued on the existing worker stream                                |
+| Submission         | Ordered within the worker; Intel currently completes before reply     |
 | Completion         | READ or explicit synchronization establishes completion               |
 
 The worker validates these spans using 64-bit arithmetic before forming pointers
@@ -102,10 +105,10 @@ alias restriction applies to the entire handle, even when the proposed views
 would be disjoint.
 
 Enabled workers advertise `blas-sgemm-f32-nn-v1` together with exactly their
-provider capability: `blas-provider-rocblas-v1` for AMD or
-`blas-provider-cublas-v1` for NVIDIA. There is no fallback between providers, to
-a packed reference kernel, or to CPU execution. The Intel worker advertises
-neither capability. Applications can require the operation capability when
+provider capability: `blas-provider-rocblas-v1` for AMD,
+`blas-provider-cublas-v1` for NVIDIA, or `blas-provider-onemkl-v1` for opt-in Intel.
+There is no fallback between providers, to a packed reference kernel, or to CPU
+execution. Disabled workers advertise neither operation nor provider capability. Applications can require the operation capability when
 opening a session to reject an unsupported worker before device discovery.
 
 `session.sgemm_provider()` negotiates the exact provider and operation contract,
@@ -187,7 +190,7 @@ and performance are outside this qualification.
 
 ## Native execution and failures
 
-The BLAS handle is bound to the existing nonblocking stream and host scalar
+For AMD/NVIDIA, the BLAS handle is bound to the existing nonblocking stream and host scalar
 mode. AMD explicitly selects `rocblas_default_math`; NVIDIA selects
 `CUBLAS_PEDANTIC_MATH`. Both disable atomic algorithms through their respective
 handle settings. The implementation does not opt into XF32, TF32, or reduced
@@ -196,6 +199,11 @@ implementation details. The API and stream/context requirements follow the
 [cuBLAS documentation](https://docs.nvidia.com/cuda/archive/13.2.0/cublas/index.html)
 and [rocBLAS documentation](https://rocm.docs.amd.com/projects/rocBLAS/en/docs-7.2.0/reference/level-3.html);
 the implementation was compiled against the selected local SDK headers.
+
+Intel borrows the native Level Zero context/device into a separate in-order SYCL
+queue and explicitly drains work between the two queues. Its allocation checks,
+precision policy, and failure handling are described in the
+[Intel integration guide](multi-vendor-intel-sgemm.md).
 
 The existing [service RPC](multi-vendor-service.md) frame version remains 1.
 Opcode 12 negotiates provider, ABI, ABI version, and contract hash after OPEN;
@@ -263,7 +271,7 @@ module_dist="$PWD/build/multi-vendor-sgemm/dist/multi-vendor-modules"
 
 For a build that additionally contains unqualified SM90 or Intel targets, apply
 `-E 'intel|sm90'` to hardware runs until those devices are available. SGEMM cases
-are registered for AMD/NVIDIA only; selecting an NVIDIA architecture remains an
+are registered only for enabled providers; selecting an NVIDIA architecture remains an
 exact hardware requirement, not a fallback to another card.
 
 Completed checks cover padded
@@ -277,7 +285,7 @@ checkpoints. Build outputs and machine-local evidence are not included in a clon
 
 Radeon and NVIDIA validation belongs in the dedicated
 `build/multi-vendor-sgemm` tree. Intel remains a compile/offline regression target
-with explicit unsupported SGEMM behavior. Earlier vector-module, installed-client,
+with explicit unsupported SGEMM behavior when its separate provider option is OFF. Earlier vector-module, installed-client,
 and selective-export results do not qualify this new operation. Intel B70 and
 NVIDIA SM90 execution remain unqualified until matching hardware is tested.
 
@@ -303,7 +311,7 @@ pack-based module path.
   from the worker binary. A stable plugin ABI, library ownership, dependency
   resolution, and complete runtime manifests need further design. This bounded
   opt-in linked provider provides a testable contract before broadening that ABI.
-- **Intel oneMath/oneMKL integration:** remains an extension option, with explicit
-  Level Zero context/queue interoperability and buffer lifetime validation needed
-  before using the worker's native allocations. No Intel BLAS implementation or
-  hardware qualification is claimed in this increment.
+- **Intel oneMath/oneMKL integration:** the subsequent opt-in
+  [oneMKL integration](multi-vendor-intel-sgemm.md) supplies this provider boundary
+  for native Level Zero allocations. Hardware interoperation and numerical
+  qualification remain pending. A broader oneMath dispatcher remains an option.

@@ -42,13 +42,16 @@ import json
 from .cpu_session import ProviderOnlySession
 calls = []
 sessions = []
-def open_sgemm_session(root, target, *, device_index=None, device_uuid=None):
+def open_sgemm_session(root, target, *, device_index=None, device_uuid=None,
+                       expected_device_id=None):
     calls.append({
         "target": target,
         "device_index": device_index,
         "device_uuid": device_uuid,
         "prior_worker_live": any(not session.closed for session in sessions),
     })
+    if expected_device_id is not None:
+        calls[-1]["expected_device_id"] = expected_device_id
     (root.parent / "opened-workers.json").write_text(json.dumps(calls))
     session = ProviderOnlySession(target, device_index, device_uuid)
     sessions.append(session)
@@ -88,7 +91,7 @@ class ProviderOnlySession(CpuSession):
         self.runner_sha256 = ("c" if vendor == "amd" else "d") * 64
         self.provider = SimpleNamespace(record=lambda: {
             "vendor": vendor,
-            "provider": "rocblas" if vendor == "amd" else "cublas",
+            "provider": {"amd": "rocblas", "nvidia": "cublas", "intel": "onemkl"}[vendor],
             "library_version": "cpu-test-observed-version",
         })
 
@@ -284,11 +287,27 @@ class SgemmProviderExampleTest(unittest.TestCase):
         self.assertEqual(report["sessions"][0]["device_uuid"], AMD_UUID)
         self.assertEqual(report["sessions"][1]["device"]["device_index"], 3)
 
+    def test_intel_provider_forwards_expected_pci_id(self) -> None:
+        self.arguments = [
+            "--dist-root",
+            str(self.root),
+            "--target",
+            "intel:level-zero:xe2-b70",
+        ]
+        report, observed = self.records("--expect-device-id", "0xe223")
+        self.assertEqual(observed["calls"][0]["expected_device_id"], 0xE223)
+        self.assert_session_report(report["sessions"][0], "intel:level-zero:xe2-b70")
+        self.assertEqual(report["sessions"][0]["provider"]["provider"], "onemkl")
+        self.assertEqual(report["modules_loaded"], 0)
+        self.assertTrue(observed["sessions"][0]["closed"])
+
     def test_invalid_cli_fails_before_opening_a_worker(self) -> None:
         for arguments in (
             ("--format", "hsaco"),
             ("--peer-format", "cubin"),
             ("--device", "-1"),
+            ("--expect-device-id", "-1"),
+            ("--expect-device-id", "0xinvalid"),
             ("--peer-device", "1"),
             ("--peer-device-uuid", NVIDIA_UUID),
             ("--peer-target", AMD),

@@ -44,6 +44,13 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
     set(_compiler_target "${THEROCK_MULTI_VENDOR_${_key}_PROCESSOR}")
     _therock_multi_vendor_compiler(_compiler spirv "${THEROCK_MULTI_VENDOR_AMD_ROOT}" clang)
     set(_native_sources kernels.cl level_zero_loader.cpp module_service_level_zero.h)
+    if(THEROCK_ENABLE_MULTI_VENDOR_INTEL_SGEMM)
+      set(_enable_sgemm ON)
+      list(APPEND _native_sources module_service_onemkl.h)
+      list(APPEND _sdk_args
+        "-DTHEROCK_MODULE_ONEAPI_ROOT=${THEROCK_MULTI_VENDOR_ONEAPI_ROOT}"
+        "-DTHEROCK_MODULE_ONEMKL_ROOT=${THEROCK_MULTI_VENDOR_RESOLVED_ONEMKL_ROOT}")
+    endif()
     list(APPEND _sdk_args
       "-DTHEROCK_MODULE_SPIRV_TRANSLATOR=${THEROCK_MULTI_VENDOR_RESOLVED_SPIRV_TRANSLATOR}"
       "-DTHEROCK_MODULE_SPIRV_VALIDATOR=${THEROCK_MULTI_VENDOR_RESOLVED_SPIRV_VALIDATOR}"
@@ -94,7 +101,16 @@ foreach(_key IN LISTS THEROCK_MULTI_VENDOR_TARGET_KEYS)
     "${THEROCK_SOURCE_DIR}/build_tools/configure_module_contract.py"
     "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/module_contract.py"
     "${THEROCK_SOURCE_DIR}/build_tools/_therock_utils/sgemm_contract.py")
-  therock_cmake_subproject_activate("${_native_project}")
+  if(_vendor STREQUAL "intel" AND _enable_sgemm)
+    # TheRock writes its inherited compiler into the child toolchain. A cache
+    # argument alone cannot override it; confine this choice to one activation.
+    block(SCOPE_FOR VARIABLES)
+      set(CMAKE_CXX_COMPILER "${THEROCK_MULTI_VENDOR_RESOLVED_SYCL_COMPILER}")
+      therock_cmake_subproject_activate("${_native_project}")
+    endblock()
+  else()
+    therock_cmake_subproject_activate("${_native_project}")
+  endif()
   _therock_multi_vendor_register_inputs("${_native_project}")
   list(APPEND _native_projects "${_native_project}")
   list(APPEND _native_keys "${_key}")
@@ -262,8 +278,12 @@ foreach(_key IN LISTS _native_keys)
       FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
       RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
-  if(THEROCK_ENABLE_MULTI_VENDOR_SGEMM AND _vendor MATCHES "^(amd|nvidia)$")
+  if((THEROCK_ENABLE_MULTI_VENDOR_SGEMM AND _vendor MATCHES "^(amd|nvidia)$")
+      OR (THEROCK_ENABLE_MULTI_VENDOR_INTEL_SGEMM AND _vendor STREQUAL "intel"))
     set(_sgemm_format hsaco)
+    if(_vendor STREQUAL "intel")
+      set(_sgemm_format spirv)
+    endif()
     if(_vendor STREQUAL "nvidia")
       set(_sgemm_format mixed)
     endif()
@@ -272,7 +292,7 @@ foreach(_key IN LISTS _native_keys)
       COMMAND "${Python3_EXECUTABLE}" -I
         "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_provider_example.py"
         --dist-root "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_key}_ID}"
-        --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+        --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}" ${_identity_args})
     set_tests_properties("${_test}" PROPERTIES
       LABELS "multi-vendor;sgemm;sgemm-session;module-client;gpu;${_vendor}"
       FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
@@ -282,7 +302,7 @@ foreach(_key IN LISTS _native_keys)
       COMMAND "${Python3_EXECUTABLE}" -I
         "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_example.py"
         --dist-root "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_key}_ID}"
-        --format "${_sgemm_format}" --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+        --format "${_sgemm_format}" --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}" ${_identity_args})
     set_tests_properties("${_test}" PROPERTIES
       LABELS "multi-vendor;sgemm;module-client;gpu;${_vendor}"
       FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"

@@ -19,7 +19,7 @@ from types import ModuleType
 
 def nonnegative_integer(value: str) -> int:
     try:
-        number = int(value)
+        number = int(value, 16 if value.lower().startswith("0x") else 10)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("Expected a nonnegative integer") from exc
     if number < 0:
@@ -31,6 +31,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist-root", type=Path, required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--expect-device-id", type=nonnegative_integer)
     device = parser.add_mutually_exclusive_group()
     device.add_argument("--device", type=nonnegative_integer)
     device.add_argument("--device-uuid")
@@ -109,7 +110,11 @@ def main(argv: list[str]) -> int:
     records = []
     details = {}
     with runtime.open_sgemm_session(
-        root, args.target, device_index=args.device, device_uuid=args.device_uuid
+        root,
+        args.target,
+        device_index=args.device,
+        device_uuid=args.device_uuid,
+        expected_device_id=args.expect_device_id,
     ) as session:
         first = numerical.Fixture.create(session, ())
         records.append({**session_record(session), **first.run(kernel_interop=False)})

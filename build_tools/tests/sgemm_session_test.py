@@ -217,14 +217,15 @@ class SgemmSessionTest(unittest.TestCase):
                     self.session()
                 self.assertEqual(self.records(), [])
 
-    def test_default_and_intel_workers_fail_before_device_queries(self):
+    def test_sgemm_off_workers_including_intel_fail_before_device_queries(self):
         for vendor, target in (
             ("nvidia", _TARGET),
             ("intel", "intel:level-zero:xe2-b70"),
         ):
             with self.subTest(vendor=vendor):
                 self.write_runner(
-                    target_id=target, description=runner_description(vendor).record()
+                    target_id=target,
+                    description=runner_description(vendor, enable_sgemm=False).record(),
                 )
                 with self.assertRaisesRegex(ValueError, "blas-sgemm-f32-nn-v1"):
                     self.session(target)
@@ -246,6 +247,33 @@ class SgemmSessionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.session(target_id, required_capabilities=("blas-provider-cublas-v1",))
         self.assertEqual(self.records(), [])
+
+    def test_intel_onemkl_provider_negotiates_without_loading_spirv_payloads(self):
+        target_id = "intel:level-zero:xe2-b70"
+        self.write_runner(
+            target_id=target_id,
+            description=runner_description("intel", enable_sgemm=True).record(),
+            inventory=_inventory(target_id),
+            provider=provider("intel").record(),
+        )
+        with self.session(target_id) as session:
+            self.assertEqual(session.target.canonical_id, target_id)
+            self.assertEqual(session.device.device_id, 0xE223)
+            self.assertEqual(session.sgemm_provider(), provider("intel"))
+            self.assertEqual(session.sgemm_provider().provider, "onemkl")
+            self.assertEqual(self.opcodes(), [1, 2, 12])
+            a, b, c = (session.allocate(4) for _ in range(3))
+            session.write(a, 0, [1, 2, 3, 4])
+            session.write(b, 0, [5, 6, 7, 8])
+            session.sgemm(a, b, c, m=2, n=2, k=2, lda=2, ldb=2, ldc=2)
+            self.assertEqual(session.read(c, 0, 4), array("f", [23, 34, 31, 46]))
+            self.assertNotIn(5, self.opcodes())
+            self.assertNotIn(9, self.opcodes())
+        self.clear_records()
+        for capability in ("blas-provider-rocblas-v1", "blas-provider-cublas-v1"):
+            with self.subTest(capability=capability), self.assertRaises(ValueError):
+                self.session(target_id, required_capabilities=(capability,))
+            self.assertEqual(self.records(), [])
 
     def test_persistent_service_capability_is_mandatory_before_queries(self):
         description = copy.deepcopy(self.config["description"])

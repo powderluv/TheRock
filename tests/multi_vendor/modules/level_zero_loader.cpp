@@ -3,6 +3,18 @@
 
 #include <level_zero/ze_api.h>
 
+#if defined(THEROCK_MODULE_ENABLE_SGEMM) && THEROCK_MODULE_ENABLE_SGEMM
+#include <mkl.h>
+#include <oneapi/mkl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <sycl/sycl.hpp>
+
+#include <chrono>
+#include <exception>
+#include <mutex>
+#include <thread>
+#endif
+
 #include "device_inventory.h"
 #include "module_service_protocol.h"
 #include "module_session_options.h"
