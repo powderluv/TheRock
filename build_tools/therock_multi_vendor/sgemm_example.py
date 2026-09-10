@@ -140,7 +140,7 @@ class Fixture:
             session, requests, tuple(session.allocate(CAPACITY) for _ in range(4))
         )
 
-    def run(self) -> dict[str, object]:
+    def run(self, *, kernel_interop: bool = True) -> dict[str, object]:
         provider = self.session.sgemm_provider()
         require(
             self.session.sgemm_provider() is provider,
@@ -168,11 +168,10 @@ class Fixture:
                     "inputs_unchanged": True,
                 }
             )
-        return {
-            "provider": provider.record(),
-            "checks": checks,
-            "kernel_interop": self.pipeline(),
-        }
+        result = {"provider": provider.record(), "checks": checks}
+        if kernel_interop:
+            result["kernel_interop"] = self.pipeline()
+        return result
 
     def pipeline(self) -> dict[str, object]:
         a, b, c, d = self.buffers

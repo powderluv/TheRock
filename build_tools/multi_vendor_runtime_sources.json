@@ -89,6 +89,11 @@
       "destination": "share/therock/python/therock_multi_vendor/sgemm_example.py",
       "path": "therock_multi_vendor/sgemm_example.py",
       "root": "tools"
+    },
+    {
+      "destination": "share/therock/python/therock_multi_vendor/sgemm_provider_example.py",
+      "path": "therock_multi_vendor/sgemm_provider_example.py",
+      "root": "tools"
     }
   ],
   "schema_version": 1

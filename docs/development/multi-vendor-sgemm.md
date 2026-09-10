@@ -145,10 +145,11 @@ session.sgemm(
 negotiation. It returns no new handle. C remains the caller's existing allocation
 and contains the updated matrix after completion.
 
-The session-opening policy remains one to 32 unique packed `ModuleRequest`
-values. The example below declares the existing SAXPY payload to open a verified
-session; SGEMM itself is implemented by cuBLAS and does not launch that payload.
-After building the enabled distribution, run from the checkout root:
+For matrix multiplication without packed kernels, use
+[`open_sgemm_session`](multi-vendor-sgemm-sessions.md). It verifies the worker and
+negotiates the provider without reading kernel catalogs or loading modules.
+`open_session` retains its one-to-32 packed `ModuleRequest` policy for applications
+that compose kernels with SGEMM. After building the enabled distribution, run:
 
 ```sh
 module_dist="$PWD/build/multi-vendor-sgemm/dist/multi-vendor-modules"
@@ -157,15 +158,9 @@ PYTHONPATH="$module_dist/share/therock/python" \
 from array import array
 from pathlib import Path
 import sys
-from therock_multi_vendor import ModuleRequest, open_session
+from therock_multi_vendor import open_sgemm_session
 
-request = ModuleRequest("validation/saxpy", "cubin", "therock_module_saxpy")
-with open_session(
-    Path(sys.argv[1]),
-    "nvidia:cuda:sm_120",
-    (request,),
-    required_capabilities=("blas-sgemm-f32-nn-v1",),
-) as session:
+with open_sgemm_session(Path(sys.argv[1]), "nvidia:cuda:sm_120") as session:
     a = session.allocate(6)
     b = session.allocate(6)
     c = session.allocate(4)
@@ -180,7 +175,7 @@ with open_session(
 PYTHON
 ```
 
-For the Radeon, use `amd:hip:gfx1201` and a `hsaco` module request. Device-index
+For the Radeon, use `amd:hip:gfx1201`. Device-index
 and UUID selection remain unchanged. Buffers cannot cross sessions; transferring
 a result to another vendor still requires a host READ followed by WRITE.
 
@@ -226,7 +221,8 @@ call or provide rollback after a failed operation.
 
 ## Validation status and limits
 
-The enabled four-target native build passed **32 applicable CTests** on Shark-a,
+The initial bounded SGEMM checkpoint
+(`610e6fd92760b40489c5f9f4948ed37e47c4dde0`) passed **32 applicable CTests** on Shark-a,
 including Radeon, NVIDIA, and paired SGEMM consumers. The default combined
 HIP/native profile passed **33 CTests** with SGEMM disabled. The focused Python
 regression suite passed **394 tests, with no skips**, including 32 new contract,

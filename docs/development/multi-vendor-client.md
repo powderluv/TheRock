@@ -166,10 +166,16 @@ See the [architecture roadmap](multi-vendor-architecture.md#roadmap-and-acceptan
 ## Optional SGEMM provider
 
 Enable `THEROCK_ENABLE_MULTI_VENDOR_SGEMM=ON` when building native modules to
-add bounded rocBLAS/cuBLAS SGEMM to AMD/NVIDIA sessions. The existing module
-requests remain required. `session.sgemm_provider()` negotiates the separate
+add bounded rocBLAS/cuBLAS SGEMM to AMD/NVIDIA sessions. Use
+`open_sgemm_session` when no kernel modules are needed;
+`open_session` retains its existing module-request policy.
+`session.sgemm_provider()` negotiates the separate
 operation contract and reports the loaded library version; `session.sgemm(...)`
 queues matrix multiplication using the same buffers and stream as packed kernels.
 See the [provider guide](multi-vendor-sgemm.md) for dimensions, strides, offsets,
 scalar/alias restrictions, external dependencies, and a runnable example.
 Intel and default builds reject SGEMM locally without closing the kernel session.
+
+For applications that only need matrix multiplication, the
+[SGEMM session guide](multi-vendor-sgemm-sessions.md) describes `open_sgemm_session`,
+which verifies and negotiates the provider before returning and loads no modules.

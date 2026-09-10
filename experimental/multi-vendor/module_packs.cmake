@@ -267,6 +267,16 @@ foreach(_key IN LISTS _native_keys)
     if(_vendor STREQUAL "nvidia")
       set(_sgemm_format mixed)
     endif()
+    set(_test "sgemm-provider-client-${_key}")
+    add_test(NAME "${_test}"
+      COMMAND "${Python3_EXECUTABLE}" -I
+        "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_provider_example.py"
+        --dist-root "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_key}_ID}"
+        --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+    set_tests_properties("${_test}" PROPERTIES
+      LABELS "multi-vendor;sgemm;sgemm-session;module-client;gpu;${_vendor}"
+      FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+      RUN_SERIAL TRUE TIMEOUT 180)
     set(_test "sgemm-client-${_key}")
     add_test(NAME "${_test}"
       COMMAND "${Python3_EXECUTABLE}" -I
@@ -313,6 +323,18 @@ foreach(_amd_key IN LISTS _native_keys)
       continue()
     endif()
     if(THEROCK_ENABLE_MULTI_VENDOR_SGEMM)
+      set(_test "sgemm-provider-client-pair-${_amd_key}-${_nvidia_key}")
+      add_test(NAME "${_test}"
+        COMMAND "${Python3_EXECUTABLE}" -I
+          "${_module_dist}/share/therock/python/therock_multi_vendor/sgemm_provider_example.py"
+          --dist-root "${_module_dist}" --target "${THEROCK_MULTI_VENDOR_${_amd_key}_ID}"
+          --device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}"
+          --peer-target "${THEROCK_MULTI_VENDOR_${_nvidia_key}_ID}"
+          --peer-device "${THEROCK_MULTI_VENDOR_DEVICE_INDEX}")
+      set_tests_properties("${_test}" PROPERTIES
+        LABELS "multi-vendor;sgemm;sgemm-session;module-client;multi-vendor-client;gpu;amd;nvidia"
+        FIXTURES_REQUIRED "multi-vendor-inputs;multi-vendor-module-receipts"
+        RUN_SERIAL TRUE TIMEOUT 180)
       set(_test "sgemm-client-pair-${_amd_key}-${_nvidia_key}")
       add_test(NAME "${_test}"
         COMMAND "${Python3_EXECUTABLE}" -I

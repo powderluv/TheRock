@@ -3,7 +3,7 @@
 **Status: experimental implementation and proposed expansion.** This document
 describes the initial implementation validated on Shark-a on 6 September 2026,
 the subsequent input, launch-contract, discovery, event, session, pipeline, service,
-installed consumer, selective distribution, and bounded math-provider work, and
+installed consumer, selective distribution, bounded math-provider, and SGEMM session work, and
 decisions needed to extend it.
 The hardware validation record below remains tied to its stated checkpoint.
 Operational commands belong in the [getting-started guide](multi-vendor-getting-started.md),
@@ -222,6 +222,16 @@ direct installation: a newly configured provider capability cannot label an olde
 worker. Whole-SDK content locks already cover provider files under imported SDK
 roots. Complete runtime provenance and reusable artifact keys remain separate
 acceptance gates.
+
+The [SGEMM session API](multi-vendor-sgemm-sessions.md) also opens a verified
+worker without packed-module declarations. It shares target/capability validation,
+compiled-description checks, device discovery and UUID binding, and lifetime
+management with packed sessions. SGEMM sessions eagerly negotiate the provider
+and expose buffer/math operations; packed sessions retain kernel lookup/launch
+and verify every selected payload before discovery. Catalog files are not read by
+SGEMM-only opening, while registry metadata and the existing full export inventory
+remain required by their respective contracts. No transport, operation digest, or
+distribution schema changes are needed for this separation.
 
 ## Multi-pack and multi-architecture selection
 
@@ -585,3 +595,10 @@ distribution passed SGEMM and retained its verified inventory. Intel and SM90
 remain compile-only targets; no Intel math provider is implemented. See the
 [provider guide](multi-vendor-sgemm.md) for the contract, loaded library versions,
 commands, and limits.
+
+The subsequent [SGEMM session checkpoint](multi-vendor-sgemm-sessions.md) passed
+**420 focused tests without skips**, **35 enabled native CTests**, and
+**33 default combined HIP/native CTests**. Provider-only sessions passed on both
+Shark-a devices and in a relocated selected export with explicit UUID selection.
+The four native worker binaries stayed unchanged; the addition separates
+library-only application opening from verified packed-module opening.

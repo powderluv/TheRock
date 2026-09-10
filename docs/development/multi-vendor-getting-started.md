@@ -11,7 +11,9 @@ compiles Intel B70 and NVIDIA SM90 payloads; execution on those GPUs remains
 unvalidated. This is an experimental fixed-vector module interface, not a full
 ROCm runtime or a general replacement for HIP/library APIs. The optional
 [SGEMM provider](multi-vendor-sgemm.md) extends the worker with bounded native
-rocBLAS/cuBLAS calls and includes separate build and validation commands. See the
+rocBLAS/cuBLAS calls and includes separate build and validation commands.
+[SGEMM sessions](multi-vendor-sgemm-sessions.md) let library-only applications use
+that provider without loading packed kernels. See the
 [architecture](multi-vendor-architecture.md) for the design, alternatives to the
 HIP wrapper, multi-pack/multi-architecture layout, and remaining acceptance gates.
 

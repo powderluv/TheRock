@@ -1,9 +1,9 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Exact packed-module selection shared by dispatch and application sessions.
+"""Exact worker and packed-module selection for application sessions.
 
-Prepared selections retain the bytes extracted from verified archives. Runner
+Prepared module selections retain bytes extracted from verified archives. Runner
 paths remain paths rather than pinned executable inodes; distribution updates
 must be serialized with use. Metadata hashes establish integrity, not publisher
 identity or hardware qualification.
@@ -58,6 +58,23 @@ class ModuleRequest:
 
 
 @dataclass(frozen=True)
+class PreparedWorker:
+    target: GpuTarget
+    entry: RunnerEntry
+    runner: Path
+    device: ObservedDevice
+    required_capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _RegisteredWorker:
+    target: GpuTarget
+    entry: RunnerEntry
+    runner: Path
+    required_capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PreparedModules:
     target: GpuTarget
     entry: RunnerEntry
@@ -106,26 +123,17 @@ def query_inventory(runner: Path, entry: RunnerEntry) -> DeviceInventory:
     return inventory
 
 
-def prepare_modules(
+def _register_worker(
     root: Path,
     registry: RunnerRegistry,
     *,
-    requests: tuple[ModuleRequest, ...],
     target_id: str,
-    device_index: int | None = None,
-    device_uuid: str | None = None,
-    expected_device_id: int | None = None,
-    required_capabilities: tuple[str, ...] = (),
-) -> PreparedModules:
-    """Verify every payload before discovery, preserving ordered repeated stages.
-
-    Callers impose their own duplicate/stage-count policy. This common operation
-    accepts at most 32 requests and returns no process-owned execution resources.
-    """
-    if not isinstance(requests, tuple) or not 1 <= len(requests) <= 32:
-        raise ValueError("A module session requires between 1 and 32 requests")
-    if not all(isinstance(request, ModuleRequest) for request in requests):
-        raise ValueError("Expected typed ModuleRequest values")
+    device_index: int | None,
+    device_uuid: str | None,
+    expected_device_id: int | None,
+    required_capabilities: tuple[str, ...],
+) -> _RegisteredWorker:
+    """Validate selection and capabilities before executing a registered runner."""
     if not isinstance(target_id, str):
         raise ValueError("Expected a canonical GPU target string")
     target = parse_gpu_target(target_id)
@@ -147,6 +155,98 @@ def prepare_modules(
     entry = matches[0]
     require_runner_capabilities(entry.description, required_capabilities)
     runner = verify_runner(root, entry)
+    return _RegisteredWorker(target, entry, runner, required_capabilities)
+
+
+def _discover_worker(
+    root: Path,
+    registered: _RegisteredWorker,
+    *,
+    device_index: int | None,
+    device_uuid: str | None,
+    expected_device_id: int | None,
+) -> PreparedWorker:
+    target, entry, runner = registered.target, registered.entry, registered.runner
+    inventory = query_inventory(runner, entry)
+    if device_uuid is not None:
+        device = select_device_uuid(inventory, target, device_uuid, expected_device_id)
+    else:
+        device = select_device(
+            inventory,
+            target,
+            device_index if device_index is not None else 0,
+            expected_device_id,
+        )
+    verify_runner(root, entry)
+    return PreparedWorker(
+        target, entry, runner, device, registered.required_capabilities
+    )
+
+
+def prepare_worker(
+    root: Path,
+    registry: RunnerRegistry,
+    *,
+    target_id: str,
+    device_index: int | None = None,
+    device_uuid: str | None = None,
+    expected_device_id: int | None = None,
+    required_capabilities: tuple[str, ...] = (),
+) -> PreparedWorker:
+    """Verify an exact worker and observed device without inspecting any packs.
+
+    Registry metadata is still required and validated. Catalog paths are neither
+    resolved nor opened, and no payload snapshots or execution resources exist.
+    Callers must reverify runner bytes immediately before starting their worker.
+    """
+    registered = _register_worker(
+        root,
+        registry,
+        target_id=target_id,
+        device_index=device_index,
+        device_uuid=device_uuid,
+        expected_device_id=expected_device_id,
+        required_capabilities=required_capabilities,
+    )
+    return _discover_worker(
+        root,
+        registered,
+        device_index=device_index,
+        device_uuid=device_uuid,
+        expected_device_id=expected_device_id,
+    )
+
+
+def prepare_modules(
+    root: Path,
+    registry: RunnerRegistry,
+    *,
+    requests: tuple[ModuleRequest, ...],
+    target_id: str,
+    device_index: int | None = None,
+    device_uuid: str | None = None,
+    expected_device_id: int | None = None,
+    required_capabilities: tuple[str, ...] = (),
+) -> PreparedModules:
+    """Verify every payload before discovery, preserving ordered repeated stages.
+
+    Callers impose their own duplicate/stage-count policy. This common operation
+    accepts at most 32 requests and returns no process-owned execution resources.
+    """
+    if not isinstance(requests, tuple) or not 1 <= len(requests) <= 32:
+        raise ValueError("A module session requires between 1 and 32 requests")
+    if not all(isinstance(request, ModuleRequest) for request in requests):
+        raise ValueError("Expected typed ModuleRequest values")
+    registered = _register_worker(
+        root,
+        registry,
+        target_id=target_id,
+        device_index=device_index,
+        device_uuid=device_uuid,
+        expected_device_id=expected_device_id,
+        required_capabilities=required_capabilities,
+    )
+    target, entry = registered.target, registered.entry
     catalogs = [resolve_registry_path(root, path) for path in registry.catalogs]
     invocations = []
     snapshots: dict[ModuleRequest, VerifiedPayload] = {}
@@ -173,16 +273,14 @@ def prepare_modules(
             contract,
         )
         invocations.append((selected, request.entry_point))
-    inventory = query_inventory(runner, entry)
-    if device_uuid is not None:
-        device = select_device_uuid(inventory, target, device_uuid, expected_device_id)
-    else:
-        device = select_device(
-            inventory,
-            target,
-            device_index if device_index is not None else 0,
-            expected_device_id,
-        )
+    worker = _discover_worker(
+        root,
+        registered,
+        device_index=device_index,
+        device_uuid=device_uuid,
+        expected_device_id=expected_device_id,
+    )
+    device = worker.device
     contract = validation_contract()
     if math.prod(contract.launch.block) > device.limits.max_threads_per_block or any(
         required > available
@@ -193,7 +291,11 @@ def prepare_modules(
         raise ValueError(
             "Observed device limits do not support contract launch geometry"
         )
-    verify_runner(root, entry)
     return PreparedModules(
-        target, entry, runner, device, tuple(invocations), required_capabilities
+        worker.target,
+        worker.entry,
+        worker.runner,
+        worker.device,
+        tuple(invocations),
+        worker.required_capabilities,
     )
